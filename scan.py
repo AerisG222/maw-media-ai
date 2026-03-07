@@ -21,17 +21,10 @@ import os
 import sys
 import json
 import argparse
-from datetime import datetime
-from pathlib import Path
 
-import numpy as np
 from tqdm import tqdm
 
-from common import (
-    DeepFace,
-    MODEL_NAME, DETECTOR, THRESHOLD,
-    file_hash, find_images, load_db, save_db, match_face,
-)
+from common import file_hash, find_images, save_db
 
 ALL_SCAN_TYPES = ["faces", "objects", "scenes"]
 
@@ -43,7 +36,7 @@ def scan(
     skip_processed: bool,
     scan_types: list[str],
 ):
-    """Scan photos for faces, objects, and/or scenes and write results to JSON."""
+    """Orchestrate scanning of photos across one or more scan types."""
 
     # ── Validate scan types ───────────────────────────────────────────────
     for st in scan_types:
@@ -55,18 +48,14 @@ def scan(
     do_objects = "objects" in scan_types
     do_scenes  = "scenes"  in scan_types
 
-    # ── Load face database (required only for face scanning) ──────────────
-    db = None
-    if do_faces:
-        db = load_db(db_path)
-        if not db["people"]:
-            print("ERROR: No people enrolled yet. Run the 'enroll' command first.")
-            print("       Or use --scan-types objects scenes to skip face scanning.")
-            sys.exit(1)
-
-    # ── Load YOLO models if needed ────────────────────────────────────────
+    # ── Load scanners ─────────────────────────────────────────────────────
+    face_db      = None
     object_model = None
     scene_model  = None
+
+    if do_faces:
+        from faces import load_face_model, detect_faces
+        face_db = load_face_model(db_path)
 
     if do_objects:
         from objects import load_object_model, detect_objects
@@ -81,16 +70,17 @@ def scan(
     # ── Find images ───────────────────────────────────────────────────────
     images = find_images(photos_folder)
     if not images:
-        print(f"No images found in: {photos_folder}")
+        print(f"ERROR: No images found in: {photos_folder}")
         sys.exit(1)
 
     print(f"\n{'─'*50}")
     print(f"  Scanning {len(images)} photos in: {photos_folder}")
-    print(f"  Scan types: {', '.join(scan_types)}")
+    print(f"  Scan types : {', '.join(scan_types)}")
     if do_faces:
-        print(f"  Known people: {', '.join(sorted(db['people'].keys()))}")
-        print(f"  Face threshold: {THRESHOLD}")
-    print(f"  Output: {output_json}")
+        from common import THRESHOLD
+        print(f"  Known people   : {', '.join(sorted(face_db['people'].keys()))}")
+        print(f"  Face threshold : {THRESHOLD}")
+    print(f"  Output     : {output_json}")
     print(f"{'─'*50}\n")
 
     # ── Load existing results ─────────────────────────────────────────────
@@ -99,9 +89,9 @@ def scan(
         with open(output_json, "r", encoding="utf-8") as f:
             existing_rows = json.load(f)
 
-    results  = []
-    skipped  = 0
-    errors   = 0
+    results      = []
+    skipped      = 0
+    errors       = 0
     face_count   = 0
     object_count = 0
     scene_count  = 0
@@ -109,98 +99,43 @@ def scan(
     for img_path in tqdm(images, desc="Scanning photos"):
         img_hash = file_hash(str(img_path))
 
-        if skip_processed and db and img_hash in db["processed"]:
+        if skip_processed and face_db and img_hash in face_db["processed"]:
             skipped += 1
             continue
 
-        # ── Face scanning ─────────────────────────────────────────────────
+        # ── Faces ─────────────────────────────────────────────────────────
         if do_faces:
-            try:
-                faces = DeepFace.represent(
-                    img_path=str(img_path),
-                    model_name=MODEL_NAME,
-                    detector_backend=DETECTOR,
-                    enforce_detection=False,
-                )
-            except Exception as e:
-                results.append({
-                    "file_path":    str(img_path),
-                    "file_name":    img_path.name,
-                    "scan_type":    "faces",
-                    "face_index":   0,
-                    "matched_name": "ERROR",
-                    "confidence":   None,
-                    "distance":     None,
-                    "face_region":  {},
-                    "scanned_at":   datetime.now().isoformat(timespec="seconds"),
-                    "notes":        str(e),
-                })
-                errors += 1
-                faces = None
+            face_results = detect_faces(img_path, face_db)
+            results.extend(face_results)
+            face_count += sum(
+                1 for r in face_results
+                if r["matched_name"] not in ("No face detected", "ERROR")
+            )
+            errors += sum(1 for r in face_results if r["matched_name"] == "ERROR")
 
-            if faces is not None:
-                if not faces:
-                    results.append({
-                        "file_path":    str(img_path),
-                        "file_name":    img_path.name,
-                        "scan_type":    "faces",
-                        "face_index":   0,
-                        "matched_name": "No face detected",
-                        "confidence":   None,
-                        "distance":     None,
-                        "face_region":  {},
-                        "scanned_at":   datetime.now().isoformat(timespec="seconds"),
-                        "notes":        "",
-                    })
-                else:
-                    for i, face_data in enumerate(faces):
-                        embedding = np.array(face_data["embedding"])
-                        name, dist = match_face(embedding, db["people"])
-                        confidence = round((1 - dist) * 100, 1)
-                        region = face_data.get("facial_area", {})
-
-                        results.append({
-                            "file_path":    str(img_path),
-                            "file_name":    img_path.name,
-                            "scan_type":    "faces",
-                            "face_index":   i,
-                            "matched_name": name,
-                            "confidence":   confidence,
-                            "distance":     round(dist, 4),
-                            "face_region":  {
-                                "x": region.get("x"),
-                                "y": region.get("y"),
-                                "w": region.get("w"),
-                                "h": region.get("h"),
-                            },
-                            "scanned_at":   datetime.now().isoformat(timespec="seconds"),
-                            "notes":        "",
-                        })
-                        face_count += 1
-
-        # ── Object detection ──────────────────────────────────────────────
+        # ── Objects ───────────────────────────────────────────────────────
         if do_objects:
             obj_result = detect_objects(img_path, object_model)
             results.append(obj_result)
             object_count += obj_result["object_count"]
 
-        # ── Scene classification ──────────────────────────────────────────
+        # ── Scenes ────────────────────────────────────────────────────────
         if do_scenes:
             scene_result = classify_scene(img_path, scene_model)
             results.append(scene_result)
             if scene_result.get("top_scene"):
                 scene_count += 1
 
-        if db:
-            db["processed"].add(img_hash)
+        if face_db:
+            face_db["processed"].add(img_hash)
 
     # ── Write results ─────────────────────────────────────────────────────
     all_rows = existing_rows + results
     with open(output_json, "w", encoding="utf-8") as f:
         json.dump(all_rows, f, indent=2, ensure_ascii=False)
 
-    if db:
-        save_db(db, db_path)
+    if face_db:
+        save_db(face_db, db_path)
 
     print(f"\n{'─'*50}")
     print(f"  ✓ Done!")
@@ -223,11 +158,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--photos",         required=True,                          help="Folder of photos to scan (searched recursively)")
-    parser.add_argument("--db",             default="faces.db",                     help="Path to face database file (default: faces.db)")
-    parser.add_argument("--output",         default="results.json",                 help="Output JSON file (default: results.json)")
-    parser.add_argument("--skip-processed", action="store_true",                    help="Skip photos already in the database cache")
-    parser.add_argument("--scan-types",     nargs="+", default=ALL_SCAN_TYPES,      help="Scan types to run: faces objects scenes (default: all)")
+    parser.add_argument("--photos",         required=True,
+                        help="Folder of photos to scan (searched recursively)")
+    parser.add_argument("--db",             default="faces.db",
+                        help="Path to face database file (default: faces.db)")
+    parser.add_argument("--output",         default="results.json",
+                        help="Output JSON file (default: results.json)")
+    parser.add_argument("--skip-processed", action="store_true",
+                        help="Skip photos already in the database cache")
+    parser.add_argument("--scan-types",     nargs="+", default=ALL_SCAN_TYPES,
+                        help="Scan types to run: faces objects scenes (default: all)")
 
     args = parser.parse_args()
     scan(args.photos, args.db, args.output, args.skip_processed, args.scan_types)

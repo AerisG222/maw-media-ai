@@ -20,7 +20,8 @@ pt.py          # main entry point — run all commands through this
 common.py      # shared utilities, constants, GPU config (not run directly)
 enroll.py      # enroll command — register known people for face matching
 list.py        # list command — preview which files would be scanned
-scan.py        # scan command — detect faces, objects, and/or scenes
+scan.py        # scan command — orchestrates all scan types
+faces.py       # face detection and matching module (DeepFace + ArcFace)
 objects.py     # object detection module (YOLO11, COCO dataset)
 scenes.py      # scene classification module (YOLO11, ImageNet dataset)
 report.py      # report command — summarise results
