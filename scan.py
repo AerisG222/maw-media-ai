@@ -30,7 +30,7 @@ from tqdm import tqdm
 from common import (
     DeepFace,
     MODEL_NAME, DETECTOR, THRESHOLD,
-    file_hash, list_images, load_db, save_db, match_face,
+    file_hash, find_images, load_db, save_db, match_face,
 )
 
 ALL_SCAN_TYPES = ["faces", "objects", "scenes"]
@@ -79,7 +79,7 @@ def scan(
         scene_model = load_scene_model()
 
     # ── Find images ───────────────────────────────────────────────────────
-    images = list_images(photos_folder)
+    images = find_images(photos_folder)
     if not images:
         print(f"No images found in: {photos_folder}")
         sys.exit(1)

@@ -93,13 +93,29 @@ def file_hash(path: str) -> str:
     return h.hexdigest()
 
 
-def list_images(folder: str) -> list[Path]:
-    """Recursively find all image files in a folder."""
+def find_images(folder: str, extensions: set[str] | None = None) -> list[Path]:
+    """
+    Recursively find all image files in a folder.
+
+    Args:
+        folder:     Root folder to search.
+        extensions: Set of lowercase extensions to include e.g. {'.jpg', '.png'}.
+                    Defaults to IMAGE_EXTENSIONS if not provided.
+
+    Returns:
+        Sorted list of matching Path objects.
+    """
+    exts   = extensions if extensions is not None else IMAGE_EXTENSIONS
     folder = Path(folder)
-    return [
+    return sorted([
         p for p in folder.rglob("*")
-        if p.suffix.lower() in IMAGE_EXTENSIONS and p.is_file()
-    ]
+        if p.suffix.lower() in exts and p.is_file()
+    ])
+
+
+# Keep list_images as a backwards-compatible alias
+def list_images(folder: str) -> list[Path]:
+    return find_images(folder)
 
 
 # ── Database utilities ────────────────────────────────────────────────────

@@ -25,7 +25,7 @@ from tqdm import tqdm
 from common import (
     DeepFace,
     MODEL_NAME, DETECTOR,
-    list_images, load_db, save_db,
+    find_images, load_db, save_db,
 )
 
 
@@ -50,7 +50,7 @@ def enroll(known_folder: str, db_path: str):
 
     for person_dir in sorted(people_dirs):
         name = person_dir.name
-        images = list_images(str(person_dir))
+        images = find_images(str(person_dir))
 
         if not images:
             print(f"  ⚠  {name}: no images found, skipping.")

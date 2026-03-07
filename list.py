@@ -3,28 +3,27 @@
 """
 list.py — List all image files that would be scanned
 
-Prints a full list of images that would be processed by the scan command,
-without actually scanning them. Use this to verify the correct files are
-included before running a full scan.
+Prints the exact set of files that scan.py would process,
+without actually scanning them. Use this to verify the correct
+files are included before running a full scan.
 
 Usage:
     ./pt.py list --photos ./my_photos
-    ./pt.py list --photos ./my_photos --ext jpg png
+    ./pt.py list --photos ./my_photos --ext jpg png heic
     ./pt.py list --photos ./my_photos --output file-list.txt
 """
 
-import os
 import argparse
 from pathlib import Path
 from collections import Counter
 
-from common import list_images, IMAGE_EXTENSIONS
+from common import find_images, IMAGE_EXTENSIONS
 
 
 def list_files(photos_folder: str, extensions: list[str] | None, output_file: str | None):
-    """List all image files that would be scanned."""
+    """List all image files that would be processed by the scan command."""
 
-    # Override extensions if user specified specific ones
+    # Resolve extension filter — must match exactly what scan.py would use
     if extensions:
         exts = {f".{e.lower().lstrip('.')}" for e in extensions}
         invalid = exts - IMAGE_EXTENSIONS
@@ -32,46 +31,41 @@ def list_files(photos_folder: str, extensions: list[str] | None, output_file: st
             print(f"  ⚠  Unsupported extensions ignored: {', '.join(sorted(invalid))}")
             exts -= invalid
     else:
-        exts = IMAGE_EXTENSIONS
+        exts = None  # None tells find_images to use IMAGE_EXTENSIONS (same default as scan)
 
     folder = Path(photos_folder)
     if not folder.exists():
         print(f"ERROR: Folder not found: {photos_folder}")
         return
 
-    # Gather matching images
-    images = sorted([
-        p for p in folder.rglob("*")
-        if p.suffix.lower() in exts and p.is_file()
-    ])
+    # Use the exact same function as scan.py — guaranteed to match
+    images = find_images(photos_folder, extensions=exts)
 
-    # ── Summary ───────────────────────────────────────────────────────────
+    effective_exts = exts if exts is not None else IMAGE_EXTENSIONS
     ext_counts = Counter(p.suffix.lower() for p in images)
 
+    # ── Summary ───────────────────────────────────────────────────────────
     print(f"\n{'─'*50}")
     print(f"  Folder  : {folder.resolve()}")
-    print(f"  Filter  : {', '.join(sorted(exts))}")
+    print(f"  Filter  : {', '.join(sorted(effective_exts))}")
     print(f"  Total   : {len(images)} image(s) found")
     if ext_counts:
         breakdown = "  |  ".join(f"{ext}: {count}" for ext, count in sorted(ext_counts.items()))
         print(f"  Types   : {breakdown}")
     print(f"{'─'*50}\n")
 
-    # ── File listing ──────────────────────────────────────────────────────
+    # ── File listing grouped by sub-folder ────────────────────────────────
     lines = []
     current_dir = None
 
     for img_path in images:
         parent = str(img_path.parent)
-
-        # Print directory header when we enter a new sub-folder
         if parent != current_dir:
             current_dir = parent
             rel_dir = img_path.parent.relative_to(folder)
             header = f"  📁 {rel_dir}/" if str(rel_dir) != "." else f"  📁 {folder.name}/"
             lines.append("")
             lines.append(header)
-
         lines.append(f"     {img_path.name}")
 
     for line in lines:
@@ -79,12 +73,12 @@ def list_files(photos_folder: str, extensions: list[str] | None, output_file: st
 
     print()
 
-    # ── Write to file if requested ────────────────────────────────────────
+    # ── Optionally save to file ───────────────────────────────────────────
     if output_file:
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(f"# Photo Tagger — File List\n")
             f.write(f"# Folder : {folder.resolve()}\n")
-            f.write(f"# Filter : {', '.join(sorted(exts))}\n")
+            f.write(f"# Filter : {', '.join(sorted(effective_exts))}\n")
             f.write(f"# Total  : {len(images)} image(s)\n")
             f.write("#\n")
             for img_path in images:
@@ -101,8 +95,8 @@ def main():
     parser.add_argument("--photos",  required=True,
                         help="Folder of photos to list (searched recursively)")
     parser.add_argument("--ext",     nargs="+", default=None,
-                        help=f"Limit to specific extensions e.g. --ext jpg png heic "
-                             f"(default: {' '.join(sorted(IMAGE_EXTENSIONS))})")
+                        help="Limit to specific extensions e.g. --ext jpg png heic "
+                             "(default: all supported types)")
     parser.add_argument("--output",  default=None,
                         help="Optionally save the file list to a text file")
 
