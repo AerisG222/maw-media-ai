@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-#  prep.sh — Conda environment launcher for photo-tagger.py
+#  prep.sh — Conda environment setup for Photo Tagger
 #
 #  Usage:
-#    source ./prep.sh          # Enter the environment (installs if needed)
-#    source ./prep.sh --exit   # Deactivate and exit the environment
+#    ./prep.sh          # Create environment and install dependencies
+#    ./prep.sh --exit   # Deactivate the conda environment
 # ─────────────────────────────────────────────────────────────────────────────
 
 CONDA_ENV_NAME="photo-tagger"
@@ -145,12 +145,20 @@ else
     fi
 fi
 
-# ── Check for photo-tagger.py ─────────────────────────────────────────────────
-if [[ ! -f "photo-tagger.py" ]]; then
-    echo -e "\n  ${YELLOW}⚠  photo-tagger.py not found in current directory.${RESET}"
-    echo -e "  Make sure photo-tagger.py is in the same folder as this script.\n"
+# ── Check for required scripts ────────────────────────────────────────────────
+REQUIRED_SCRIPTS=("pt.py" "common.py" "enroll.py" "scan.py" "report.py")
+MISSING_SCRIPTS=()
+for script in "${REQUIRED_SCRIPTS[@]}"; do
+    if [[ ! -f "$script" ]]; then
+        MISSING_SCRIPTS+=("$script")
+    fi
+done
+
+if [[ ${#MISSING_SCRIPTS[@]} -gt 0 ]]; then
+    echo -e "\n  ${YELLOW}⚠  Missing scripts: ${MISSING_SCRIPTS[*]}${RESET}"
+    echo -e "  Make sure all scripts are in the same folder as prep.sh.\n"
 else
-    echo -e "  Script         : ${GREEN}✓ photo-tagger.py found${RESET}"
+    echo -e "  Scripts        : ${GREEN}✓ All scripts found${RESET}"
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
@@ -158,9 +166,9 @@ echo -e ""
 echo -e "${BOLD}  Installation verified!${RESET}"
 echo -e ""
 echo -e "  ${CYAN}Example commands (once inside the environment):${RESET}"
-echo -e "  ./photo-tagger.py enroll --known ./known_people --db faces.db"
-echo -e "  ./photo-tagger.py scan   --photos ./my_photos   --db faces.db --output results.csv"
-echo -e "  ./photo-tagger.py report --output results.csv"
+echo -e "  ./pt.py enroll --known ./known_people --db faces.db"
+echo -e "  ./pt.py scan   --photos ./my_photos   --db faces.db --output results.json"
+echo -e "  ./pt.py report --output results.json"
 echo -e ""
 echo -e "  ${YELLOW}To exit the environment later, run:  ${BOLD}conda deactivate${RESET}"
 echo -e ""
