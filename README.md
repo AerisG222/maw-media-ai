@@ -19,6 +19,7 @@ prep.sh        # conda environment setup script
 pt.py          # main entry point — run all commands through this
 common.py      # shared utilities, constants, GPU config (not run directly)
 enroll.py      # enroll command — register known people for face matching
+list.py        # list command — preview which files would be scanned
 scan.py        # scan command — detect faces, objects, and/or scenes
 objects.py     # object detection module (YOLO11, COCO dataset)
 scenes.py      # scene classification module (YOLO11, ImageNet dataset)
@@ -61,6 +62,43 @@ All commands are run through `pt.py`:
 
 ```bash
 ./pt.py <command> [options]
+```
+
+---
+
+### `list` — Preview which files would be scanned
+
+Run this before scanning to verify the right images are included — and nothing you want to skip is accidentally picked up.
+
+```bash
+# List all images in a folder
+./pt.py list --photos ./my_photos
+
+# Limit to specific file types
+./pt.py list --photos ./my_photos --ext jpg png heic
+
+# Save the list to a text file for review
+./pt.py list --photos ./my_photos --output file-list.txt
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--photos` | required | Folder to inspect (searched recursively) |
+| `--ext` | all supported | Limit to specific extensions e.g. `jpg png heic` |
+| `--output` | none | Save the file list to a text file |
+
+Supported extensions: `.jpg` `.jpeg` `.png` `.heic` `.bmp` `.tiff` `.webp`
+
+The output is grouped by sub-folder so it's easy to spot unexpected directories being included:
+
+```
+  📁 my_photos/
+     birthday.jpg
+     holiday.png
+
+  📁 my_photos/2024/
+     beach.jpg
+     concert.heic
 ```
 
 ---

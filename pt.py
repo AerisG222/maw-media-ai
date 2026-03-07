@@ -10,6 +10,10 @@ Setup:
     conda activate photo-tagger     # enter the environment
 
 Usage:
+    ./pt.py list   --photos ./my_photos
+    ./pt.py list   --photos ./my_photos --ext jpg png heic
+    ./pt.py list   --photos ./my_photos --output file-list.txt
+
     ./pt.py enroll --known ./known_people --db faces.db
 
     ./pt.py scan --photos ./my_photos --db faces.db --output results.json
@@ -31,8 +35,9 @@ from common import configure_gpu
 
 
 COMMANDS = {
+    "list":   "List all image files that would be scanned",
     "enroll": "Enroll known people from reference photos",
-    "scan":   "Scan a photo library and tag faces",
+    "scan":   "Scan a photo library for faces, objects, and/or scenes",
     "report": "Print a summary of results",
 }
 
@@ -59,7 +64,9 @@ def main():
     # Rebuild sys.argv for the sub-script so its own argparse works correctly
     sys.argv = [args.command + ".py"] + args.args
 
-    if args.command == "enroll":
+    if args.command == "list":
+        from list import main as run
+    elif args.command == "enroll":
         from enroll import main as run
     elif args.command == "scan":
         from scan import main as run

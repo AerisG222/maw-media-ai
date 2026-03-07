@@ -147,7 +147,7 @@ else
 fi
 
 # ── Check for required scripts ────────────────────────────────────────────────
-REQUIRED_SCRIPTS=("pt.py" "common.py" "enroll.py" "scan.py" "report.py" "objects.py" "scenes.py")
+REQUIRED_SCRIPTS=("pt.py" "common.py" "enroll.py" "scan.py" "report.py" "objects.py" "scenes.py" "list.py")
 MISSING_SCRIPTS=()
 for script in "${REQUIRED_SCRIPTS[@]}"; do
     if [[ ! -f "$script" ]]; then
