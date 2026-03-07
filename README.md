@@ -1,6 +1,6 @@
 # Photo Tagger
 
-Local facial recognition tool that scans a photo library, detects faces, matches them against known people, and saves results to a JSON file. Everything runs locally — no cloud APIs, your photos never leave your machine.
+Local photo scanning tool that detects faces, objects, and scenes in your photo library using on-device AI. Results are saved to a JSON file. Everything runs locally — no cloud APIs, your photos never leave your machine.
 
 ---
 
@@ -18,9 +18,11 @@ Local facial recognition tool that scans a photo library, detects faces, matches
 prep.sh        # conda environment setup script
 pt.py          # main entry point — run all commands through this
 common.py      # shared utilities, constants, GPU config (not run directly)
-enroll.py      # enroll command implementation
-scan.py        # scan command implementation
-report.py      # report command implementation
+enroll.py      # enroll command — register known people for face matching
+scan.py        # scan command — detect faces, objects, and/or scenes
+objects.py     # object detection module (YOLO11, COCO dataset)
+scenes.py      # scene classification module (YOLO11, ImageNet dataset)
+report.py      # report command — summarise results
 ```
 
 ---
@@ -37,7 +39,7 @@ chmod +x prep.sh pt.py
 This will:
 - Create a conda environment named `photo-tagger` with Python 3.12
 - Detect your GPU and install CUDA/cuDNN automatically if an NVIDIA GPU is found
-- Install all required Python packages
+- Install all required Python packages including DeepFace and Ultralytics YOLO
 
 **2. Activate the environment:**
 
@@ -61,11 +63,11 @@ All commands are run through `pt.py`:
 ./pt.py <command> [options]
 ```
 
-### Commands
+---
 
-#### `enroll` — Register known people
+### `enroll` — Register known people for face matching
 
-Point the tool at a folder of reference photos, one sub-folder per person:
+Required before running face scans. Point it at a folder of reference photos, one sub-folder per person:
 
 ```
 known_people/
@@ -93,15 +95,19 @@ known_people/
 
 ---
 
-#### `scan` — Scan your photo library
+### `scan` — Scan your photo library
 
 ```bash
+# Scan for everything (default)
 ./pt.py scan --photos ./my_photos --db faces.db --output results.json
-```
 
-To skip photos already processed in a previous run:
+# Scan for specific types only
+./pt.py scan --photos ./my_photos --db faces.db --output results.json --scan-types faces
+./pt.py scan --photos ./my_photos --db faces.db --output results.json --scan-types objects
+./pt.py scan --photos ./my_photos --db faces.db --output results.json --scan-types scenes
+./pt.py scan --photos ./my_photos --db faces.db --output results.json --scan-types faces objects
 
-```bash
+# Skip already-processed photos
 ./pt.py scan --photos ./my_photos --db faces.db --output results.json --skip-processed
 ```
 
@@ -110,30 +116,50 @@ To skip photos already processed in a previous run:
 | `--photos` | required | Folder of photos to scan (searched recursively) |
 | `--db` | `faces.db` | Path to the face database file |
 | `--output` | `results.json` | Output JSON file |
+| `--scan-types` | `faces objects scenes` | Which scan types to run |
 | `--skip-processed` | off | Skip photos already in the database cache |
+
+#### Scan types
+
+| Type | Model | What it detects |
+|---|---|---|
+| `faces` | DeepFace + ArcFace | Identifies people by matching against enrolled reference photos |
+| `objects` | YOLO11 (COCO) | Detects and locates 80 common objects: people, cars, dogs, chairs, etc. |
+| `scenes` | YOLO11 (ImageNet) | Classifies the overall scene into 1000 categories: beach, kitchen, forest, etc. |
+
+> **Note:** YOLO models (~6MB each) are downloaded automatically from Ultralytics on first use.
 
 ---
 
-#### `report` — View a summary of results
+### `report` — View a summary of results
 
 ```bash
+# Full summary of all scan types
 ./pt.py report --output results.json
+
+# Summary for a specific scan type only
+./pt.py report --output results.json --type faces
+./pt.py report --output results.json --type objects
+./pt.py report --output results.json --type scenes
 ```
 
 | Argument | Default | Description |
 |---|---|---|
 | `--output` | `results.json` | JSON results file to summarise |
+| `--type` | `all` | Which scan type to report: `all`, `faces`, `objects`, `scenes` |
 
 ---
 
 ## Output Format
 
-Results are written to a JSON file. Each detected face is a separate entry:
+All results are written to a single JSON file as a list. Each entry has a `scan_type` field identifying which scanner produced it.
 
+### Face entry
 ```json
 {
   "file_path": "/home/user/photos/birthday.jpg",
   "file_name": "birthday.jpg",
+  "scan_type": "faces",
   "face_index": 0,
   "matched_name": "Alice",
   "confidence": 87.3,
@@ -144,23 +170,48 @@ Results are written to a JSON file. Each detected face is a separate entry:
 }
 ```
 
-| Field | Description |
-|---|---|
-| `file_path` | Full path to the photo |
-| `file_name` | Filename only |
-| `face_index` | Index of this face within the photo (0-based) |
-| `matched_name` | Matched person's name, `Unknown`, `No face detected`, or `ERROR` |
-| `confidence` | Match confidence as a percentage (higher = better) |
-| `distance` | Raw cosine distance (lower = closer match) |
-| `face_region` | Bounding box of the face in pixels |
-| `scanned_at` | ISO 8601 timestamp |
-| `notes` | Error message if something went wrong |
+### Object entry
+```json
+{
+  "file_path": "/home/user/photos/birthday.jpg",
+  "file_name": "birthday.jpg",
+  "scan_type": "objects",
+  "object_count": 3,
+  "labels": ["cake", "cup", "person"],
+  "objects": [
+    {
+      "label": "cake",
+      "confidence": 91.2,
+      "bbox": { "x1": 210, "y1": 300, "x2": 480, "y2": 520, "w": 270, "h": 220 }
+    }
+  ],
+  "scanned_at": "2026-03-07T14:22:01",
+  "notes": ""
+}
+```
+
+### Scene entry
+```json
+{
+  "file_path": "/home/user/photos/birthday.jpg",
+  "file_name": "birthday.jpg",
+  "scan_type": "scenes",
+  "top_scene": "dining_table",
+  "scenes": [
+    { "label": "dining_table", "confidence": 72.4 },
+    { "label": "bakery",       "confidence": 14.1 },
+    { "label": "restaurant",   "confidence": 8.3  }
+  ],
+  "scanned_at": "2026-03-07T14:22:01",
+  "notes": ""
+}
+```
 
 ---
 
 ## GPU Acceleration
 
-The tool automatically detects and uses your GPU at startup. No configuration needed.
+The tool automatically detects and uses your GPU at startup for all scan types.
 
 | Hardware | Approximate speed |
 |---|---|
@@ -174,19 +225,25 @@ For NVIDIA GPUs, `prep.sh` installs `cudatoolkit` and `cuDNN` via conda, which h
 
 ## Tuning Accuracy
 
-The matching threshold is defined in `common.py`:
-
+### Face matching threshold
+Defined in `common.py`:
 ```python
-THRESHOLD = 0.40  # Lower = stricter matching (0.0–1.0)
+THRESHOLD = 0.40  # Lower = stricter (0.0–1.0)
 ```
+- **Lower** (e.g. `0.30`) → fewer false positives, more `Unknown` results
+- **Higher** (e.g. `0.50`) → more matches, higher risk of incorrect tags
 
-- **Lower the threshold** (e.g. `0.30`) to reduce false positives — more faces will be tagged as `Unknown`
-- **Raise the threshold** (e.g. `0.50`) to catch more matches — at the risk of occasional incorrect tags
+### Object/scene confidence threshold
+Also in `common.py`:
+```python
+YOLO_CONFIDENCE = 0.30  # Minimum confidence to include a detection
+```
+- **Lower** → more detections, including less certain ones
+- **Higher** → only high-confidence detections are included
 
-The default model is **ArcFace**, which handles variation in lighting, age, and angle well. The detector is **RetinaFace**, which is accurate but slower. You can change both in `common.py` if needed.
-
----
-
-## License
-
-MIT
+### Face recognition model
+The default is **ArcFace** via **RetinaFace** detector. Both can be changed in `common.py`:
+```python
+MODEL_NAME = "ArcFace"    # alternatives: VGG-Face, Facenet, DeepFace
+DETECTOR   = "retinaface" # alternatives: opencv, mtcnn, ssd
+```

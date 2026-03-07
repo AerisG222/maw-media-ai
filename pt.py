@@ -11,9 +11,17 @@ Setup:
 
 Usage:
     ./pt.py enroll --known ./known_people --db faces.db
-    ./pt.py scan   --photos ./my_photos --db faces.db --output results.json
-    ./pt.py scan   --photos ./my_photos --db faces.db --output results.json --skip-processed
+
+    ./pt.py scan --photos ./my_photos --db faces.db --output results.json
+    ./pt.py scan --photos ./my_photos --db faces.db --output results.json --scan-types faces
+    ./pt.py scan --photos ./my_photos --db faces.db --output results.json --scan-types objects
+    ./pt.py scan --photos ./my_photos --db faces.db --output results.json --scan-types scenes
+    ./pt.py scan --photos ./my_photos --db faces.db --output results.json --scan-types faces objects scenes
+
     ./pt.py report --output results.json
+    ./pt.py report --output results.json --type faces
+    ./pt.py report --output results.json --type objects
+    ./pt.py report --output results.json --type scenes
 """
 
 import sys

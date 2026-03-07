@@ -104,7 +104,7 @@ if [[ "$NEEDS_INSTALL" == true ]]; then
     fi
 
     # Remaining packages
-    for pkg in "deepface" "opencv-python" "tqdm" "tf-keras==2.20.1"; do
+    for pkg in "deepface" "opencv-python" "tqdm" "tf-keras==2.20.1" "ultralytics"; do
         echo -e "  Installing ${CYAN}${pkg}${RESET}..."
         pip install "$pkg" --quiet 2>&1 | grep -v "dependency conflicts" | grep -v "WARNING" || true
         echo -e "  ${GREEN}✓ ${pkg}${RESET}"
@@ -121,6 +121,7 @@ else
         ["tqdm"]="tqdm"
         ["tensorflow"]="tensorflow"
         ["tf-keras"]="tf-keras"
+        ["ultralytics"]="ultralytics"
     )
 
     for pkg in "${!PIP_NAMES[@]}"; do
@@ -146,7 +147,7 @@ else
 fi
 
 # ── Check for required scripts ────────────────────────────────────────────────
-REQUIRED_SCRIPTS=("pt.py" "common.py" "enroll.py" "scan.py" "report.py")
+REQUIRED_SCRIPTS=("pt.py" "common.py" "enroll.py" "scan.py" "report.py" "objects.py" "scenes.py")
 MISSING_SCRIPTS=()
 for script in "${REQUIRED_SCRIPTS[@]}"; do
     if [[ ! -f "$script" ]]; then
@@ -167,7 +168,8 @@ echo -e "${BOLD}  Installation verified!${RESET}"
 echo -e ""
 echo -e "  ${CYAN}Example commands (once inside the environment):${RESET}"
 echo -e "  ./pt.py enroll --known ./known_people --db faces.db"
-echo -e "  ./pt.py scan   --photos ./my_photos   --db faces.db --output results.json"
+echo -e "  ./pt.py scan   --photos ./my_photos --db faces.db --output results.json"
+echo -e "  ./pt.py scan   --photos ./my_photos --db faces.db --output results.json --scan-types faces objects scenes"
 echo -e "  ./pt.py report --output results.json"
 echo -e ""
 echo -e "  ${YELLOW}To exit the environment later, run:  ${BOLD}conda deactivate${RESET}"

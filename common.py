@@ -37,6 +37,18 @@ DISTANCE_METRIC  = "cosine"
 THRESHOLD        = 0.40          # Lower = stricter matching (0.0–1.0)
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".bmp", ".tiff", ".webp"}
 
+# YOLO models (downloaded automatically on first use)
+YOLO_OBJECT_MODEL = "yolo11n.pt"       # COCO — 80 common object classes
+YOLO_SCENE_MODEL  = "yolo11n-cls.pt"   # ImageNet — 1000 scene/category classes
+YOLO_CONFIDENCE   = 0.30               # Minimum confidence to include a detection
+
+
+# ── YOLO import ───────────────────────────────────────────────────────────
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None  # Gracefully degrade — face scanning still works without YOLO
+
 
 # ── GPU configuration ─────────────────────────────────────────────────────
 
