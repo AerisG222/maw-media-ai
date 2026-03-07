@@ -18,6 +18,7 @@ Local photo scanning tool that detects faces, objects, and scenes in your photo 
 prep.sh        # conda environment setup script
 pt.py          # main entry point — run all commands through this
 common.py      # shared utilities, constants, GPU config (not run directly)
+gpu.py         # gpu command — check GPU availability and configuration
 enroll.py      # enroll command — register known people for face matching
 list.py        # list command — preview which files would be scanned
 scan.py        # scan command — orchestrates all scan types
@@ -63,6 +64,24 @@ All commands are run through `pt.py`:
 
 ```bash
 ./pt.py <command> [options]
+```
+
+---
+
+### `gpu` — Check GPU availability
+
+Run this any time to verify whether GPU acceleration is available and correctly configured:
+
+```bash
+./pt.py gpu
+```
+
+Example output with an NVIDIA GPU:
+```
+  GPU Status: 🚀 Acceleration available
+  Device 0  : NVIDIA GeForce RTX 3080
+  Count     : 1 device(s)
+  TF version: 2.20.0
 ```
 
 ---
