@@ -35,7 +35,7 @@ MODEL_NAME       = "ArcFace"     # Best accuracy for personal collections
 DETECTOR         = "retinaface"  # Best detector; fall back to "opencv" if slow
 DISTANCE_METRIC  = "cosine"
 THRESHOLD        = 0.40          # Lower = stricter matching (0.0–1.0)
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".bmp", ".tiff", ".webp"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".bmp", ".tiff", ".webp", ".avif"}
 
 # YOLO models (downloaded automatically on first use)
 YOLO_OBJECT_MODEL = "yolo11n.pt"       # COCO — 80 common object classes
@@ -95,7 +95,11 @@ def file_hash(path: str) -> str:
 
 def find_images(folder: str, extensions: set[str] | None = None) -> list[Path]:
     """
-    Recursively find all image files in a folder.
+    Recursively find all image files in a folder, restricted to images that
+    reside inside a directory named '4k'.
+
+    Expected directory structure:
+        <root>/<year>/<category>/4k/<images>
 
     Args:
         folder:     Root folder to search.
@@ -109,7 +113,9 @@ def find_images(folder: str, extensions: set[str] | None = None) -> list[Path]:
     folder = Path(folder)
     return sorted([
         p for p in folder.rglob("*")
-        if p.suffix.lower() in exts and p.is_file()
+        if p.suffix.lower() in exts
+        and p.is_file()
+        and p.parent.name.lower() == "4k"
     ])
 
 
