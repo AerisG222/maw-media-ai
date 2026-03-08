@@ -219,7 +219,7 @@ def export_clusters(
             if crop is None:
                 continue
 
-            out_path = cluster_dir / f"face_{saved + 1:03d}.jpg"
+            out_path = cluster_dir / f"{folder_name}_{saved + 1:03d}.jpg"
             cv2.imwrite(str(out_path), crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
             saved += 1
 
