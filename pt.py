@@ -16,6 +16,11 @@ Usage:
     ./pt.py list   --photos ./my_photos --ext jpg png heic
     ./pt.py list   --photos ./my_photos --output file-list.txt
 
+    ./pt.py cluster --photos ./my_photos --output ./known_people
+    ./pt.py cluster --photos ./my_photos --output ./known_people --sample 20
+    ./pt.py cluster --photos ./my_photos --output ./known_people --years 2010 2015
+    ./pt.py cluster --photos ./my_photos --output ./known_people --eps 0.35 --min-samples 3
+
     ./pt.py enroll --known ./known_people --db faces.db
 
     ./pt.py scan --photos ./my_photos --db faces.db --output results.json
@@ -35,11 +40,12 @@ import argparse
 
 
 COMMANDS = {
-    "gpu":    "Check GPU availability and configuration",
-    "list":   "List all image files that would be scanned",
-    "enroll": "Enroll known people from reference photos",
-    "scan":   "Scan a photo library for faces, objects, and/or scenes",
-    "report": "Print a summary of results",
+    "gpu":     "Check GPU availability and configuration",
+    "list":    "List all image files that would be scanned",
+    "cluster": "Bootstrap known faces database via unsupervised clustering",
+    "enroll":  "Enroll known people from reference photos",
+    "scan":    "Scan a photo library for faces, objects, and/or scenes",
+    "report":  "Print a summary of results",
 }
 
 
@@ -66,6 +72,8 @@ def main():
         from gpu import main as run
     elif args.command == "list":
         from list import main as run
+    elif args.command == "cluster":
+        from cluster import main as run
     elif args.command == "enroll":
         from enroll import main as run
     elif args.command == "scan":

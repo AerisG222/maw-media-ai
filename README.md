@@ -19,8 +19,9 @@ prep.sh        # conda environment setup script
 pt.py          # main entry point — run all commands through this
 common.py      # shared utilities, constants, GPU config (not run directly)
 gpu.py         # gpu command — check GPU availability and configuration
-enroll.py      # enroll command — register known people for face matching
 list.py        # list command — preview which files would be scanned
+cluster.py     # cluster command — bootstrap known faces via unsupervised clustering
+enroll.py      # enroll command — register known people for face matching
 scan.py        # scan command — orchestrates all scan types
 faces.py       # face detection and matching module (DeepFace + ArcFace)
 objects.py     # object detection module (YOLO11, COCO dataset)
@@ -120,6 +121,58 @@ The output is grouped by sub-folder so it's easy to spot unexpected directories 
      beach.jpg
      concert.heic
 ```
+
+---
+
+### `cluster` — Bootstrap the known faces database
+
+Samples a percentage of your photo library, detects all faces, clusters them by similarity, and exports representative face crops into `known_people/` folders ready for enrollment. Use this instead of manually collecting reference photos.
+
+```bash
+# Sample 10% of photos (default)
+./pt.py cluster --photos ./my_photos --output ./known_people
+
+# Sample a larger percentage to catch rarer people
+./pt.py cluster --photos ./my_photos --output ./known_people --sample 25
+
+# Restrict to a year range to cluster by era (recommended for age brackets)
+./pt.py cluster --photos ./my_photos --output ./known_people --years 2010 2015
+
+# Tune clustering sensitivity
+./pt.py cluster --photos ./my_photos --output ./known_people --eps 0.35 --min-samples 3
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--photos` | required | Folder of photos to sample from |
+| `--output` | required | Output folder for clustered face crops |
+| `--sample` | `10` | Percentage of photos to sample |
+| `--years` | none | Restrict to a year range e.g. `--years 2010 2015` |
+| `--eps` | `0.40` | DBSCAN max distance to join a cluster — lower is stricter |
+| `--min-samples` | `3` | Minimum faces required to form a cluster |
+
+**Output structure:**
+```
+known_people/
+    person_001/       ← rename this to the person's real name
+        face_001.jpg
+        face_002.jpg
+    person_002/
+        face_001.jpg
+    unmatched/        ← faces that didn't cluster with anyone
+```
+
+**After clustering:**
+1. Review the folders — open the face crops to identify who each person is
+2. Rename each `person_NNN` folder to the person's real name
+3. Delete any noise or unrecognisable folders
+4. Run enrollment: `./pt.py enroll --known ./known_people --db faces.db`
+
+**Tuning tips:**
+- If clusters are too large (mixing different people), lower `--eps` e.g. `0.30`
+- If clusters are too fragmented (same person split across many folders), raise `--eps` e.g. `0.45`
+- Use `--years` to cluster by era — this works well with the age bracket strategy for people who appear across many decades
+- Increase `--sample` if key people aren't appearing in clusters (they may be rare in your library)
 
 ---
 

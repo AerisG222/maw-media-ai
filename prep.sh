@@ -104,7 +104,7 @@ if [[ "$NEEDS_INSTALL" == true ]]; then
     fi
 
     # Remaining packages
-    for pkg in "deepface" "opencv-python" "tqdm" "tf-keras==2.20.1" "ultralytics"; do
+    for pkg in "deepface" "opencv-python" "tqdm" "tf-keras==2.20.1" "ultralytics" "scikit-learn"; do
         echo -e "  Installing ${CYAN}${pkg}${RESET}..."
         pip install "$pkg" --quiet 2>&1 | grep -v "dependency conflicts" | grep -v "WARNING" || true
         echo -e "  ${GREEN}✓ ${pkg}${RESET}"
@@ -122,6 +122,7 @@ else
         ["tensorflow"]="tensorflow"
         ["tf-keras"]="tf-keras"
         ["ultralytics"]="ultralytics"
+        ["scikit-learn"]="scikit-learn"
     )
 
     for pkg in "${!PIP_NAMES[@]}"; do
@@ -147,7 +148,7 @@ else
 fi
 
 # ── Check for required scripts ────────────────────────────────────────────────
-REQUIRED_SCRIPTS=("pt.py" "common.py" "gpu.py" "enroll.py" "list.py" "scan.py" "faces.py" "objects.py" "scenes.py" "report.py")
+REQUIRED_SCRIPTS=("pt.py" "common.py" "gpu.py" "enroll.py" "list.py" "cluster.py" "scan.py" "faces.py" "objects.py" "scenes.py" "report.py")
 MISSING_SCRIPTS=()
 for script in "${REQUIRED_SCRIPTS[@]}"; do
     if [[ ! -f "$script" ]]; then
@@ -166,10 +167,27 @@ fi
 echo -e ""
 echo -e "${BOLD}  Installation verified!${RESET}"
 echo -e ""
-echo -e "  ${CYAN}Example commands (once inside the environment):${RESET}"
+echo -e "  ${CYAN}Available commands (once inside the environment):${RESET}"
+echo -e ""
+echo -e "  ${BOLD}Check GPU${RESET}"
+echo -e "  ./pt.py gpu"
+echo -e ""
+echo -e "  ${BOLD}List files that would be scanned${RESET}"
+echo -e "  ./pt.py list --photos ./my_photos"
+echo -e ""
+echo -e "  ${BOLD}Cluster faces to bootstrap known people database${RESET}"
+echo -e "  ./pt.py cluster --photos ./my_photos --output ./known_people --sample 10"
+echo -e ""
+echo -e "  ${BOLD}Enroll known people for face matching${RESET}"
 echo -e "  ./pt.py enroll --known ./known_people --db faces.db"
-echo -e "  ./pt.py scan   --photos ./my_photos --db faces.db --output results.json"
-echo -e "  ./pt.py scan   --photos ./my_photos --db faces.db --output results.json --scan-types faces objects scenes"
+echo -e ""
+echo -e "  ${BOLD}Scan photos (all types)${RESET}"
+echo -e "  ./pt.py scan --photos ./my_photos --db faces.db --output results.json"
+echo -e ""
+echo -e "  ${BOLD}Scan photos (specific types)${RESET}"
+echo -e "  ./pt.py scan --photos ./my_photos --db faces.db --output results.json --scan-types faces objects scenes"
+echo -e ""
+echo -e "  ${BOLD}Report results${RESET}"
 echo -e "  ./pt.py report --output results.json"
 echo -e ""
 echo -e "  ${YELLOW}To exit the environment later, run:  ${BOLD}conda deactivate${RESET}"
