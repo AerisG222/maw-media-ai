@@ -128,18 +128,20 @@ The output is grouped by sub-folder so it's easy to spot unexpected directories 
 
 Samples a percentage of your photo library, detects all faces, clusters them by similarity, and exports representative face crops into `known_people/` folders ready for enrollment. Use this instead of manually collecting reference photos.
 
+On subsequent runs, existing folders in `--output` are loaded as **anchors**. New clusters are matched against these anchors first — if close enough they are merged into the existing folder rather than creating a new `person_NNN` folder. Repeated runs progressively build up the database without losing prior work.
+
 ```bash
-# Sample 10% of photos (default)
+# First run — sample 10% of photos
 ./pt.py cluster --photos ./my_photos --output ./known_people
 
-# Sample a larger percentage to catch rarer people
-./pt.py cluster --photos ./my_photos --output ./known_people --sample 25
+# Second run — automatically builds on previous output
+./pt.py cluster --photos ./my_photos --output ./known_people --sample 20
 
 # Restrict to a year range to cluster by era (recommended for age brackets)
 ./pt.py cluster --photos ./my_photos --output ./known_people --years 2010 2015
 
-# Tune clustering sensitivity
-./pt.py cluster --photos ./my_photos --output ./known_people --eps 0.35 --min-samples 3
+# Tune clustering and anchor sensitivity
+./pt.py cluster --photos ./my_photos --output ./known_people --eps 0.35 --min-samples 3 --anchor-threshold 0.35
 ```
 
 | Argument | Default | Description |
@@ -150,15 +152,16 @@ Samples a percentage of your photo library, detects all faces, clusters them by 
 | `--years` | none | Restrict to a year range e.g. `--years 2010 2015` |
 | `--eps` | `0.40` | DBSCAN max distance to join a cluster — lower is stricter |
 | `--min-samples` | `3` | Minimum faces required to form a cluster |
+| `--anchor-threshold` | `0.40` | Max distance to merge a new cluster into an existing anchor |
 
 **Output structure:**
 ```
 known_people/
     person_001/       ← rename this to the person's real name
-        face_001.jpg
-        face_002.jpg
+        person_001_001.jpg
+        person_001_002.jpg
     person_002/
-        face_001.jpg
+        person_002_001.jpg
     unmatched/        ← faces that didn't cluster with anyone
 ```
 
@@ -171,6 +174,7 @@ known_people/
 **Tuning tips:**
 - If clusters are too large (mixing different people), lower `--eps` e.g. `0.30`
 - If clusters are too fragmented (same person split across many folders), raise `--eps` e.g. `0.45`
+- If a renamed person keeps getting new `person_NNN` folders instead of merging, lower `--anchor-threshold`
 - Use `--years` to cluster by era — this works well with the age bracket strategy for people who appear across many decades
 - Increase `--sample` if key people aren't appearing in clusters (they may be rare in your library)
 

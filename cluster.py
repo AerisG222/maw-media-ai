@@ -7,6 +7,12 @@ Samples a percentage of your photo library, detects all faces, clusters them
 by similarity using DBSCAN, and exports representative face crops into the
 known_people folder structure ready for enrollment.
 
+On subsequent runs, existing folders in --output are loaded as anchors.
+New clusters are matched against these anchors first — if close enough they
+are merged into the existing folder rather than creating a new person_NNN
+folder. Repeated runs progressively build up the database without losing
+prior work.
+
 After running this command:
   1. Review the output folders in known_people/
   2. Rename each person_NNN folder to the person's real name
@@ -14,10 +20,10 @@ After running this command:
   4. Run:  ./pt.py enroll --known ./known_people --db faces.db
 
 Usage:
-    # Sample 10% of photos (default)
+    # First run — sample 10% of photos
     ./pt.py cluster --photos ./my_photos --output ./known_people
 
-    # Sample a specific percentage
+    # Second run — builds on previous output automatically
     ./pt.py cluster --photos ./my_photos --output ./known_people --sample 20
 
     # Restrict to a year range (matches your <root>/<year>/... structure)
@@ -27,7 +33,6 @@ Usage:
     ./pt.py cluster --photos ./my_photos --output ./known_people --eps 0.35 --min-samples 3
 """
 
-import os
 import sys
 import random
 import argparse
@@ -40,26 +45,106 @@ from tqdm import tqdm
 from common import (
     DeepFace,
     MODEL_NAME, DETECTOR,
-    find_images,
+    find_images, cosine_distance,
 )
 
 # ── Clustering defaults ───────────────────────────────────────────────────
-DEFAULT_SAMPLE_PCT  = 10     # % of photos to sample
-DEFAULT_EPS         = 0.40   # DBSCAN: max cosine distance to join a cluster
-DEFAULT_MIN_SAMPLES = 3      # DBSCAN: min faces to form a cluster
-MAX_CROPS_PER_CLUSTER = 10   # max reference crops to export per person
+DEFAULT_SAMPLE_PCT    = 10    # % of photos to sample
+DEFAULT_EPS           = 0.40  # DBSCAN: max cosine distance to join a cluster
+DEFAULT_MIN_SAMPLES   = 3     # DBSCAN: min faces to form a cluster
+DEFAULT_ANCHOR_THRESH = 0.40  # max distance to merge a new cluster into an anchor
+MAX_CROPS_PER_CLUSTER = 10    # max reference crops to export per person
 
+
+# ── Anchor loading ────────────────────────────────────────────────────────
+
+def load_anchors_from_output(output_folder: Path) -> dict[str, list[np.ndarray]]:
+    """
+    Load embeddings from face crops already present in the output folder.
+    Each sub-folder name becomes an anchor label.
+    Returns {folder_name: [embeddings]}.
+    """
+    anchors = {}
+    if not output_folder.exists():
+        return anchors
+
+    person_dirs = [d for d in output_folder.iterdir() if d.is_dir() and d.name != "unmatched"]
+    if not person_dirs:
+        return anchors
+
+    print(f"  Loading anchors from existing output folder...")
+    for person_dir in sorted(person_dirs):
+        images = find_images(str(person_dir), require_4k=False)
+        if not images:
+            continue
+
+        embeddings = []
+        for img_path in images:
+            try:
+                result = DeepFace.represent(
+                    img_path=str(img_path),
+                    model_name=MODEL_NAME,
+                    detector_backend=DETECTOR,
+                    enforce_detection=False,
+                )
+                for face in result:
+                    emb = np.array(face["embedding"])
+                    if emb is not None:
+                        embeddings.append(emb)
+            except Exception:
+                continue
+
+        if embeddings:
+            anchors[person_dir.name] = embeddings
+
+    print(f"  Found {len(anchors)} existing anchor(s): {', '.join(sorted(anchors.keys()))}\n")
+    return anchors
+
+
+def anchor_centroid(embeddings: list[np.ndarray]) -> np.ndarray:
+    """Compute the mean (centroid) embedding for a set of face embeddings."""
+    stacked = np.array(embeddings)
+    mean    = stacked.mean(axis=0)
+    return mean / (np.linalg.norm(mean) + 1e-10)
+
+
+def match_cluster_to_anchor(
+    cluster_embeddings: list[np.ndarray],
+    anchors: dict[str, list[np.ndarray]],
+    threshold: float,
+) -> str | None:
+    """
+    Compare the centroid of a new cluster against all anchor centroids.
+    Returns the name of the closest anchor if within threshold, else None.
+    """
+    if not anchors:
+        return None
+
+    cluster_centroid = anchor_centroid(cluster_embeddings)
+    best_name = None
+    best_dist = float("inf")
+
+    for name, embeddings in anchors.items():
+        centroid = anchor_centroid(embeddings)
+        dist     = cosine_distance(cluster_centroid, centroid)
+        if dist < best_dist:
+            best_dist = dist
+            best_name = name
+
+    return best_name if best_dist <= threshold else None
+
+
+# ── Face extraction ───────────────────────────────────────────────────────
 
 def sample_images(images: list[Path], pct: float, years: tuple | None) -> list[Path]:
     """
     Filter images to a year range if specified, then randomly sample pct%.
-    Year is inferred from the grandparent directory name (the <year> level).
+    Year is inferred from path components (the <year> level).
     """
     if years:
         year_start, year_end = years
         filtered = []
         for p in images:
-            # Walk up path parts to find a 4-digit year component
             for part in p.parts:
                 if part.isdigit() and len(part) == 4:
                     y = int(part)
@@ -91,7 +176,7 @@ def extract_embeddings(images: list[Path]) -> tuple[list[np.ndarray], list[dict]
                 detector_backend=DETECTOR,
                 enforce_detection=False,
             )
-        except Exception as e:
+        except Exception:
             continue
 
         for i, face in enumerate(faces):
@@ -99,13 +184,15 @@ def extract_embeddings(images: list[Path]) -> tuple[list[np.ndarray], list[dict]
             region = face.get("facial_area", {})
             embeddings.append(emb)
             metadata.append({
-                "img_path":  img_path,
+                "img_path":   img_path,
                 "face_index": i,
-                "region":    region,
+                "region":     region,
             })
 
     return embeddings, metadata
 
+
+# ── Clustering ────────────────────────────────────────────────────────────
 
 def cluster_embeddings(
     embeddings: list[np.ndarray],
@@ -127,12 +214,12 @@ def cluster_embeddings(
         print("  ⚠  Not enough faces detected to cluster.")
         sys.exit(1)
 
-    # Normalise embeddings to unit length so euclidean distance ≈ cosine distance
     normed = normalize(np.array(embeddings))
-    # eps in cosine space; sklearn DBSCAN uses euclidean on normalised vectors
-    db = DBSCAN(eps=eps, min_samples=min_samples, metric="euclidean", n_jobs=-1)
+    db     = DBSCAN(eps=eps, min_samples=min_samples, metric="euclidean", n_jobs=-1)
     return db.fit_predict(normed)
 
+
+# ── Face cropping & export ────────────────────────────────────────────────
 
 def crop_face(img_path: Path, region: dict, padding: float = 0.20) -> np.ndarray | None:
     """
@@ -153,7 +240,6 @@ def crop_face(img_path: Path, region: dict, padding: float = 0.20) -> np.ndarray
         if w <= 0 or h <= 0:
             return None
 
-        # Add padding
         pad_x = int(w * padding)
         pad_y = int(h * padding)
         x1 = max(0, x - pad_x)
@@ -165,7 +251,6 @@ def crop_face(img_path: Path, region: dict, padding: float = 0.20) -> np.ndarray
         if crop.size == 0:
             return None
 
-        # Resize to a consistent reference size
         crop = cv2.resize(crop, (256, 256), interpolation=cv2.INTER_LANCZOS4)
         return crop
 
@@ -173,29 +258,77 @@ def crop_face(img_path: Path, region: dict, padding: float = 0.20) -> np.ndarray
         return None
 
 
+def next_crop_index(folder: Path, folder_name: str) -> int:
+    """
+    Return the next available crop index for a folder, accounting for
+    any crops already saved there from a previous run.
+    """
+    existing = list(folder.glob(f"{folder_name}_*.jpg"))
+    if not existing:
+        return 1
+    indices = []
+    for f in existing:
+        stem = f.stem  # e.g. "person_001_003"
+        try:
+            indices.append(int(stem.rsplit("_", 1)[-1]))
+        except ValueError:
+            pass
+    return max(indices) + 1 if indices else 1
+
+
+def is_duplicate(
+    candidate: np.ndarray,
+    existing: list[np.ndarray],
+    threshold: float = 0.15,
+) -> bool:
+    """
+    Return True if the candidate embedding is too similar to any existing one.
+    A low threshold (default 0.15) catches near-identical frames while still
+    allowing genuinely different photos of the same person to be saved.
+    """
+    for emb in existing:
+        if cosine_distance(candidate, emb) < threshold:
+            return True
+    return False
+
+
 def export_clusters(
     labels: np.ndarray,
     metadata: list[dict],
-    output_folder: str,
+    embeddings: list[np.ndarray],
+    output_folder: Path,
+    anchors: dict[str, list[np.ndarray]],
+    anchor_threshold: float,
     max_crops: int,
 ):
     """
     Export face crops grouped by cluster label into the output folder.
-    Noise faces (label -1) go into an 'unmatched' sub-folder.
+
+    For each cluster:
+      - If it matches an existing anchor, crops are added to that folder
+      - Otherwise a new person_NNN folder is created
+    Near-duplicate faces (too similar to one already saved) are skipped.
+    Noise faces (label -1) go into the 'unmatched' sub-folder.
     """
-    output_folder = Path(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
 
     unique_labels = sorted(set(labels))
-    n_clusters    = sum(1 for l in unique_labels if l >= 0)
-    n_noise       = sum(1 for l in labels if l == -1)
+    new_clusters  = [l for l in unique_labels if l >= 0]
+    n_noise       = int(np.sum(labels == -1))
 
-    print(f"\n  Clusters found : {n_clusters}")
-    print(f"  Unmatched faces: {n_noise}")
-    print(f"\n  Exporting face crops...\n")
+    print(f"\n  New clusters found : {len(new_clusters)}")
+    print(f"  Unmatched faces    : {n_noise}")
+    print(f"\n  Resolving clusters against anchors...\n")
 
-    # Pad cluster index for consistent folder naming
-    width = len(str(n_clusters))
+    # Figure out next available person index for genuinely new clusters
+    existing_person_dirs = [
+        d for d in output_folder.iterdir()
+        if d.is_dir() and d.name.startswith("person_")
+    ]
+    next_person_idx = len(existing_person_dirs) + 1
+
+    merged_count   = 0
+    new_count      = 0
 
     for label in unique_labels:
         indices = [i for i, l in enumerate(labels) if l == label]
@@ -203,31 +336,61 @@ def export_clusters(
         if label == -1:
             folder_name = "unmatched"
         else:
-            folder_name = f"person_{str(label + 1).zfill(width)}"
+            cluster_embs   = [embeddings[i] for i in indices]
+            matched_anchor = match_cluster_to_anchor(cluster_embs, anchors, anchor_threshold)
+
+            if matched_anchor:
+                folder_name = matched_anchor
+                merged_count += 1
+                print(f"  Cluster {label+1:>3}  →  merged into '{folder_name}' ({len(indices)} face(s))")
+            else:
+                width       = max(3, len(str(next_person_idx + len(new_clusters))))
+                folder_name = f"person_{str(next_person_idx).zfill(width)}"
+                next_person_idx += 1
+                new_count += 1
+                print(f"  Cluster {label+1:>3}  →  new folder '{folder_name}' ({len(indices)} face(s))")
 
         cluster_dir = output_folder / folder_name
         cluster_dir.mkdir(parents=True, exist_ok=True)
+
+        # Seed the seen-embeddings list from the anchor so we also deduplicate
+        # against faces saved in previous runs, not just the current batch
+        seen_embeddings: list[np.ndarray] = list(anchors.get(folder_name, []))
 
         # Pick a diverse spread of crops up to max_crops
         step    = max(1, len(indices) // max_crops)
         to_save = indices[::step][:max_crops]
 
-        saved = 0
+        start_idx = next_crop_index(cluster_dir, folder_name)
+        saved     = 0
+        skipped   = 0
+
         for idx in to_save:
-            meta  = metadata[idx]
-            crop  = crop_face(meta["img_path"], meta["region"])
+            emb  = embeddings[idx]
+            meta = metadata[idx]
+
+            if is_duplicate(emb, seen_embeddings):
+                skipped += 1
+                continue
+
+            crop = crop_face(meta["img_path"], meta["region"])
             if crop is None:
                 continue
 
-            out_path = cluster_dir / f"{folder_name}_{saved + 1:03d}.jpg"
+            out_path = cluster_dir / f"{folder_name}_{start_idx + saved:03d}.jpg"
             cv2.imwrite(str(out_path), crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            seen_embeddings.append(emb)
             saved += 1
 
-        if label >= 0:
-            print(f"  {folder_name}  →  {len(indices)} face(s) detected, {saved} crop(s) saved")
+        if skipped:
+            print(f"             {skipped} near-duplicate(s) skipped")
 
-    print(f"\n  Crops saved → {output_folder.resolve()}")
+    print(f"\n  Merged into existing : {merged_count}")
+    print(f"  New folders created  : {new_count}")
+    print(f"  Crops saved        → {output_folder.resolve()}")
 
+
+# ── Main pipeline ─────────────────────────────────────────────────────────
 
 def cluster(
     photos_folder: str,
@@ -236,17 +399,29 @@ def cluster(
     years: tuple | None,
     eps: float,
     min_samples: int,
+    anchor_threshold: float,
 ):
-    """Full clustering pipeline: sample → detect → cluster → export."""
+    """Full clustering pipeline: load anchors → sample → detect → cluster → export."""
+
+    output_path = Path(output_folder)
 
     print(f"\n{'─'*50}")
-    print(f"  Clustering faces in: {photos_folder}")
-    print(f"  Sample rate : {sample_pct}%")
+    print(f"  Clustering faces in : {photos_folder}")
+    print(f"  Sample rate         : {sample_pct}%")
     if years:
-        print(f"  Year range  : {years[0]}–{years[1]}")
-    print(f"  DBSCAN eps  : {eps}  |  min samples: {min_samples}")
-    print(f"  Output      : {output_folder}")
+        print(f"  Year range          : {years[0]}–{years[1]}")
+    print(f"  DBSCAN eps          : {eps}  |  min samples: {min_samples}")
+    print(f"  Anchor threshold    : {anchor_threshold}")
+    print(f"  Output              : {output_folder}")
     print(f"{'─'*50}\n")
+
+    # ── Load anchors from any existing output folders ─────────────────────
+    anchors = load_anchors_from_output(output_path)
+
+    if anchors:
+        print(f"  Total anchors loaded: {len(anchors)} person(s)\n")
+    else:
+        print(f"  No existing anchors found — all clusters will be new.\n")
 
     # ── Sample images ─────────────────────────────────────────────────────
     all_images = find_images(photos_folder)
@@ -255,8 +430,8 @@ def cluster(
         sys.exit(1)
 
     sampled = sample_images(all_images, sample_pct, years)
-    print(f"  Total images  : {len(all_images)}")
-    print(f"  Sampled       : {len(sampled)} ({sample_pct}%)\n")
+    print(f"  Total images : {len(all_images)}")
+    print(f"  Sampled      : {len(sampled)} ({sample_pct}%)\n")
 
     # ── Extract embeddings ────────────────────────────────────────────────
     embeddings, metadata = extract_embeddings(sampled)
@@ -273,12 +448,20 @@ def cluster(
     labels = cluster_embeddings(embeddings, eps, min_samples)
 
     # ── Export ────────────────────────────────────────────────────────────
-    export_clusters(labels, metadata, output_folder, MAX_CROPS_PER_CLUSTER)
+    export_clusters(
+        labels=labels,
+        metadata=metadata,
+        embeddings=embeddings,
+        output_folder=output_path,
+        anchors=anchors,
+        anchor_threshold=anchor_threshold,
+        max_crops=MAX_CROPS_PER_CLUSTER,
+    )
 
-    # ── Next steps ────────────────────────────────────────────────────────
+    # ── Summary ───────────────────────────────────────────────────────────
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     print(f"\n{'─'*50}")
-    print(f"  ✓ Done! {n_clusters} potential people found.")
+    print(f"  ✓ Done! {n_clusters} cluster(s) processed.")
     print(f"{'─'*50}")
     print(f"\n  Next steps:")
     print(f"  1. Review folders in: {output_folder}")
@@ -294,18 +477,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--photos",      required=True,
+    parser.add_argument("--photos",           required=True,
                         help="Folder of photos to sample from")
-    parser.add_argument("--output",      required=True,
+    parser.add_argument("--output",           required=True,
                         help="Output folder for clustered face crops (e.g. ./known_people)")
-    parser.add_argument("--sample",      type=float, default=DEFAULT_SAMPLE_PCT,
+    parser.add_argument("--sample",           type=float, default=DEFAULT_SAMPLE_PCT,
                         help=f"Percentage of photos to sample (default: {DEFAULT_SAMPLE_PCT})")
-    parser.add_argument("--years",       type=int, nargs=2, metavar=("START", "END"),
+    parser.add_argument("--years",            type=int, nargs=2, metavar=("START", "END"),
                         help="Restrict to a year range e.g. --years 2010 2015")
-    parser.add_argument("--eps",         type=float, default=DEFAULT_EPS,
+    parser.add_argument("--eps",              type=float, default=DEFAULT_EPS,
                         help=f"DBSCAN: max distance to join a cluster (default: {DEFAULT_EPS}, lower = stricter)")
-    parser.add_argument("--min-samples", type=int, default=DEFAULT_MIN_SAMPLES,
+    parser.add_argument("--min-samples",      type=int, default=DEFAULT_MIN_SAMPLES,
                         help=f"DBSCAN: min faces to form a cluster (default: {DEFAULT_MIN_SAMPLES})")
+    parser.add_argument("--anchor-threshold", type=float, default=DEFAULT_ANCHOR_THRESH,
+                        help=f"Max distance to merge a new cluster into an existing anchor (default: {DEFAULT_ANCHOR_THRESH})")
 
     args = parser.parse_args()
     cluster(
@@ -315,6 +500,7 @@ def main():
         years=tuple(args.years) if args.years else None,
         eps=args.eps,
         min_samples=args.min_samples,
+        anchor_threshold=args.anchor_threshold,
     )
 
 
