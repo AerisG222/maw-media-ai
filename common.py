@@ -93,18 +93,22 @@ def file_hash(path: str) -> str:
     return h.hexdigest()
 
 
-def find_images(folder: str, extensions: set[str] | None = None) -> list[Path]:
+def find_images(
+    folder: str,
+    extensions: set[str] | None = None,
+    require_4k: bool = True,
+) -> list[Path]:
     """
-    Recursively find all image files in a folder, restricted to images that
-    reside inside a directory named '4k'.
-
-    Expected directory structure:
-        <root>/<year>/<category>/4k/<images>
+    Recursively find all image files in a folder.
 
     Args:
         folder:     Root folder to search.
         extensions: Set of lowercase extensions to include e.g. {'.jpg', '.png'}.
                     Defaults to IMAGE_EXTENSIONS if not provided.
+        require_4k: When True (default), only returns images whose immediate
+                    parent directory is named '4k', matching the library structure:
+                        <root>/<year>/<category>/4k/<images>
+                    Set to False for flat folders like known_people/ or cluster output.
 
     Returns:
         Sorted list of matching Path objects.
@@ -115,7 +119,7 @@ def find_images(folder: str, extensions: set[str] | None = None) -> list[Path]:
         p for p in folder.rglob("*")
         if p.suffix.lower() in exts
         and p.is_file()
-        and p.parent.name.lower() == "4k"
+        and (not require_4k or p.parent.name.lower() == "4k")
     ])
 
 

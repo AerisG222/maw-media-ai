@@ -50,7 +50,7 @@ def enroll(known_folder: str, db_path: str):
 
     for person_dir in sorted(people_dirs):
         name = person_dir.name
-        images = find_images(str(person_dir))
+        images = find_images(str(person_dir), require_4k=False)
 
         if not images:
             print(f"  ⚠  {name}: no images found, skipping.")
