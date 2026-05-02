@@ -1,0 +1,20 @@
+# Core face detection & recognition
+insightface>=0.7.3
+onnxruntime-gpu>=1.17.0
+
+# Clustering
+hdbscan>=0.8.33
+scikit-learn>=1.4.0
+
+# Image loading
+opencv-python-headless>=4.9.0
+Pillow>=10.0.0
+
+# Database
+psycopg[binary]>=3.1.0       # psycopg3 — modern async-capable Postgres driver
+
+# Progress bar
+tqdm>=4.66.0
+
+# Numerical
+numpy>=1.26.0
