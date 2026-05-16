@@ -39,8 +39,8 @@ pip install -r requirements.txt
 ### 1. Start the Postgres + pgvector container
 
 ```bash
-chmod +x setup_db.sh
-./setup_db.sh
+chmod +x setup-db.sh
+./setup-db.sh
 ```
 
 This will:
@@ -54,11 +54,11 @@ The script prints the `FACE_SCANNER_DSN` export line when done.
 #### Container management
 
 ```bash
-./setup_db.sh start    # start after a reboot
-./setup_db.sh stop     # stop (data is preserved)
-./setup_db.sh psql     # open an interactive psql session
-./setup_db.sh logs     # tail container logs
-./setup_db.sh destroy  # stop + delete container AND all data
+./setup-db.sh start    # start after a reboot
+./setup-db.sh stop     # stop (data is preserved)
+./setup-db.sh psql     # open an interactive psql session
+./setup-db.sh logs     # tail container logs
+./setup-db.sh destroy  # stop + delete container AND all data
 ```
 
 #### Configuration
@@ -75,7 +75,7 @@ Override any default via environment variable before running the script:
 | `VOLUME_NAME` | `face_scanner_pgdata` | Podman volume name |
 
 ```bash
-PG_PASSWORD=mysecret PG_PORT=5434 ./setup_db.sh
+PG_PASSWORD=mysecret PG_PORT=5434 ./setup-db.sh
 ```
 
 ### 2. Set the connection string
@@ -84,7 +84,7 @@ PG_PASSWORD=mysecret PG_PORT=5434 ./setup_db.sh
 export FACE_SCANNER_DSN="postgresql://face_scanner:face_scanner_secret@localhost:5433/face_scanner"
 ```
 
-Or edit the `DB_DSN` default at the top of `scan_faces.py`.
+Or edit the `DB_DSN` default at the top of `scan-faces.py`.
 
 ---
 
@@ -95,7 +95,7 @@ Or edit the `DB_DSN` default at the top of `scan_faces.py`.
 Detects faces in every photo and stores embeddings. No clustering yet.
 
 ```bash
-python scan_faces.py scan --photo-dir /path/to/photos
+python scan-faces.py scan --photo-dir /path/to/photos
 ```
 
 ### Cluster into persons
@@ -104,7 +104,7 @@ Groups all stored embeddings into person clusters using HDBSCAN.
 Run this after a full scan, or after adding many new photos.
 
 ```bash
-python scan_faces.py cluster
+python scan-faces.py cluster
 ```
 
 ### Incremental scan (ongoing)
@@ -112,7 +112,7 @@ python scan_faces.py cluster
 Skips photos already in the database; processes only new arrivals.
 
 ```bash
-python scan_faces.py scan --photo-dir /path/to/photos --incremental
+python scan-faces.py scan --photo-dir /path/to/photos --incremental
 ```
 
 After adding a batch of new photos, re-run clustering so the new faces
@@ -121,7 +121,7 @@ get folded into existing persons (or new ones are created).
 ### Check stats
 
 ```bash
-python scan_faces.py stats
+python scan-faces.py stats
 ```
 
 ---
@@ -217,7 +217,7 @@ WHERE people ? 'Jane Smith';
 | Incremental recognition too aggressive | Lower `RECOGNITION_DISTANCE_THRESHOLD` (e.g. 0.35) |
 
 All tuning parameters can be set via environment variables — see the top
-of `scan_faces.py` for the full list.
+of `scan-faces.py` for the full list.
 
 ---
 
