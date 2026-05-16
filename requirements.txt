@@ -18,3 +18,7 @@ tqdm>=4.66.0
 
 # Numerical
 numpy>=1.26.0
+
+# streamlit web app to view results
+streamlit>=1.56.0
+psycopg2-binary
