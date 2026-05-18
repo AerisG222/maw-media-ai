@@ -1,5 +1,5 @@
 -- =============================================================================
--- Face Scanner Schema
+-- Face Scanner Schema (UUID, no default)
 -- Run this once against your Postgres 18 database before the first scan.
 -- Requires the pgvector extension: https://github.com/pgvector/pgvector
 -- =============================================================================
@@ -13,7 +13,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- and remove the REFERENCES below that point here.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS photos (
-    id              BIGSERIAL PRIMARY KEY,
+    id              UUID PRIMARY KEY,
     file_path       TEXT NOT NULL UNIQUE,
     file_name       TEXT NOT NULL,
     scanned_at      TIMESTAMPTZ DEFAULT now(),
@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS photos (
 -- name is NULL until a human labels the cluster via your admin UI.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS persons (
-    id                          BIGSERIAL PRIMARY KEY,
+    id                          UUID PRIMARY KEY,
     name                        VARCHAR(255),            -- set by human operator
     cluster_label               INT,                     -- HDBSCAN cluster id
     representative_embedding    vector(512),             -- centroid of all face embeddings
@@ -42,13 +42,10 @@ CREATE TABLE IF NOT EXISTS persons (
 -- plus raw pixel values for convenience.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS face_detections (
-    id              BIGSERIAL PRIMARY KEY,
-    photo_id        BIGINT NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
-    person_id       BIGINT REFERENCES persons(id) ON DELETE SET NULL,
+    id              UUID PRIMARY KEY,
+    photo_id        UUID NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+    person_id       UUID REFERENCES persons(id) ON DELETE SET NULL,
     bounding_box    JSONB NOT NULL,
-    -- Example bounding_box:
-    -- { "x": 0.12, "y": 0.05, "width": 0.18, "height": 0.24,
-    --   "x_px": 154, "y_px": 64, "width_px": 230, "height_px": 307 }
     embedding       vector(512),
     detection_score FLOAT NOT NULL,
     face_width_px   INT NOT NULL,

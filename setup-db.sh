@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-# setup_db.sh
+# setup-db.sh
 # Starts a Postgres 16 + pgvector container via Podman and applies the schema.
 #
 # Usage:
-#   ./setup_db.sh            # start container + apply schema
-#   ./setup_db.sh start      # start an already-created container
-#   ./setup_db.sh stop       # stop the container (data is preserved)
-#   ./setup_db.sh destroy    # stop + delete container AND volume (all data lost)
-#   ./setup_db.sh logs       # tail container logs
-#   ./setup_db.sh psql       # open an interactive psql session
+#   ./setup-db.sh            # start container + apply schema
+#   ./setup-db.sh start      # start an already-created container
+#   ./setup-db.sh stop       # stop the container (data is preserved)
+#   ./setup-db.sh destroy    # stop + delete container AND volume (all data lost)
+#   ./setup-db.sh logs       # tail container logs
+#   ./setup-db.sh psql       # open an interactive psql session
 # =============================================================================
 
 set -euo pipefail

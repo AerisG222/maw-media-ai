@@ -86,65 +86,21 @@ log = logging.getLogger(__name__)
 # Database helpers
 # ---------------------------------------------------------------------------
 
-SCHEMA_SQL = """
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE IF NOT EXISTS photos (
-    id              BIGSERIAL PRIMARY KEY,
-    file_path       TEXT NOT NULL UNIQUE,
-    file_name       TEXT NOT NULL,
-    scanned_at      TIMESTAMPTZ DEFAULT now(),
-    scan_error      TEXT
-);
-
-CREATE TABLE IF NOT EXISTS persons (
-    id                       BIGSERIAL PRIMARY KEY,
-    name                     VARCHAR(255),
-    cluster_label            INT,
-    representative_embedding vector(512),
-    face_count               INT DEFAULT 0,
-    created_at               TIMESTAMPTZ DEFAULT now(),
-    updated_at               TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS face_detections (
-    id              BIGSERIAL PRIMARY KEY,
-    photo_id        BIGINT NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
-    person_id       BIGINT REFERENCES persons(id) ON DELETE SET NULL,
-    bounding_box    JSONB NOT NULL,
-    embedding       vector(512),
-    detection_score FLOAT NOT NULL,
-    face_width_px   INT NOT NULL,
-    face_height_px  INT NOT NULL,
-    created_at      TIMESTAMPTZ DEFAULT now()
-);
-
--- ANN index for fast similarity search. Rebuild after bulk inserts if needed:
---   DROP INDEX IF EXISTS face_detections_embedding_idx;
---   CREATE INDEX face_detections_embedding_idx ON face_detections
---       USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-CREATE INDEX IF NOT EXISTS face_detections_embedding_idx
-    ON face_detections USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
-
-CREATE INDEX IF NOT EXISTS face_detections_photo_id_idx
-    ON face_detections(photo_id);
-
-CREATE INDEX IF NOT EXISTS face_detections_person_id_idx
-    ON face_detections(person_id);
-"""
-
 
 def get_connection(dsn: str) -> psycopg.Connection:
     return psycopg.connect(dsn, row_factory=dict_row)
 
 
-def ensure_schema(conn: psycopg.Connection) -> None:
-    log.info("Ensuring database schema is up to date…")
+def check_schema(conn: psycopg.Connection) -> bool:
+    """Check if the required tables exist. Returns True if schema is present."""
+    required_tables = {"photos", "persons", "face_detections"}
     with conn.cursor() as cur:
-        cur.execute(SCHEMA_SQL)
-    conn.commit()
-    log.info("Schema OK.")
+        cur.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public'
+        """)
+        tables = {row["table_name"] for row in cur.fetchall()}
+    return required_tables.issubset(tables)
 
 
 def get_already_scanned_paths(conn: psycopg.Connection) -> set[str]:
@@ -154,47 +110,72 @@ def get_already_scanned_paths(conn: psycopg.Connection) -> set[str]:
         return {row["file_path"] for row in cur.fetchall()}
 
 
+import uuid
+
+
 def upsert_photo(
     conn: psycopg.Connection, file_path: str, error: str | None = None
-) -> int:
-    """Insert or update a photos row; return the photo id."""
+) -> str:
+    """Insert or update a photos row; return the photo id (UUID string)."""
     with conn.cursor() as cur:
+        # Try to fetch existing photo id first
+        cur.execute("SELECT id FROM photos WHERE file_path = %s", (file_path,))
+        row = cur.fetchone()
+        if row:
+            # Update scan_error if needed
+            cur.execute(
+                """
+                UPDATE photos SET scanned_at = now(), scan_error = %s WHERE id = %s
+                """,
+                (error, row[0]),
+            )
+            return row["id"]
+        # Insert new photo with generated UUIDv7
+        photo_id = str(uuid.uuid7())
         cur.execute(
             """
-            INSERT INTO photos (file_path, file_name, scan_error)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (file_path) DO UPDATE
-                SET scanned_at = now(),
-                    scan_error = EXCLUDED.scan_error
+            INSERT INTO photos (id, file_path, file_name, scan_error)
+            VALUES (%s, %s, %s, %s)
             RETURNING id
             """,
-            (file_path, Path(file_path).name, error),
+            (photo_id, file_path, Path(file_path).name, error),
         )
         return cur.fetchone()["id"]
 
 
 def insert_face(
     conn: psycopg.Connection,
-    photo_id: int,
+    photo_id: str,
     bbox: dict,
     embedding: np.ndarray,
     det_score: float,
     face_w: int,
     face_h: int,
-) -> int:
-    """Insert a face detection row; return the face id."""
+    person_id: str | None = None,
+) -> str:
+    """Insert a face detection row; return the face id (UUID string)."""
     import json
 
+    face_id = str(uuid.uuid7())
     vec_str = "[" + ",".join(f"{v:.8f}" for v in embedding.tolist()) + "]"
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO face_detections
-                (photo_id, bounding_box, embedding, detection_score, face_width_px, face_height_px)
-            VALUES (%s, %s, %s::vector, %s, %s, %s)
+                (id, photo_id, bounding_box, embedding, detection_score, face_width_px, face_height_px, person_id)
+            VALUES (%s, %s, %s, %s::vector, %s, %s, %s, %s)
             RETURNING id
             """,
-            (photo_id, json.dumps(bbox), vec_str, det_score, face_w, face_h),
+            (
+                face_id,
+                photo_id,
+                json.dumps(bbox),
+                vec_str,
+                det_score,
+                face_w,
+                face_h,
+                person_id,
+            ),
         )
         return cur.fetchone()["id"]
 
@@ -336,7 +317,11 @@ def cmd_scan(photo_dir: str, incremental: bool) -> None:
     log.info(f"Incremental mode: {incremental}")
 
     conn = get_connection(DB_DSN)
-    ensure_schema(conn)
+    if not check_schema(conn):
+        log.error(
+            "Database schema is missing. Please run setup-db.sh to initialize the schema."
+        )
+        sys.exit(1)
 
     all_images = iter_images(photo_dir)
     log.info(f"Found {len(all_images):,} image(s) in directory tree.")
@@ -494,13 +479,14 @@ def cmd_cluster() -> None:
         centroid_str = "[" + ",".join(f"{v:.8f}" for v in centroid.tolist()) + "]"
 
         with conn.cursor() as cur:
+            person_id = str(uuid.uuid7())
             cur.execute(
                 """
-                INSERT INTO persons (cluster_label, representative_embedding, face_count)
-                VALUES (%s, %s::vector, %s)
+                INSERT INTO persons (id, cluster_label, representative_embedding, face_count)
+                VALUES (%s, %s, %s::vector, %s)
                 RETURNING id
                 """,
-                (int(cluster_label), centroid_str, len(indices)),
+                (person_id, int(cluster_label), centroid_str, len(indices)),
             )
             person_id = cur.fetchone()["id"]
 

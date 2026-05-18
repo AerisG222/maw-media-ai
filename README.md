@@ -147,6 +147,30 @@ lets you type a name. This is the most efficient workflow for large libraries.
 
 ---
 
+## Viewing Clusters and Faces (Web UI)
+
+A simple web interface is provided to browse detected persons/clusters and their associated faces.
+
+### 1. Install Streamlit (if not already done)
+
+```bash
+pip install streamlit
+```
+
+### 2. Set the database connection
+
+Make sure your `FACE_SCANNER_DSN` environment variable is set, as described above.
+
+### 3. Run the viewer
+
+```bash
+streamlit run view_clusters_app.py
+```
+
+Then open the provided URL in your browser (usually http://localhost:8501).
+
+---
+
 ## Querying from .NET
 
 Install the packages:
