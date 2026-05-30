@@ -127,7 +127,7 @@ def upsert_photo(
                 """
                 UPDATE photos SET scanned_at = now(), scan_error = %s WHERE id = %s
                 """,
-                (error, row[0]),
+                (error, row["id"]),
             )
             return row["id"]
         # Insert new photo with generated UUIDv7

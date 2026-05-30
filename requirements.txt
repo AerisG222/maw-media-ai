@@ -1,6 +1,7 @@
 # Core face detection & recognition
 insightface>=0.7.3
 onnxruntime-gpu>=1.17.0
+nvidia-cudnn-cu12
 
 # Clustering
 hdbscan>=0.8.33

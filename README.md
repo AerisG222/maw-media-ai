@@ -256,3 +256,21 @@ of `scan-faces.py` for the full list.
   ```sql
   REINDEX INDEX face_detections_embedding_idx;
   ```
+
+---
+
+## CUDA Setup
+
+On my fedora system, CUDA 13 was installed, but ONNX seems to want 12.2.  This is how to get that installed:
+
+1. download the CUDA 12.2 installer from [NVIDIA](https://developer.nvidia.com/cuda-12-2-0-download-archive)
+2. run the installer and follow the prompts
+```bash
+sudo sh /home/mmorano/cuda/cuda_12.2.2_535.104.05_linux.run --override --toolkit --installpath=/usr/local/cuda-12.2
+```
+3. add the CUDA bin directory to your `PATH` and `LD_LIBRARY_PATH`:
+```bash
+export CUDA_HOME=/usr/local/cuda-12.2
+export PATH=/usr/local/cuda-12.2/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:~/git/maw-media-ai/.venv/lib/python3.14/site-packages/nvidia/cudnn/lib:$LD_LIBRARY_PATH
+```
