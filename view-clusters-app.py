@@ -1,3 +1,7 @@
+import base64
+import html
+import io
+import mimetypes
 import os
 
 import psycopg2
@@ -96,7 +100,7 @@ selected = st.sidebar.selectbox("Select a person/cluster:", person_options)
 selected_person_id = person_id_map[selected]
 
 # Pagination settings
-PAGE_SIZE = 24
+PAGE_SIZE = 25
 total_faces = fetch_face_count_for_person(selected_person_id)
 total_pages = max(1, (total_faces + PAGE_SIZE - 1) // PAGE_SIZE)
 
@@ -172,26 +176,75 @@ st.sidebar.markdown(f"Faces {start_idx}-{end_idx} of {total_faces}")
 if not faces:
     st.write("No faces to show for this page.")
 else:
-    cols = st.columns(6)
+    # Build an HTML grid and let the browser scale the images to fit the cells.
+    COLS = 6
+    CELL_W = 160
+    CELL_H = 200
+    CAPTION_H = 40
+    IMG_H = CELL_H - CAPTION_H
+
+    def _image_data_url(file_path, pil_img=None):
+        """Return a data URL for the image. If pil_img is provided, encode it as PNG
+        (no resizing). Otherwise return the original file bytes with guessed mime type.
+        """
+        try:
+            if pil_img is None:
+                mime, _ = mimetypes.guess_type(file_path)
+                if not mime:
+                    mime = "image/png"
+                with open(file_path, "rb") as f:
+                    data = f.read()
+                return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+            else:
+                buf = io.BytesIO()
+                pil_img.save(buf, format="PNG")
+                return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('ascii')}"
+        except Exception:
+            return None
+
+    cells = []
     for idx, row in enumerate(faces):
-        # row: (face_id, file_path, bounding_box, detection_score)
         try:
             face_id, file_path, bounding_box, score = row
         except ValueError:
-            # backward compatibility if query returns fewer columns
             face_id, file_path, bounding_box = row
             score = None
 
-        img = load_and_crop_face(file_path, bounding_box)
-        col = cols[idx % 6]
-        with col:
-            if img:
-                # Show the image, then display score below it
-                st.image(img, width=160)
-                if score is not None:
-                    try:
-                        st.caption(f"Score: {float(score):.2f}")
-                    except Exception:
-                        st.caption(f"Score: {score}")
-            else:
-                st.write(f"Could not load: {file_path}")
+        pil_img = load_and_crop_face(file_path, bounding_box)
+        data_url = _image_data_url(file_path, pil_img)
+        if not data_url:
+            # fallback placeholder
+            placeholder = (
+                f"<div style='width:{CELL_W}px;height:{IMG_H}px;background:#EEE;display:flex;align-items:center;justify-content:center;'>"
+                f"<span style='color:#999;font-size:12px;'>Could not load</span></div>"
+            )
+            img_html = placeholder
+        else:
+            alt_attr = html.escape(os.path.basename(file_path))
+            img_html = (
+                f'<img src="{data_url}" alt="{alt_attr}" loading="lazy" '
+                f'style="max-width:{CELL_W}px;max-height:{IMG_H}px;object-fit:contain;display:block;margin:auto;"/>'
+            )
+
+        fn = html.escape(os.path.basename(file_path))
+        score_text = ""
+        if score is not None:
+            try:
+                score_text = f"Score: {float(score):.2f}"
+            except Exception:
+                score_text = f"Score: {html.escape(str(score))}"
+
+        cell_html = (
+            f"<div style='width:{CELL_W}px;height:{CELL_H}px;display:flex;flex-direction:column;align-items:center;'>"
+            f"<div style='width:{CELL_W}px;height:{IMG_H}px;display:flex;align-items:center;justify-content:center;'>"
+            f"{img_html}"
+            f"</div>"
+            f"<div style='width:{CELL_W}px;height:{CAPTION_H - (CAPTION_H // 2)}px;font-size:11px;color:#666;text-align:center;'>{html.escape(score_text)}</div>"
+            f"</div>"
+        )
+        cells.append(cell_html)
+
+    # Use a flexbox container so cells automatically wrap to the available width.
+    flex_style = "display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;justify-content:flex-start;"
+    container_html = "<div style='" + flex_style + "'>" + "".join(cells) + "</div>"
+    st.markdown(container_html, unsafe_allow_html=True)
