@@ -120,41 +120,10 @@ page_input = st.sidebar.number_input(
 # Update stored page to the widget's value (widget has its own internal key, so this is safe)
 st.session_state[page_key] = int(page_input)
 
-# Header and navigation buttons in the main area
-st.header(f"Faces for: {selected}")
-nav_col1, nav_col2, nav_col3, nav_col4, nav_col5 = st.columns([1, 1, 3, 1, 1])
+# Header in the main area
+st.header(f"{selected}")
 
 curr_page = st.session_state[page_key]
-
-
-# Use callbacks on the buttons to update session state so we don't attempt to modify
-# a widget-owned key after widget creation. The callbacks are small helper lambdas.
-def _set_page(new_page):
-    st.session_state[page_key] = new_page
-
-
-start_btn = nav_col1.button(
-    "⏮ Start", disabled=(curr_page == 1), on_click=_set_page, args=(1,)
-)
-prev_btn = nav_col2.button(
-    "◀ Prev",
-    disabled=(curr_page == 1),
-    on_click=_set_page,
-    args=(max(1, curr_page - 1),),
-)
-nav_col3.markdown(f"Page **{curr_page}** of **{total_pages}**")
-next_btn = nav_col4.button(
-    "Next ▶",
-    disabled=(curr_page == total_pages),
-    on_click=_set_page,
-    args=(min(total_pages, curr_page + 1),),
-)
-end_btn = nav_col5.button(
-    "End ⏭",
-    disabled=(curr_page == total_pages),
-    on_click=_set_page,
-    args=(total_pages,),
-)
 
 # Use the (possibly updated) page value from session state
 page = st.session_state[page_key]
@@ -165,9 +134,40 @@ faces = fetch_faces_for_person(selected_person_id, limit=PAGE_SIZE, offset=offse
 start_idx = offset + 1 if total_faces > 0 else 0
 end_idx = offset + len(faces)
 
-st.subheader(
-    f"Showing {start_idx}-{end_idx} of {total_faces} (page {page}/{total_pages})"
+
+# Use callbacks on the buttons to update session state so we don't attempt to modify
+# a widget-owned key after widget creation. The callbacks are small helper lambdas.
+def _set_page(new_page):
+    st.session_state[page_key] = new_page
+
+
+nav_col1, nav_col2, nav_col3, nav_col4 = st.sidebar.columns([1, 1, 1, 1])
+
+start_btn = nav_col1.button(
+    "⏮ Start", disabled=(curr_page == 1), on_click=_set_page, args=(1,)
 )
+prev_btn = nav_col2.button(
+    "◀ Prev",
+    disabled=(curr_page == 1),
+    on_click=_set_page,
+    args=(max(1, curr_page - 1),),
+)
+next_btn = nav_col3.button(
+    "Next ▶",
+    disabled=(curr_page == total_pages),
+    on_click=_set_page,
+    args=(min(total_pages, curr_page + 1),),
+)
+end_btn = nav_col4.button(
+    "End ⏭",
+    disabled=(curr_page == total_pages),
+    on_click=_set_page,
+    args=(total_pages,),
+)
+
+# Move navigation/status summary to the left sidebar
+st.sidebar.markdown(f"Page **{curr_page}** of **{total_pages}**")
+st.sidebar.markdown(f"Faces {start_idx}-{end_idx} of {total_faces}")
 
 if not faces:
     st.write("No faces to show for this page.")
@@ -186,12 +186,13 @@ else:
         col = cols[idx % 6]
         with col:
             if img:
-                caption = os.path.basename(file_path)
+                # Show the image, then display filename and score below it
+                st.image(img, width=160)
+                st.caption(os.path.basename(file_path))
                 if score is not None:
                     try:
-                        caption = f"{caption} — score: {float(score):.2f}"
+                        st.caption(f"Score: {float(score):.2f}")
                     except Exception:
-                        pass
-                st.image(img, caption=caption, width=160)
+                        st.caption(f"Score: {score}")
             else:
                 st.write(f"Could not load: {file_path}")
