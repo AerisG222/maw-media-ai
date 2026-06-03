@@ -3,6 +3,7 @@ import html
 import io
 import mimetypes
 import os
+import time
 
 import psycopg2
 import streamlit as st
@@ -96,8 +97,65 @@ person_options = [
 ]
 person_id_map = {person_options[i]: persons[i][0] for i in range(len(persons))}
 
-selected = st.sidebar.selectbox("Select a person/cluster:", person_options)
+# Persist selected person id in session state so selection survives reruns and name edits
+if "selected_person_id" not in st.session_state:
+    st.session_state["selected_person_id"] = persons[0][0]
+
+# Compute index of the currently selected person for the selectbox
+selected_index = 0
+for i, p in enumerate(persons):
+    if p[0] == st.session_state["selected_person_id"]:
+        selected_index = i
+        break
+
+selected = st.sidebar.selectbox(
+    "Select a person/cluster:",
+    person_options,
+    index=selected_index,
+    key="person_select",
+)
 selected_person_id = person_id_map[selected]
+st.session_state["selected_person_id"] = selected_person_id
+
+# Text input for naming the selected person/cluster
+person_name_map = {p[0]: p[1] for p in persons}
+current_name = person_name_map.get(selected_person_id) or ""
+name_key = f"name_{selected_person_id}"
+new_name = st.sidebar.text_input(
+    "Cluster name (optional)", value=current_name, key=name_key
+)
+if st.sidebar.button("Save name"):
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE persons SET name = %s WHERE id = %s",
+                (new_name if new_name else None, selected_person_id),
+            )
+            conn.commit()
+        conn.close()
+        st.sidebar.success("Name saved")
+        # Trigger a rerun in a way that's compatible across Streamlit versions.
+        rerun_fn = getattr(st, "experimental_rerun", None)
+        if callable(rerun_fn):
+            rerun_fn()
+        else:
+            # Fallback: try to change query params which causes a rerun in many versions
+            set_qp = getattr(st, "experimental_set_query_params", None)
+            get_qp = getattr(st, "experimental_get_query_params", None)
+            if callable(set_qp) and callable(get_qp):
+                try:
+                    params = get_qp() or {}
+                    params["_refresh"] = str(time.time())
+                    set_qp(**params)
+                except Exception:
+                    st.sidebar.info(
+                        "Name saved — please refresh the page to see changes."
+                    )
+            else:
+                st.sidebar.info("Name saved — please refresh the page to see changes.")
+    except Exception as e:
+        st.sidebar.error(f"Failed to save name: {e}")
 
 # Pagination settings
 PAGE_SIZE = 25
