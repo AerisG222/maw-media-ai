@@ -186,9 +186,8 @@ else:
         col = cols[idx % 6]
         with col:
             if img:
-                # Show the image, then display filename and score below it
+                # Show the image, then display score below it
                 st.image(img, width=160)
-                st.caption(os.path.basename(file_path))
                 if score is not None:
                     try:
                         st.caption(f"Score: {float(score):.2f}")
