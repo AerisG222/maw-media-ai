@@ -278,6 +278,76 @@ def render_person_card_meta(name: str | None, face_count: int, top_score: float 
         )
 
 
+def render_clickable_person_card(
+    person_id: str | int,
+    data_url: str | None,
+    name: str | None,
+    face_count: int,
+    top_score: float | None,
+    width: int = 160,
+    height: int = 160,
+    filename: str = "Image",
+):
+    """Render a single clickable card for a cluster/person."""
+    # Build Image HTML
+    if data_url:
+        style = f"width:{width}px;height:{height}px;object-fit:contain;display:block;margin:auto;user-select:none;border-radius:4px;"
+        img_html = (
+            f'<img src="{data_url}" alt="{html.escape(filename)}" '
+            f'style="{style}" draggable="false" />'
+        )
+    else:
+        img_html = (
+            f'<div style="width:{width}px;height:{height}px;background:var(--background-color);'
+            f'display:flex;align-items:center;justify-content:center;border-radius:4px;margin:auto;">'
+            f'<span style="color:#999;font-size:12px;">No preview</span></div>'
+        )
+
+    # Build Metadata HTML
+    name_html = f'<div style="margin-top:8px;margin-bottom:2px;font-size:0.95rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"><strong>{html.escape(name or "Unnamed")}</strong></div>'
+
+    if top_score is not None:
+        try:
+            score_text = f"{float(top_score):.2f}"
+        except (ValueError, TypeError):
+            score_text = str(top_score)
+        meta_html = f'<span style="font-size:0.8rem;opacity:0.8;">Faces: {face_count} | Top: {score_text}</span>'
+    else:
+        meta_html = (
+            f'<span style="font-size:0.8rem;opacity:0.8;">Faces: {face_count}</span>'
+        )
+
+    # Combine into clickable card
+    card_html = f"""
+    <a href="?open={html.escape(str(person_id))}" target="_self" style="text-decoration:none;color:inherit;display:block;">
+        <div style="
+            border: 1px solid var(--secondary-background-color);
+            border-radius: 8px;
+            padding: 12px;
+            background-color: var(--secondary-background-color);
+            transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s;
+            cursor: pointer;
+            text-align: center;
+            height: {height + 75}px;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        " onmouseover="this.style.transform='scale(1.02)';this.style.borderColor='var(--primary-color)';"
+           onmouseout="this.style.transform='scale(1)';this.style.borderColor='var(--secondary-background-color)';">
+            <div>
+                {img_html}
+            </div>
+            <div>
+                {name_html}
+                {meta_html}
+            </div>
+        </div>
+    </a>
+    """
+    st.markdown(card_html, unsafe_allow_html=True)
+
+
 def render_face_grid_cell_html(
     data_url: str | None, width: int, height: int, filename: str, score: float | None
 ) -> str:
@@ -460,10 +530,11 @@ def main():
     _init_session_state()
 
     # Check for query param to open a cluster
-    open_id = _get_query_param("open")
+    open_id = st.query_params.get("open")
     if open_id:
         st.session_state["selected_person_id"] = open_id
         st.session_state["ui_step"] = "view"
+        st.session_state[f"view_page_{open_id}"] = 1
         _try_set_query_param("open", None)  # Clear the param
 
     # Step header
@@ -543,28 +614,18 @@ def _render_choose_step():
                 if sample_path:
                     data_url = get_image_data_url_cached(sample_path, sample_bbox)
 
-                render_person_card_image(
-                    data_url,
+                render_clickable_person_card(
+                    person_id=person_id,
+                    data_url=data_url,
+                    name=name,
+                    face_count=face_count,
+                    top_score=sample_score,
                     width=IMAGE_HEIGHT,
                     height=IMAGE_HEIGHT,
                     filename=os.path.basename(sample_path)
                     if sample_path
                     else "Unknown",
                 )
-
-                render_person_card_meta(name, face_count, sample_score)
-
-                # Open button
-                if st.button("Open", key=f"open_person_{person_id}"):
-                    # Try query param navigation
-                    if _try_set_query_param("open", str(person_id)):
-                        st.stop()
-
-                    # Fallback: server-side navigation
-                    st.session_state["selected_person_id"] = person_id
-                    st.session_state["ui_step"] = "view"
-                    st.session_state[f"view_page_{person_id}"] = 1
-                    _do_rerun()
 
     # Bottom navigation
     render_bottom_navigation_choose(st.session_state["choose_page"], page_count)
