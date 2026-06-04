@@ -459,13 +459,21 @@ if st.session_state["ui_step"] == "choose":
                     )
 
                 # title and meta
-                st.markdown(f"**{name if name else 'Unnamed'}**")
-                st.markdown(f"Faces: {face_count}")
+                st.markdown(
+                    f'<div style="margin-bottom: 0;"><span style="font-weight: bold;">{name if name else "Unnamed"}</span></div>',
+                    unsafe_allow_html=True,
+                )
                 if sample_score is not None:
                     try:
-                        st.markdown(f"Top score: {float(sample_score):.2f}")
+                        st.markdown(
+                            f'<span style="font-size: .8rem;">Faces: {face_count} | Top score: {float(sample_score):.2f}</span>',
+                            unsafe_allow_html=True,
+                        )
                     except Exception:
-                        st.markdown(f"Top score: {sample_score}")
+                        st.markdown(
+                            f'<span style="font-size: .8rem;">Faces: {face_count} | Top score: {sample_score}</span>',
+                            unsafe_allow_html=True,
+                        )
 
                 # action button inside the same cell
                 if st.button("Open", key=f"open_btn_{person_id}"):
