@@ -460,7 +460,7 @@ if st.session_state["ui_step"] == "choose":
 
                 # title and meta
                 st.markdown(f"**{name if name else 'Unnamed'}**")
-                st.markdown(f"ID: `{person_id}`  \nFaces: {face_count}")
+                st.markdown(f"Faces: {face_count}")
                 if sample_score is not None:
                     try:
                         st.markdown(f"Top score: {float(sample_score):.2f}")
