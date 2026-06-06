@@ -30,31 +30,29 @@ IMAGE_HEIGHT = CELL_HEIGHT - CAPTION_HEIGHT
 FACES_PAGE_SIZE = 24
 PERSONS_DEFAULT_PAGE_SIZE = 24
 
+QUERY_PARAM_PERSON = "person"
+
 
 # --- Database Connection ---
 def get_connection():
-    """Get a PostgreSQL connection."""
     return psycopg2.connect(DSN)
 
 
-def _execute_query(query: str, params: tuple = ()):
-    """Execute a SELECT query and return all results."""
+def execute_query(query: str, params: tuple = ()):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params)
             return cur.fetchall()
 
 
-def _execute_single(query: str, params: tuple = ()):
-    """Execute a SELECT query and return a single row."""
+def execute_single(query: str, params: tuple = ()):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params)
             return cur.fetchone()
 
 
-def _execute_update(query: str, params: tuple = ()):
-    """Execute an UPDATE/INSERT query and commit."""
+def execute_update(query: str, params: tuple = ()):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params)
@@ -63,10 +61,9 @@ def _execute_update(query: str, params: tuple = ()):
 
 # --- Data Fetching ---
 def fetch_persons_count(search: str | None = None) -> int:
-    """Return the number of persons matching optional search."""
     like = f"%{search}%" if search else None
-    result = _execute_single(
-        "SELECT COUNT(*) FROM persons WHERE (%s IS NULL OR name ILIKE %s OR id::text ILIKE %s)",
+    result = execute_single(
+        "SELECT COUNT(1) FROM persons WHERE (%s IS NULL OR name ILIKE %s OR id::text ILIKE %s)",
         (search, like, like),
     )
     return result[0] if result else 0
@@ -80,7 +77,7 @@ def fetch_persons_page(
     Each row: (id, name, cluster_label, face_count, sample_path, sample_score, sample_bbox)
     """
     like = f"%{search}%" if search else None
-    return _execute_query(
+    return execute_query(
         """
         SELECT p.id, p.name, p.cluster_label, p.face_count,
                ph.file_path AS sample_path, fd.detection_score AS sample_score, fd.bounding_box AS sample_bbox
@@ -94,7 +91,7 @@ def fetch_persons_page(
         ) fd ON true
         LEFT JOIN photos ph ON ph.id = fd.photo_id
         WHERE (%s IS NULL OR p.name ILIKE %s OR p.id::text ILIKE %s)
-        ORDER BY COALESCE(p.name, ''), p.id
+        ORDER BY p.face_count DESC NULLS LAST, p.id
         LIMIT %s OFFSET %s
         """,
         (search, like, like, limit, offset),
@@ -103,7 +100,7 @@ def fetch_persons_page(
 
 def fetch_person(person_id: str) -> tuple | None:
     """Return person data: (id, name, cluster_label, face_count)."""
-    return _execute_single(
+    return execute_single(
         "SELECT id, name, cluster_label, face_count FROM persons WHERE id = %s",
         (person_id,),
     )
@@ -111,7 +108,7 @@ def fetch_person(person_id: str) -> tuple | None:
 
 def fetch_face_count_for_person(person_id: str) -> int:
     """Return the number of faces for a person."""
-    result = _execute_single(
+    result = execute_single(
         "SELECT COUNT(*) FROM face_detections WHERE person_id = %s",
         (person_id,),
     )
@@ -123,7 +120,7 @@ def fetch_faces_for_person(person_id: str, limit: int = 24, offset: int = 0) -> 
 
     Each row: (id, file_path, bounding_box, detection_score)
     """
-    return _execute_query(
+    return execute_query(
         """
         SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score
         FROM face_detections fd
@@ -291,7 +288,7 @@ def render_clickable_person_card(
     """Render a single clickable card for a cluster/person."""
     # Build Image HTML
     if data_url:
-        style = f"width:{width}px;height:{height}px;object-fit:contain;display:block;margin:auto;user-select:none;border-radius:4px;"
+        style = f"width:{width}px;height:{height}px;object-fit:contain;display:block;margin:auto;user-select:none;border-radius:8px;"
         img_html = (
             f'<img src="{data_url}" alt="{html.escape(filename)}" '
             f'style="{style}" draggable="false" />'
@@ -317,9 +314,8 @@ def render_clickable_person_card(
             f'<span style="font-size:0.8rem;opacity:0.8;">Faces: {face_count}</span>'
         )
 
-    # Combine into clickable card
     card_html = f"""
-    <a href="?open={html.escape(str(person_id))}" target="_self" style="text-decoration:none;color:inherit;display:block;">
+    <a href="?{QUERY_PARAM_PERSON}={html.escape(str(person_id))}" target="_self" style="text-decoration:none;color:inherit;display:block;">
         <div style="
             border: 1px solid var(--secondary-background-color);
             border-radius: 8px;
@@ -351,12 +347,11 @@ def render_clickable_person_card(
 def render_face_grid_cell_html(
     data_url: str | None, width: int, height: int, filename: str, score: float | None
 ) -> str:
-    """Return HTML for a single face cell in the grid."""
     if data_url:
         img_html = (
             f'<img src="{data_url}" alt="{html.escape(filename)}" '
             f'style="max-width:{width}px;max-height:{height}px;object-fit:contain;'
-            f'display:block;margin:auto;pointer-events:none;" loading="lazy" />'
+            f'display:block;margin:auto;pointer-events:none;border-radius:8px" loading="lazy" />'
         )
     else:
         img_html = (
@@ -372,13 +367,6 @@ def render_face_grid_cell_html(
         except (ValueError, TypeError):
             score_text = f"Score: {html.escape(str(score))}"
 
-    filename_esc = html.escape(filename)
-    filename_div = (
-        f"<div style='height:20px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;"
-        f"-webkit-box-orient:vertical;text-overflow:ellipsis;white-space:normal;"
-        f"font-size:12px;color:#222;text-align:center;margin-top:6px;'>{filename_esc}</div>"
-    )
-
     score_div = (
         f"<div style='height:20px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;"
         f"-webkit-box-orient:vertical;text-overflow:ellipsis;white-space:normal;"
@@ -389,123 +377,38 @@ def render_face_grid_cell_html(
         f"<div style='width:{CELL_WIDTH}px;display:flex;flex-direction:column;align-items:center;'>"
         f"<div style='width:{CELL_WIDTH}px;height:{IMAGE_HEIGHT}px;display:flex;"
         f"align-items:center;justify-content:center;'>{img_html}</div>"
-        f"{filename_div}{score_div}</div>"
+        f"{score_div}</div>"
     )
-
-
-# --- Query Parameter Navigation ---
-def _get_query_param_handlers():
-    """Get get/set query param functions, with fallbacks across Streamlit versions."""
-    get_fn = getattr(st, "experimental_get_query_params", None) or getattr(
-        st, "get_query_params", None
-    )
-    set_fn = getattr(st, "experimental_set_query_params", None) or getattr(
-        st, "set_query_params", None
-    )
-    return get_fn, set_fn
-
-
-def _try_set_query_param(key: str, value: str | None) -> bool:
-    """Attempt to set a query parameter. Return True if successful."""
-    _, set_fn = _get_query_param_handlers()
-    if not callable(set_fn):
-        return False
-
-    try:
-        if value is None:
-            set_fn()  # Clear all params
-        else:
-            set_fn(**{key: value})
-        return True
-    except TypeError:
-        try:
-            set_fn({key: value} if value else {})
-            return True
-        except Exception:
-            return False
-    except Exception:
-        return False
-
-
-def _get_query_param(key: str) -> str | None:
-    """Attempt to get a query parameter. Return None if not found."""
-    get_fn, _ = _get_query_param_handlers()
-    if not callable(get_fn):
-        return None
-
-    try:
-        params = get_fn() or {}
-        if not isinstance(params, dict):
-            return None
-        val = params.get(key)
-        if isinstance(val, (list, tuple)):
-            return val[0] if val else None
-        return val
-    except Exception:
-        return None
-
-
-def _do_rerun():
-    """Attempt to rerun the Streamlit app."""
-    rerun_fn = getattr(st, "experimental_rerun", None) or getattr(st, "rerun", None)
-    if callable(rerun_fn):
-        try:
-            rerun_fn()
-        except Exception:
-            pass
-
-
-# --- Session State Initialization ---
-def _init_session_state():
-    """Initialize all session state variables."""
-    defaults = {
-        "ui_step": "choose",
-        "selected_person_id": None,
-        "choose_search": "",
-        "choose_page": 1,
-        "choose_page_size": PERSONS_DEFAULT_PAGE_SIZE,
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
 
 
 # --- UI Helper Functions ---
-def render_pagination_controls_choose() -> tuple[bool, bool]:
-    """Render pagination controls for the choose step. Return (prev_clicked, next_clicked)."""
-    cols = st.columns([1, 1])
+def render_pagination_controls_persons() -> tuple[bool, bool, bool, bool]:
+    cols = st.columns([1, 1, 1, 1])
     with cols[0]:
-        prev_clicked = st.button("◀ Prev", key="prev_choose_page")
+        first = st.button("<< First", key="person_page_first")
     with cols[1]:
-        next_clicked = st.button("Next ▶", key="next_choose_page")
-    return prev_clicked, next_clicked
+        prev = st.button("◀ Prev", key="person_page_prev")
+    with cols[2]:
+        next = st.button("Next ▶", key="person_page_next")
+    with cols[3]:
+        last = st.button("Last >>", key="person_page_last")
+
+    return first, prev, next, last
 
 
-def render_bottom_navigation_choose(page: int, page_count: int):
-    """Render bottom navigation for the choose step."""
-    cols = st.columns([1, 1, 6])
-    with cols[0]:
-        if st.button("<< First", key="first_choose"):
-            st.session_state["choose_page"] = 1
-    with cols[1]:
-        if st.button(">> Last", key="last_choose"):
-            st.session_state["choose_page"] = page_count
-
-
-def render_pagination_controls_view(
+def render_pagination_controls_faces(
     page: int, total_pages: int
 ) -> tuple[bool, bool, bool, bool]:
-    """Render pagination controls for the view step. Return (start, prev, next, end)."""
     cols = st.columns([1, 1, 1, 6])
     with cols[0]:
-        start = st.button("⏮ Start", key="start_view")
+        first = st.button("<< First", key="face_page_first")
     with cols[1]:
-        prev = st.button("◀ Prev", key="prev_view")
+        prev = st.button("◀ Prev", key="face_page_prev")
     with cols[2]:
-        next = st.button("Next ▶", key="next_view")
+        next = st.button("Next ▶", key="face_page_next")
     with cols[3]:
-        end = st.button("End ⏭", key="end_view")
-    return start, prev, next, end
+        last = st.button("Last >>", key="face_page_last")
+    return first, prev, next, last
 
 
 def update_view_page(action: str, page: int, total_pages: int) -> int:
@@ -521,35 +424,20 @@ def update_view_page(action: str, page: int, total_pages: int) -> int:
     return page
 
 
-# --- Main App ---
 def main():
-    """Main application logic."""
     st.set_page_config(page_title="Face Clusters Viewer", layout="wide")
-    st.title("Face Clusters Viewer")
+    st.title("Face Cluster Explorer")
 
-    _init_session_state()
+    person_id = st.query_params.get(QUERY_PARAM_PERSON)
 
-    # Check for query param to open a cluster
-    open_id = st.query_params.get("open")
-    if open_id:
-        st.session_state["selected_person_id"] = open_id
-        st.session_state["ui_step"] = "view"
-        st.session_state[f"view_page_{open_id}"] = 1
-        _try_set_query_param("open", None)  # Clear the param
-
-    # Step header
-    if st.session_state["ui_step"] == "choose":
-        st.header("1 — Choose a cluster to inspect")
-        _render_choose_step()
+    if person_id:
+        render_faces_step(person_id)
     else:
-        st.header("2 — Inspect cluster")
-        _render_view_step()
+        render_persons_step()
 
 
-def _render_choose_step():
-    """Render the choose cluster step."""
-    # Controls
-    control_col1, control_col2, control_col3 = st.columns([4, 2, 2])
+def render_persons_step():
+    control_col1, control_col2, control_col3 = st.columns([2, 1, 2])
 
     with control_col1:
         search = st.text_input(
@@ -567,7 +455,7 @@ def _render_choose_step():
         )
 
     with control_col3:
-        prev_clicked, next_clicked = render_pagination_controls_choose()
+        first, prev, next, last = render_pagination_controls_persons()
 
     # Pagination
     total = fetch_persons_count(search if search else None)
@@ -579,10 +467,18 @@ def _render_choose_step():
     )
 
     # Handle navigation
-    if prev_clicked and st.session_state["choose_page"] > 1:
+    if first and st.session_state["choose_page"] > 1:
+        st.session_state["choose_page"] = 1
+        st.rerun()
+    if prev and st.session_state["choose_page"] > 1:
         st.session_state["choose_page"] -= 1
-    if next_clicked and st.session_state["choose_page"] < page_count:
+        st.rerun()
+    if next and st.session_state["choose_page"] < page_count:
         st.session_state["choose_page"] += 1
+        st.rerun()
+    if last and st.session_state["choose_page"] > 1:
+        st.session_state["choose_page"] = page_count - 1
+        st.rerun()
 
     st.write(
         f"{total} clusters — page {st.session_state['choose_page']} of {page_count}"
@@ -598,7 +494,6 @@ def _render_choose_step():
         offset=offset,
     )
 
-    # Render grid
     for row_start in range(0, len(persons), GRID_COLS):
         row = persons[row_start : row_start + GRID_COLS]
         cols = st.columns(GRID_COLS)
@@ -627,29 +522,28 @@ def _render_choose_step():
                     else "Unknown",
                 )
 
-    # Bottom navigation
-    render_bottom_navigation_choose(st.session_state["choose_page"], page_count)
+
+def navigate_to_persons():
+    dict = st.query_params.to_dict()
+    dict.pop(QUERY_PARAM_PERSON, None)
+    st.query_params.from_dict(dict)
+    st.rerun()
 
 
-def _render_view_step():
-    """Render the view cluster step."""
-    person_id = st.session_state.get("selected_person_id")
+def render_faces_step(person_id: str):
     if not person_id:
         st.error("No person selected; returning to list.")
-        st.session_state["ui_step"] = "choose"
-        st.stop()
+        navigate_to_persons()
 
     person_row = fetch_person(person_id)
     if not person_row:
         st.error("Selected person not found in database.")
-        st.session_state["ui_step"] = "choose"
-        st.stop()
+        navigate_to_persons()
 
     _, current_name, _, face_count = (
         person_row if person_row else (None, "Unknown", None, 0)
     )
 
-    # Header
     header_col, back_col = st.columns([8, 1])
     with header_col:
         st.markdown(f"## {html.escape(current_name or 'Unnamed')}")
@@ -657,28 +551,26 @@ def _render_view_step():
 
     with back_col:
         if st.button("Back to list", key="back_to_list"):
-            if _try_set_query_param("open", None):
-                st.stop()
-            st.session_state["ui_step"] = "choose"
-            _do_rerun()
+            navigate_to_persons()
 
-    # Rename
-    edit_key = f"name_edit_{person_id}"
-    new_name = st.text_input(
-        "Cluster name (optional)",
-        value=current_name or "",
-        key=edit_key,
-    )
-
-    if st.button("Save name", key=f"save_name_{person_id}"):
-        try:
-            _execute_update(
-                "UPDATE persons SET name = %s WHERE id = %s",
-                (new_name if new_name else None, person_id),
-            )
-            st.success("Name saved")
-        except Exception as e:
-            st.error(f"Failed to save name: {e}")
+    edit_name_col, save_button_col = st.columns([4, 1])
+    with edit_name_col:
+        edit_key = f"name_edit_{person_id}"
+        new_name = st.text_input(
+            "Person/Cluster name",
+            value=current_name or "",
+            key=edit_key,
+        )
+    with save_button_col:
+        if st.button("Save name", key=f"save_name_{person_id}"):
+            try:
+                execute_update(
+                    "UPDATE persons SET name = %s WHERE id = %s",
+                    (new_name if new_name else None, person_id),
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to save name: {e}")
 
     # Faces pagination
     view_page_key = f"view_page_{person_id}"
@@ -692,7 +584,7 @@ def _render_view_step():
     )
 
     # Navigation
-    start, prev, next_btn, end = render_pagination_controls_view(
+    start, prev, next_btn, end = render_pagination_controls_faces(
         st.session_state[view_page_key], total_pages
     )
 
