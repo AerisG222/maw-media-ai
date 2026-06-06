@@ -31,6 +31,7 @@ FACES_PAGE_SIZE = 24
 PERSONS_DEFAULT_PAGE_SIZE = 24
 
 QUERY_PARAM_PERSON = "person"
+QUERY_PARAM_UNKNOWN = "unknown"
 
 
 # --- Database Connection ---
@@ -130,6 +131,32 @@ def fetch_faces_for_person(person_id: str, limit: int = 24, offset: int = 0) -> 
         LIMIT %s OFFSET %s
         """,
         (person_id, limit, offset),
+    )
+
+
+def fetch_face_count_for_unknown() -> int:
+    """Return the number of faces that are not associated with any person."""
+    result = execute_single(
+        "SELECT COUNT(*) FROM face_detections WHERE person_id IS NULL",
+    )
+    return result[0] if result else 0
+
+
+def fetch_faces_for_unknown(limit: int = 24, offset: int = 0) -> list:
+    """Return a page of faces for a person, ordered by detection score.
+
+    Each row: (id, file_path, bounding_box, detection_score)
+    """
+    return execute_query(
+        """
+        SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score
+        FROM face_detections fd
+        JOIN photos p ON fd.photo_id = p.id
+        WHERE fd.person_id IS NULL
+        ORDER BY fd.detection_score DESC NULLS LAST, fd.id
+        LIMIT %s OFFSET %s
+        """,
+        (limit, offset),
     )
 
 
@@ -411,6 +438,21 @@ def render_pagination_controls_faces(
     return first, prev, next, last
 
 
+def render_pagination_controls_unknown(
+    page: int, total_pages: int
+) -> tuple[bool, bool, bool, bool]:
+    cols = st.columns([1, 1, 1, 6])
+    with cols[0]:
+        first = st.button("<< First", key="unknown_page_first")
+    with cols[1]:
+        prev = st.button("◀ Prev", key="unknown_page_prev")
+    with cols[2]:
+        next = st.button("Next ▶", key="unknown_page_next")
+    with cols[3]:
+        last = st.button("Last >>", key="unknown_page_last")
+    return first, prev, next, last
+
+
 def update_view_page(action: str, page: int, total_pages: int) -> int:
     """Update the current page based on action."""
     if action == "start":
@@ -429,9 +471,12 @@ def main():
     st.title("Face Cluster Explorer")
 
     person_id = st.query_params.get(QUERY_PARAM_PERSON)
+    show_unknown = st.query_params.get(QUERY_PARAM_UNKNOWN, "false") == "true"
 
     if person_id:
         render_faces_step(person_id)
+    elif show_unknown:
+        render_unknown_step()
     else:
         render_persons_step()
 
@@ -456,6 +501,11 @@ def render_persons_step():
 
     with control_col3:
         first, prev, next, last = render_pagination_controls_persons()
+
+    st.markdown(
+        f'<a href="/?{QUERY_PARAM_UNKNOWN}=true">Unknown Faces</a>',
+        unsafe_allow_html=True,
+    )
 
     # Pagination
     total = fetch_persons_count(search if search else None)
@@ -526,6 +576,7 @@ def render_persons_step():
 def navigate_to_persons():
     dict = st.query_params.to_dict()
     dict.pop(QUERY_PARAM_PERSON, None)
+    dict.pop(QUERY_PARAM_UNKNOWN, None)
     st.query_params.from_dict(dict)
     st.rerun()
 
@@ -603,6 +654,72 @@ def render_faces_step(person_id: str):
     page = st.session_state[view_page_key]
     offset = (page - 1) * FACES_PAGE_SIZE
     faces = fetch_faces_for_person(person_id, limit=FACES_PAGE_SIZE, offset=offset)
+
+    # Summary
+    start_idx = offset + 1 if total_faces > 0 else 0
+    end_idx = offset + len(faces)
+    st.markdown(
+        f"**Showing {start_idx}-{end_idx} of {total_faces} (page {page}/{total_pages})**"
+    )
+
+    # Render face grid
+    cells_html = []
+    for face_id, file_path, bounding_box, score in faces:
+        data_url = get_image_data_url_cached(file_path, bounding_box)
+        cell_html = render_face_grid_cell_html(
+            data_url,
+            width=CELL_WIDTH,
+            height=IMAGE_HEIGHT,
+            filename=os.path.basename(file_path),
+            score=score,
+        )
+        cells_html.append(cell_html)
+
+    flex_style = "display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;justify-content:flex-start;"
+    container_html = f"<div style='{flex_style}'>{''.join(cells_html)}</div>"
+    st.markdown(container_html, unsafe_allow_html=True)
+
+
+def render_unknown_step():
+    header_col, back_col = st.columns([8, 1])
+    with header_col:
+        st.markdown("UNCATEGORIZED FACES")
+
+    with back_col:
+        if st.button("Back to list", key="back_to_list"):
+            navigate_to_persons()
+
+    # Faces pagination
+    view_page_key = "view_page_unknown"
+    if view_page_key not in st.session_state:
+        st.session_state[view_page_key] = 1
+
+    total_faces = fetch_face_count_for_unknown()
+    total_pages = max(1, math.ceil(total_faces / FACES_PAGE_SIZE))
+    st.session_state[view_page_key] = max(
+        1, min(st.session_state[view_page_key], total_pages)
+    )
+
+    # Navigation
+    start, prev, next_btn, end = render_pagination_controls_unknown(
+        st.session_state[view_page_key], total_pages
+    )
+
+    if start:
+        st.session_state[view_page_key] = 1
+    elif prev:
+        st.session_state[view_page_key] = max(1, st.session_state[view_page_key] - 1)
+    elif next_btn:
+        st.session_state[view_page_key] = min(
+            total_pages, st.session_state[view_page_key] + 1
+        )
+    elif end:
+        st.session_state[view_page_key] = total_pages
+
+    # Fetch faces
+    page = st.session_state[view_page_key]
+    offset = (page - 1) * FACES_PAGE_SIZE
+    faces = fetch_faces_for_unknown(limit=FACES_PAGE_SIZE, offset=offset)
 
     # Summary
     start_idx = offset + 1 if total_faces > 0 else 0
