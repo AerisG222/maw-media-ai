@@ -27,8 +27,8 @@ CELL_HEIGHT = 200
 CAPTION_HEIGHT = 72
 IMAGE_HEIGHT = CELL_HEIGHT - CAPTION_HEIGHT
 
-FACES_PAGE_SIZE = 24
-PERSONS_DEFAULT_PAGE_SIZE = 24
+FACES_PAGE_SIZE = 48
+PERSONS_PAGE_SIZE = 48
 
 QUERY_PARAM_PERSON = "person"
 QUERY_PARAM_UNKNOWN = "unknown"
@@ -86,7 +86,7 @@ def fetch_persons_count(search: str | None = None, unnamed_only: bool = False) -
 
 
 def fetch_persons_page(
-    search: str | None = None, limit: int = 24, offset: int = 0, unnamed_only: bool = False
+    search: str | None = None, limit: int = PERSONS_PAGE_SIZE, offset: int = 0, unnamed_only: bool = False
 ) -> list:
     """Return a page of persons with one sample face for preview.
 
@@ -132,7 +132,7 @@ def fetch_face_count_for_person(person_id: str) -> int:
     return result[0] if result else 0
 
 
-def fetch_faces_for_person(person_id: str, limit: int = 24, offset: int = 0) -> list:
+def fetch_faces_for_person(person_id: str, limit: int = FACES_PAGE_SIZE, offset: int = 0) -> list:
     """Return a page of faces for a person, ordered by detection score.
 
     Each row: (id, file_path, bounding_box, detection_score)
@@ -158,7 +158,7 @@ def fetch_face_count_for_unknown() -> int:
     return result[0] if result else 0
 
 
-def fetch_faces_for_unknown(limit: int = 24, offset: int = 0) -> list:
+def fetch_faces_for_unknown(limit: int = FACES_PAGE_SIZE, offset: int = 0) -> list:
     """Return a page of faces for a person, ordered by detection score.
 
     Each row: (id, file_path, bounding_box, detection_score)
@@ -517,21 +517,13 @@ def main():
 
 
 def render_persons_step():
-    control_col1, control_col2, control_col3, control_col4 = st.columns([3, 1, 1, 2])
+    control_col1, control_col3, control_col4 = st.columns([3, 1, 2])
 
     with control_col1:
         search = st.text_input(
             "Search by name or id",
             value=st.session_state.get("choose_search", ""),
             key="choose_search",
-        )
-
-    with control_col2:
-        st.selectbox(
-            "Per page",
-            options=[12, 24, 48, 96],
-            index=[12, 24, 48, 96].index(st.session_state.get("choose_page_size", 24)),
-            key="choose_page_size",
         )
 
     with control_col3:
@@ -549,7 +541,7 @@ def render_persons_step():
 
     # Pagination
     total = fetch_persons_count(search if search else None, unnamed_only=unnamed_only)
-    page_count = max(1, math.ceil(total / st.session_state["choose_page_size"]))
+    page_count = max(1, math.ceil(total / PERSONS_PAGE_SIZE))
 
     # Clamp current page
     st.session_state["choose_page"] = max(
@@ -575,12 +567,10 @@ def render_persons_step():
     )
 
     # Fetch page
-    offset = (st.session_state["choose_page"] - 1) * st.session_state[
-        "choose_page_size"
-    ]
+    offset = (st.session_state["choose_page"] - 1) * PERSONS_PAGE_SIZE
     persons = fetch_persons_page(
         search if search else None,
-        limit=st.session_state["choose_page_size"],
+        limit=PERSONS_PAGE_SIZE,
         offset=offset,
         unnamed_only=unnamed_only,
     )
