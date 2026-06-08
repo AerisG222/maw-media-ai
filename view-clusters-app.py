@@ -76,17 +76,17 @@ def remove_faces_from_person(person_id: str, face_ids: list[str]):
 
 
 # --- Data Fetching ---
-def fetch_persons_count(search: str | None = None) -> int:
+def fetch_persons_count(search: str | None = None, unnamed_only: bool = False) -> int:
     like = f"%{search}%" if search else None
     result = execute_single(
-        "SELECT COUNT(1) FROM persons WHERE (%s IS NULL OR name ILIKE %s OR id::text ILIKE %s)",
-        (search, like, like),
+        "SELECT COUNT(1) FROM persons WHERE (%s IS NULL OR name ILIKE %s OR id::text ILIKE %s) AND (NOT %s OR name IS NULL)",
+        (search, like, like, unnamed_only),
     )
     return result[0] if result else 0
 
 
 def fetch_persons_page(
-    search: str | None = None, limit: int = 24, offset: int = 0
+    search: str | None = None, limit: int = 24, offset: int = 0, unnamed_only: bool = False
 ) -> list:
     """Return a page of persons with one sample face for preview.
 
@@ -107,10 +107,11 @@ def fetch_persons_page(
         ) fd ON true
         LEFT JOIN photos ph ON ph.id = fd.photo_id
         WHERE (%s IS NULL OR p.name ILIKE %s OR p.id::text ILIKE %s)
+          AND (NOT %s OR p.name IS NULL)
         ORDER BY p.face_count DESC NULLS LAST, p.id
         LIMIT %s OFFSET %s
         """,
-        (search, like, like, limit, offset),
+        (search, like, like, unnamed_only, limit, offset),
     )
 
 
@@ -516,7 +517,7 @@ def main():
 
 
 def render_persons_step():
-    control_col1, control_col2, control_col3 = st.columns([2, 1, 2])
+    control_col1, control_col2, control_col3, control_col4 = st.columns([3, 1, 1, 2])
 
     with control_col1:
         search = st.text_input(
@@ -534,6 +535,9 @@ def render_persons_step():
         )
 
     with control_col3:
+        st.checkbox("Unnamed only", key="choose_unnamed_only")
+
+    with control_col4:
         first, prev, next, last = render_pagination_controls_persons()
 
     st.markdown(
@@ -541,8 +545,10 @@ def render_persons_step():
         unsafe_allow_html=True,
     )
 
+    unnamed_only = st.session_state.get("choose_unnamed_only", False)
+
     # Pagination
-    total = fetch_persons_count(search if search else None)
+    total = fetch_persons_count(search if search else None, unnamed_only=unnamed_only)
     page_count = max(1, math.ceil(total / st.session_state["choose_page_size"]))
 
     # Clamp current page
@@ -576,6 +582,7 @@ def render_persons_step():
         search if search else None,
         limit=st.session_state["choose_page_size"],
         offset=offset,
+        unnamed_only=unnamed_only,
     )
 
     for row_start in range(0, len(persons), GRID_COLS):
