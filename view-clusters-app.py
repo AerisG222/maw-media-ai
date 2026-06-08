@@ -60,6 +60,21 @@ def execute_update(query: str, params: tuple = ()):
             conn.commit()
 
 
+def remove_faces_from_person(person_id: str, face_ids: list[str]):
+    """Unassign the given faces from a person and sync the face count."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE face_detections SET person_id = NULL WHERE id = ANY(%s::uuid[])",
+                (face_ids,),
+            )
+            cur.execute(
+                "UPDATE persons SET face_count = (SELECT COUNT(*) FROM face_detections WHERE person_id = %s) WHERE id = %s",
+                (person_id, person_id),
+            )
+            conn.commit()
+
+
 # --- Data Fetching ---
 def fetch_persons_count(search: str | None = None) -> int:
     like = f"%{search}%" if search else None
@@ -466,6 +481,25 @@ def update_view_page(action: str, page: int, total_pages: int) -> int:
     return page
 
 
+def _face_selection_key(person_id: str, face_id) -> str:
+    return f"remove_face_{person_id}_{face_id}"
+
+
+def _clear_face_selections(person_id: str):
+    prefix = f"remove_face_{person_id}_"
+    for k in [k for k in st.session_state if k.startswith(prefix)]:
+        del st.session_state[k]
+
+
+def _get_selected_face_ids(person_id: str) -> list[str]:
+    prefix = f"remove_face_{person_id}_"
+    return [
+        k[len(prefix):]
+        for k, v in st.session_state.items()
+        if k.startswith(prefix) and v
+    ]
+
+
 def main():
     st.set_page_config(page_title="Face Clusters Viewer", layout="wide")
     st.title("Face Cluster Explorer")
@@ -595,10 +629,24 @@ def render_faces_step(person_id: str):
         person_row if person_row else (None, "Unknown", None, 0)
     )
 
-    header_col, back_col = st.columns([8, 1])
+    select_mode_key = f"select_mode_{person_id}"
+    if select_mode_key not in st.session_state:
+        st.session_state[select_mode_key] = False
+    in_select_mode = st.session_state[select_mode_key]
+
+    header_col, select_col, back_col = st.columns([6, 2, 1])
     with header_col:
         st.markdown(f"## {html.escape(current_name or 'Unnamed')}")
         st.markdown(f"ID: `{html.escape(str(person_id))}` — Faces: {face_count}")
+
+    with select_col:
+        toggle_label = "Cancel selection" if in_select_mode else "Select to remove"
+        if st.button(toggle_label, key=f"toggle_select_{person_id}"):
+            new_mode = not in_select_mode
+            st.session_state[select_mode_key] = new_mode
+            if not new_mode:
+                _clear_face_selections(person_id)
+            st.rerun()
 
     with back_col:
         if st.button("Back to list", key="back_to_list"):
@@ -655,29 +703,72 @@ def render_faces_step(person_id: str):
     offset = (page - 1) * FACES_PAGE_SIZE
     faces = fetch_faces_for_person(person_id, limit=FACES_PAGE_SIZE, offset=offset)
 
-    # Summary
+    # Summary + remove action row
     start_idx = offset + 1 if total_faces > 0 else 0
     end_idx = offset + len(faces)
-    st.markdown(
-        f"**Showing {start_idx}-{end_idx} of {total_faces} (page {page}/{total_pages})**"
-    )
+    summary_col, remove_col = st.columns([6, 4])
+    with summary_col:
+        st.markdown(
+            f"**Showing {start_idx}-{end_idx} of {total_faces} (page {page}/{total_pages})**"
+        )
+    if in_select_mode:
+        selected_ids = _get_selected_face_ids(person_id)
+        with remove_col:
+            if selected_ids:
+                if st.button(
+                    f"Remove {len(selected_ids)} selected face(s)",
+                    key=f"do_remove_{person_id}",
+                    type="primary",
+                ):
+                    try:
+                        remove_faces_from_person(person_id, selected_ids)
+                        st.session_state[select_mode_key] = False
+                        _clear_face_selections(person_id)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to remove faces: {e}")
 
     # Render face grid
-    cells_html = []
-    for face_id, file_path, bounding_box, score in faces:
-        data_url = get_image_data_url_cached(file_path, bounding_box)
-        cell_html = render_face_grid_cell_html(
-            data_url,
-            width=CELL_WIDTH,
-            height=IMAGE_HEIGHT,
-            filename=os.path.basename(file_path),
-            score=score,
-        )
-        cells_html.append(cell_html)
+    if in_select_mode:
+        for row_start in range(0, len(faces), GRID_COLS):
+            row_faces = faces[row_start : row_start + GRID_COLS]
+            cols = st.columns(GRID_COLS)
+            for col_idx, (face_id, file_path, bounding_box, score) in enumerate(
+                row_faces
+            ):
+                with cols[col_idx]:
+                    data_url = get_image_data_url_cached(file_path, bounding_box)
+                    st.markdown(
+                        render_face_grid_cell_html(
+                            data_url,
+                            width=CELL_WIDTH,
+                            height=IMAGE_HEIGHT,
+                            filename=os.path.basename(file_path),
+                            score=score,
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                    st.checkbox(
+                        "Select",
+                        key=_face_selection_key(person_id, face_id),
+                        label_visibility="collapsed",
+                    )
+    else:
+        cells_html = []
+        for face_id, file_path, bounding_box, score in faces:
+            data_url = get_image_data_url_cached(file_path, bounding_box)
+            cell_html = render_face_grid_cell_html(
+                data_url,
+                width=CELL_WIDTH,
+                height=IMAGE_HEIGHT,
+                filename=os.path.basename(file_path),
+                score=score,
+            )
+            cells_html.append(cell_html)
 
-    flex_style = "display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;justify-content:flex-start;"
-    container_html = f"<div style='{flex_style}'>{''.join(cells_html)}</div>"
-    st.markdown(container_html, unsafe_allow_html=True)
+        flex_style = "display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;justify-content:flex-start;"
+        container_html = f"<div style='{flex_style}'>{''.join(cells_html)}</div>"
+        st.markdown(container_html, unsafe_allow_html=True)
 
 
 def render_unknown_step():
