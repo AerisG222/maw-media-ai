@@ -906,44 +906,30 @@ def render_unknown_step():
         if st.button("Back to list", key="back_to_list"):
             navigate_to_persons()
 
-    # Sort / assign controls when in selection mode
+    # Target person + sort controls
     sort_by_similarity = False
     target_person = None
     if in_assign_mode:
         named_persons = fetch_named_persons_for_assign()
-        assign_col1, assign_col2 = st.columns([4, 2])
-        with assign_col1:
-            if named_persons:
+        if named_persons:
+            ctrl_col1, ctrl_col2 = st.columns([4, 4])
+            with ctrl_col1:
                 target_person = st.selectbox(
                     "Assign selected faces to:",
                     options=named_persons,
                     format_func=lambda x: f"{x[1]}  ({x[2]} faces)",
                     key="assign_target_person",
                 )
+            with ctrl_col2:
                 sort_by_similarity = st.checkbox(
                     "Sort by similarity to selected person",
                     key="sort_by_similarity",
                     value=True,
                 )
-            else:
-                st.warning("No named persons found. Label some clusters first.")
-        with assign_col2:
-            selected_ids = _get_selected_face_ids(UNKNOWN_KEY)
-            if selected_ids and target_person:
-                if st.button(
-                    f"Assign {len(selected_ids)} face(s)",
-                    key="do_assign_unknown",
-                    type="primary",
-                ):
-                    try:
-                        assign_faces_to_person(str(target_person[0]), selected_ids)
-                        st.session_state[assign_mode_key] = False
-                        _clear_face_selections(UNKNOWN_KEY)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Assignment failed: {e}")
+        else:
+            st.warning("No named persons found. Label some clusters first.")
 
-    # Faces pagination
+    # Pagination
     view_page_key = "view_page_unknown"
     if view_page_key not in st.session_state:
         st.session_state[view_page_key] = 1
@@ -972,6 +958,7 @@ def render_unknown_step():
     page = st.session_state[view_page_key]
     offset = (page - 1) * FACES_PAGE_SIZE
 
+    # Fetch faces before rendering action buttons so we know the page's face IDs
     if in_assign_mode and sort_by_similarity and target_person:
         faces = fetch_faces_for_unknown_by_similarity(
             str(target_person[0]), limit=FACES_PAGE_SIZE, offset=offset
@@ -981,9 +968,36 @@ def render_unknown_step():
 
     start_idx = offset + 1 if total_faces > 0 else 0
     end_idx = offset + len(faces)
-    st.markdown(
-        f"**Showing {start_idx}–{end_idx} of {total_faces} (page {page}/{total_pages})**"
-    )
+
+    summary_col, action_col = st.columns([4, 4])
+    with summary_col:
+        st.markdown(f"**Showing {start_idx}–{end_idx} of {total_faces} (page {page}/{total_pages})**")
+
+    if in_assign_mode and target_person:
+        page_face_ids = [str(face[0]) for face in faces]
+        with action_col:
+            btn_col1, btn_col2 = st.columns(2)
+            with btn_col1:
+                if st.button("Select all on page", key="select_all_unknown"):
+                    for fid in page_face_ids:
+                        st.session_state[_face_selection_key(UNKNOWN_KEY, fid)] = True
+            # Read after the select-all handler so the count reflects any keys just set
+            selected_ids = _get_selected_face_ids(UNKNOWN_KEY)
+            with btn_col2:
+                assign_label = f"Assign {len(selected_ids)} face(s)" if selected_ids else "Assign faces"
+                if st.button(
+                    assign_label,
+                    key="do_assign_unknown",
+                    type="primary",
+                    disabled=not selected_ids,
+                ):
+                    try:
+                        assign_faces_to_person(str(target_person[0]), selected_ids)
+                        st.session_state[assign_mode_key] = False
+                        _clear_face_selections(UNKNOWN_KEY)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Assignment failed: {e}")
 
     if in_assign_mode:
         for row_start in range(0, len(faces), GRID_COLS):
