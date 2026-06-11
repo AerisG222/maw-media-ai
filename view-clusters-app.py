@@ -884,11 +884,14 @@ def render_faces_step(person_id: str):
 
 
 def render_unknown_step():
-    UNKNOWN_KEY = "unknown"
+    # Use an explicit set to track selections rather than individual widget keys.
+    # Pre-populating many checkbox session-state keys at once (old approach) was
+    # disrupting sort_by_similarity / target_person state on the following rerun.
+    SEL_KEY = "unknown_selected_set"
+    st.session_state.setdefault(SEL_KEY, set())
 
     assign_mode_key = "assign_mode_unknown"
-    if assign_mode_key not in st.session_state:
-        st.session_state[assign_mode_key] = False
+    st.session_state.setdefault(assign_mode_key, False)
     in_assign_mode = st.session_state[assign_mode_key]
 
     header_col, select_col, back_col = st.columns([6, 2, 1])
@@ -900,7 +903,7 @@ def render_unknown_step():
             new_mode = not in_assign_mode
             st.session_state[assign_mode_key] = new_mode
             if not new_mode:
-                _clear_face_selections(UNKNOWN_KEY)
+                st.session_state[SEL_KEY] = set()
             st.rerun()
     with back_col:
         if st.button("Back to list", key="back_to_list"):
@@ -912,27 +915,29 @@ def render_unknown_step():
     if in_assign_mode:
         named_persons = fetch_named_persons_for_assign()
         if named_persons:
+            person_map = {str(p[0]): p for p in named_persons}
             ctrl_col1, ctrl_col2 = st.columns([4, 4])
             with ctrl_col1:
-                target_person = st.selectbox(
+                target_person_id = st.selectbox(
                     "Assign selected faces to:",
-                    options=named_persons,
-                    format_func=lambda x: f"{x[1]}  ({x[2]} faces)",
+                    options=list(person_map.keys()),
+                    format_func=lambda pid: f"{person_map[pid][1]}  ({person_map[pid][2]} faces)",
                     key="assign_target_person",
                 )
+                target_person = person_map.get(target_person_id)
             with ctrl_col2:
+                # setdefault so value= never overrides existing state
+                st.session_state.setdefault("sort_by_similarity", True)
                 sort_by_similarity = st.checkbox(
                     "Sort by similarity to selected person",
                     key="sort_by_similarity",
-                    value=True,
                 )
         else:
             st.warning("No named persons found. Label some clusters first.")
 
     # Pagination
     view_page_key = "view_page_unknown"
-    if view_page_key not in st.session_state:
-        st.session_state[view_page_key] = 1
+    st.session_state.setdefault(view_page_key, 1)
 
     total_faces = fetch_face_count_for_unknown()
     total_pages = max(1, math.ceil(total_faces / FACES_PAGE_SIZE))
@@ -958,7 +963,6 @@ def render_unknown_step():
     page = st.session_state[view_page_key]
     offset = (page - 1) * FACES_PAGE_SIZE
 
-    # Fetch faces before rendering action buttons so we know the page's face IDs
     if in_assign_mode and sort_by_similarity and target_person:
         faces = fetch_faces_for_unknown_by_similarity(
             str(target_person[0]), limit=FACES_PAGE_SIZE, offset=offset
@@ -975,14 +979,13 @@ def render_unknown_step():
 
     if in_assign_mode and target_person:
         page_face_ids = [str(face[0]) for face in faces]
+        selected_ids = list(st.session_state[SEL_KEY])
         with action_col:
             btn_col1, btn_col2 = st.columns(2)
             with btn_col1:
                 if st.button("Select all on page", key="select_all_unknown"):
-                    for fid in page_face_ids:
-                        st.session_state[_face_selection_key(UNKNOWN_KEY, fid)] = True
-            # Read after the select-all handler so the count reflects any keys just set
-            selected_ids = _get_selected_face_ids(UNKNOWN_KEY)
+                    st.session_state[SEL_KEY].update(page_face_ids)
+                    st.rerun()
             with btn_col2:
                 assign_label = f"Assign {len(selected_ids)} face(s)" if selected_ids else "Assign faces"
                 if st.button(
@@ -993,17 +996,20 @@ def render_unknown_step():
                 ):
                     try:
                         assign_faces_to_person(str(target_person[0]), selected_ids)
+                        st.session_state[SEL_KEY] = set()
                         st.session_state[assign_mode_key] = False
-                        _clear_face_selections(UNKNOWN_KEY)
                         st.rerun()
                     except Exception as e:
                         st.error(f"Assignment failed: {e}")
 
     if in_assign_mode:
+        selected_set = st.session_state[SEL_KEY]
         for row_start in range(0, len(faces), GRID_COLS):
             row_faces = faces[row_start : row_start + GRID_COLS]
             cols = st.columns(GRID_COLS)
             for col_idx, (face_id, file_path, bounding_box, score) in enumerate(row_faces):
+                face_id_str = str(face_id)
+                cb_key = f"unknown_face_cb_{face_id_str}"
                 with cols[col_idx]:
                     data_url = get_image_data_url_cached(file_path, bounding_box)
                     st.markdown(
@@ -1016,9 +1022,21 @@ def render_unknown_step():
                         ),
                         unsafe_allow_html=True,
                     )
+
+                    def _toggle(fid=face_id_str):
+                        s = st.session_state[SEL_KEY]
+                        if fid in s:
+                            s.discard(fid)
+                        else:
+                            s.add(fid)
+
+                    # Sync key from the authoritative set before rendering so
+                    # Select All (which only updates the set) is reflected here.
+                    st.session_state[cb_key] = face_id_str in selected_set
                     st.checkbox(
                         "Select",
-                        key=_face_selection_key(UNKNOWN_KEY, face_id),
+                        key=cb_key,
+                        on_change=_toggle,
                         label_visibility="collapsed",
                     )
     else:
