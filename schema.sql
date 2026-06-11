@@ -109,3 +109,26 @@ JOIN face_detections fd ON fd.photo_id = p.id
 JOIN persons per        ON per.id = fd.person_id
 WHERE per.name IS NOT NULL
 GROUP BY p.id, p.file_path, p.file_name;
+
+
+-- ---------------------------------------------------------------------------
+-- New columns on face_detections
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE face_detections
+    ADD COLUMN IF NOT EXISTS suggested_person_id  UUID    REFERENCES persons(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS suggestion_score     FLOAT,
+    ADD COLUMN IF NOT EXISTS is_validated         BOOLEAN NOT NULL DEFAULT FALSE;
+
+
+-- ---------------------------------------------------------------------------
+-- Index to make the review query fast (pending suggestions for review)
+-- ---------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS face_detections_suggested_person_idx
+    ON face_detections(suggested_person_id)
+    WHERE suggested_person_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS face_detections_is_validated_idx
+    ON face_detections(is_validated)
+    WHERE is_validated = FALSE;
