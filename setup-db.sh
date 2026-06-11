@@ -10,6 +10,8 @@
 #   ./setup-db.sh destroy    # stop + delete container AND volume (all data lost)
 #   ./setup-db.sh logs       # tail container logs
 #   ./setup-db.sh psql       # open an interactive psql session
+#   ./setup-db.sh backup     # dump the database to a timestamped .dump file
+#                            # Override output dir: BACKUP_DIR=/path ./setup-db.sh backup
 # =============================================================================
 
 set -euo pipefail
@@ -153,6 +155,31 @@ cmd_psql() {
         psql -U "${PG_USER}" -d "${PG_DB}"
 }
 
+cmd_backup() {
+    require_podman
+    container_running || err "Container '${CONTAINER_NAME}' is not running. Run: $0 start"
+
+    local backup_dir="${BACKUP_DIR:-${SCRIPT_DIR}/backups}"
+    mkdir -p "${backup_dir}"
+
+    local timestamp
+    timestamp="$(date +%Y%m%d_%H%M%S)"
+    local backup_file="${backup_dir}/${PG_DB}_${timestamp}.dump"
+
+    info "Backing up '${PG_DB}' to ${backup_file}…"
+    podman exec "${CONTAINER_NAME}" \
+        pg_dump -U "${PG_USER}" -d "${PG_DB}" --format=custom \
+        > "${backup_file}"
+
+    local size
+    size="$(du -h "${backup_file}" | cut -f1)"
+    ok "Backup complete: ${backup_file} (${size})"
+    echo ""
+    echo "  To restore:"
+    echo "    podman exec -i ${CONTAINER_NAME} pg_restore -U ${PG_USER} -d ${PG_DB} --clean < ${backup_file}"
+    echo ""
+}
+
 apply_schema() {
     if [[ ! -f "${SCHEMA_FILE}" ]]; then
         echo "  [WARN]  schema.sql not found at ${SCHEMA_FILE} — skipping."
@@ -195,8 +222,9 @@ case "${1:-}" in
     destroy)    cmd_destroy ;;
     logs)       cmd_logs    ;;
     psql)       cmd_psql    ;;
+    backup)     cmd_backup  ;;
     *)
-        echo "Usage: $0 [start|stop|destroy|logs|psql]"
+        echo "Usage: $0 [start|stop|destroy|logs|psql|backup]"
         exit 1
         ;;
 esac
