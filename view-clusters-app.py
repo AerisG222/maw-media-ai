@@ -234,7 +234,7 @@ def fetch_faces_for_unknown_by_similarity(
 
 
 def fetch_all_persons_for_merge(exclude_id: str) -> list:
-    """Return all persons except exclude_id for use in the merge picker.
+    """Return all named persons except exclude_id, sorted by name, for the merge picker.
 
     Each row: (id, name, face_count)
     """
@@ -243,7 +243,8 @@ def fetch_all_persons_for_merge(exclude_id: str) -> list:
         SELECT id, name, face_count
         FROM persons
         WHERE id != %s
-        ORDER BY face_count DESC NULLS LAST, name NULLS LAST, id
+          AND name IS NOT NULL
+        ORDER BY name
         """,
         (exclude_id,),
     )
