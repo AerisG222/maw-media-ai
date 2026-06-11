@@ -75,6 +75,40 @@ def remove_faces_from_person(person_id: str, face_ids: list[str]):
             conn.commit()
 
 
+def assign_faces_to_person(person_id: str, face_ids: list[str]):
+    """Assign faces to a person and sync the face count."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE face_detections SET person_id = %s WHERE id = ANY(%s::uuid[])",
+                (person_id, face_ids),
+            )
+            cur.execute(
+                "UPDATE persons SET face_count = (SELECT COUNT(*) FROM face_detections WHERE person_id = %s) WHERE id = %s",
+                (person_id, person_id),
+            )
+            conn.commit()
+
+
+def merge_persons_into(target_id: str, source_ids: list[str]):
+    """Move all faces from source persons into target, recompute count, delete sources."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE face_detections SET person_id = %s WHERE person_id = ANY(%s::uuid[])",
+                (target_id, source_ids),
+            )
+            cur.execute(
+                "UPDATE persons SET face_count = (SELECT COUNT(*) FROM face_detections WHERE person_id = %s) WHERE id = %s",
+                (target_id, target_id),
+            )
+            cur.execute(
+                "DELETE FROM persons WHERE id = ANY(%s::uuid[])",
+                (source_ids,),
+            )
+            conn.commit()
+
+
 # --- Data Fetching ---
 def fetch_persons_count(search: str | None = None, unnamed_only: bool = False) -> int:
     like = f"%{search}%" if search else None
@@ -159,7 +193,7 @@ def fetch_face_count_for_unknown() -> int:
 
 
 def fetch_faces_for_unknown(limit: int = FACES_PAGE_SIZE, offset: int = 0) -> list:
-    """Return a page of faces for a person, ordered by detection score.
+    """Return a page of unassigned faces ordered by detection score.
 
     Each row: (id, file_path, bounding_box, detection_score)
     """
@@ -173,6 +207,61 @@ def fetch_faces_for_unknown(limit: int = FACES_PAGE_SIZE, offset: int = 0) -> li
         LIMIT %s OFFSET %s
         """,
         (limit, offset),
+    )
+
+
+def fetch_faces_for_unknown_by_similarity(
+    person_id: str, limit: int = FACES_PAGE_SIZE, offset: int = 0
+) -> list:
+    """Return unassigned faces sorted by cosine similarity to a person's centroid.
+
+    Each row: (id, file_path, bounding_box, detection_score)
+    """
+    return execute_query(
+        """
+        SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score
+        FROM face_detections fd
+        JOIN photos p ON fd.photo_id = p.id
+        WHERE fd.person_id IS NULL
+          AND fd.embedding IS NOT NULL
+        ORDER BY fd.embedding <=> (
+            SELECT representative_embedding FROM persons WHERE id = %s
+        ) ASC
+        LIMIT %s OFFSET %s
+        """,
+        (person_id, limit, offset),
+    )
+
+
+def fetch_all_persons_for_merge(exclude_id: str) -> list:
+    """Return all persons except exclude_id for use in the merge picker.
+
+    Each row: (id, name, face_count)
+    """
+    return execute_query(
+        """
+        SELECT id, name, face_count
+        FROM persons
+        WHERE id != %s
+        ORDER BY face_count DESC NULLS LAST, name NULLS LAST, id
+        """,
+        (exclude_id,),
+    )
+
+
+def fetch_named_persons_for_assign() -> list:
+    """Return all named persons for use in the assign-unknown dropdown.
+
+    Each row: (id, name, face_count)
+    """
+    return execute_query(
+        """
+        SELECT id, name, face_count
+        FROM persons
+        WHERE name IS NOT NULL
+        ORDER BY name
+        """,
+        (),
     )
 
 
@@ -668,6 +757,31 @@ def render_faces_step(person_id: str):
             except Exception as e:
                 st.error(f"Failed to save name: {e}")
 
+    with st.expander("Merge other clusters into this person"):
+        other_persons = fetch_all_persons_for_merge(person_id)
+        if not other_persons:
+            st.info("No other clusters found.")
+        else:
+            selected_to_merge = st.multiselect(
+                "Select clusters to absorb (their faces move here, then they are deleted):",
+                options=other_persons,
+                format_func=lambda x: f"{x[1] or 'Unnamed'} — {x[2]} faces  [{str(x[0])[:8]}…]",
+                key=f"merge_select_{person_id}",
+            )
+            if selected_to_merge:
+                if st.button(
+                    f"Merge {len(selected_to_merge)} cluster(s) into this person",
+                    key=f"merge_btn_{person_id}",
+                    type="primary",
+                ):
+                    source_ids = [str(p[0]) for p in selected_to_merge]
+                    try:
+                        merge_persons_into(person_id, source_ids)
+                        st.success(f"Merged {len(source_ids)} cluster(s).")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Merge failed: {e}")
+
     # Faces pagination
     view_page_key = f"view_page_{person_id}"
     if view_page_key not in st.session_state:
@@ -769,13 +883,64 @@ def render_faces_step(person_id: str):
 
 
 def render_unknown_step():
-    header_col, back_col = st.columns([8, 1])
-    with header_col:
-        st.markdown("UNCATEGORIZED FACES")
+    UNKNOWN_KEY = "unknown"
 
+    assign_mode_key = "assign_mode_unknown"
+    if assign_mode_key not in st.session_state:
+        st.session_state[assign_mode_key] = False
+    in_assign_mode = st.session_state[assign_mode_key]
+
+    header_col, select_col, back_col = st.columns([6, 2, 1])
+    with header_col:
+        st.markdown("## Uncategorized Faces")
+    with select_col:
+        toggle_label = "Cancel selection" if in_assign_mode else "Select to assign"
+        if st.button(toggle_label, key="toggle_assign_unknown"):
+            new_mode = not in_assign_mode
+            st.session_state[assign_mode_key] = new_mode
+            if not new_mode:
+                _clear_face_selections(UNKNOWN_KEY)
+            st.rerun()
     with back_col:
         if st.button("Back to list", key="back_to_list"):
             navigate_to_persons()
+
+    # Sort / assign controls when in selection mode
+    sort_by_similarity = False
+    target_person = None
+    if in_assign_mode:
+        named_persons = fetch_named_persons_for_assign()
+        assign_col1, assign_col2 = st.columns([4, 2])
+        with assign_col1:
+            if named_persons:
+                target_person = st.selectbox(
+                    "Assign selected faces to:",
+                    options=named_persons,
+                    format_func=lambda x: f"{x[1]}  ({x[2]} faces)",
+                    key="assign_target_person",
+                )
+                sort_by_similarity = st.checkbox(
+                    "Sort by similarity to selected person",
+                    key="sort_by_similarity",
+                    value=True,
+                )
+            else:
+                st.warning("No named persons found. Label some clusters first.")
+        with assign_col2:
+            selected_ids = _get_selected_face_ids(UNKNOWN_KEY)
+            if selected_ids and target_person:
+                if st.button(
+                    f"Assign {len(selected_ids)} face(s)",
+                    key="do_assign_unknown",
+                    type="primary",
+                ):
+                    try:
+                        assign_faces_to_person(str(target_person[0]), selected_ids)
+                        st.session_state[assign_mode_key] = False
+                        _clear_face_selections(UNKNOWN_KEY)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Assignment failed: {e}")
 
     # Faces pagination
     view_page_key = "view_page_unknown"
@@ -788,7 +953,6 @@ def render_unknown_step():
         1, min(st.session_state[view_page_key], total_pages)
     )
 
-    # Navigation
     start, prev, next_btn, end = render_pagination_controls_unknown(
         st.session_state[view_page_key], total_pages
     )
@@ -804,34 +968,59 @@ def render_unknown_step():
     elif end:
         st.session_state[view_page_key] = total_pages
 
-    # Fetch faces
     page = st.session_state[view_page_key]
     offset = (page - 1) * FACES_PAGE_SIZE
-    faces = fetch_faces_for_unknown(limit=FACES_PAGE_SIZE, offset=offset)
 
-    # Summary
+    if in_assign_mode and sort_by_similarity and target_person:
+        faces = fetch_faces_for_unknown_by_similarity(
+            str(target_person[0]), limit=FACES_PAGE_SIZE, offset=offset
+        )
+    else:
+        faces = fetch_faces_for_unknown(limit=FACES_PAGE_SIZE, offset=offset)
+
     start_idx = offset + 1 if total_faces > 0 else 0
     end_idx = offset + len(faces)
     st.markdown(
-        f"**Showing {start_idx}-{end_idx} of {total_faces} (page {page}/{total_pages})**"
+        f"**Showing {start_idx}–{end_idx} of {total_faces} (page {page}/{total_pages})**"
     )
 
-    # Render face grid
-    cells_html = []
-    for face_id, file_path, bounding_box, score in faces:
-        data_url = get_image_data_url_cached(file_path, bounding_box)
-        cell_html = render_face_grid_cell_html(
-            data_url,
-            width=CELL_WIDTH,
-            height=IMAGE_HEIGHT,
-            filename=os.path.basename(file_path),
-            score=score,
-        )
-        cells_html.append(cell_html)
-
-    flex_style = "display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;justify-content:flex-start;"
-    container_html = f"<div style='{flex_style}'>{''.join(cells_html)}</div>"
-    st.markdown(container_html, unsafe_allow_html=True)
+    if in_assign_mode:
+        for row_start in range(0, len(faces), GRID_COLS):
+            row_faces = faces[row_start : row_start + GRID_COLS]
+            cols = st.columns(GRID_COLS)
+            for col_idx, (face_id, file_path, bounding_box, score) in enumerate(row_faces):
+                with cols[col_idx]:
+                    data_url = get_image_data_url_cached(file_path, bounding_box)
+                    st.markdown(
+                        render_face_grid_cell_html(
+                            data_url,
+                            width=CELL_WIDTH,
+                            height=IMAGE_HEIGHT,
+                            filename=os.path.basename(file_path),
+                            score=score,
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                    st.checkbox(
+                        "Select",
+                        key=_face_selection_key(UNKNOWN_KEY, face_id),
+                        label_visibility="collapsed",
+                    )
+    else:
+        cells_html = []
+        for face_id, file_path, bounding_box, score in faces:
+            data_url = get_image_data_url_cached(file_path, bounding_box)
+            cells_html.append(
+                render_face_grid_cell_html(
+                    data_url,
+                    width=CELL_WIDTH,
+                    height=IMAGE_HEIGHT,
+                    filename=os.path.basename(file_path),
+                    score=score,
+                )
+            )
+        flex_style = "display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;justify-content:flex-start;"
+        st.markdown(f"<div style='{flex_style}'>{''.join(cells_html)}</div>", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
