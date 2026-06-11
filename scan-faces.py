@@ -16,6 +16,9 @@ Usage:
     # Process only new/unscanned photos (incremental):
     python scan_faces.py scan --photo-dir /path/to/photos --incremental
 
+    # Suggest person assignments for unvalidated faces (writes suggested_person_id):
+    python scan_faces.py suggest
+
     # Show stats about current database state:
     python scan_faces.py stats
 """
@@ -66,6 +69,11 @@ HDBSCAN_CLUSTER_THRESHOLD = float(os.getenv("HDBSCAN_CLUSTER_THRESHOLD", "0.4"))
 RECOGNITION_DISTANCE_THRESHOLD = float(
     os.getenv("RECOGNITION_DISTANCE_THRESHOLD", "0.40")
 )
+
+# Cosine distance threshold for the suggest command.
+# Only faces whose nearest named-person centroid is within this distance receive a
+# suggestion.  Lower = more conservative (fewer but higher-confidence suggestions).
+SUGGEST_DISTANCE_THRESHOLD = float(os.getenv("SUGGEST_DISTANCE_THRESHOLD", "0.35"))
 
 # How many images to process between database commits.
 BATCH_COMMIT_SIZE = int(os.getenv("BATCH_COMMIT_SIZE", "50"))
@@ -511,6 +519,101 @@ def cmd_cluster() -> None:
 
 
 # ---------------------------------------------------------------------------
+# SUGGEST command
+# ---------------------------------------------------------------------------
+
+
+def cmd_suggest(threshold: float) -> None:
+    """
+    For every unassigned, unvalidated face with an embedding, find its nearest
+    named-person centroid via pgvector and write a suggestion when the cosine
+    distance is below *threshold*.
+
+    Already-suggested faces are re-evaluated so that re-running after labelling
+    more clusters can improve or replace earlier suggestions.  Validated faces
+    (is_validated = TRUE) are never touched.
+    """
+    log.info(f"Running suggest with distance threshold {threshold:.3f}…")
+    conn = get_connection(DB_DSN)
+
+    # Count candidates
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM face_detections
+            WHERE person_id IS NULL
+              AND is_validated = FALSE
+              AND embedding IS NOT NULL
+            """
+        )
+        n_candidates = cur.fetchone()["count"]
+
+    if n_candidates == 0:
+        log.info("No unassigned, unvalidated faces found — nothing to do.")
+        conn.close()
+        return
+
+    log.info(f"{n_candidates:,} candidate face(s) to evaluate.")
+
+    # Reset any previous unvalidated suggestions so stale ones don't linger.
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE face_detections
+            SET suggested_person_id = NULL,
+                suggestion_score    = NULL
+            WHERE person_id    IS NULL
+              AND is_validated  = FALSE
+            """
+        )
+    conn.commit()
+    log.info("Cleared previous unvalidated suggestions.")
+
+    # For each candidate, find the single closest named-person centroid and
+    # write a suggestion if within the threshold.
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE face_detections fd
+            SET suggested_person_id = best.person_id,
+                suggestion_score    = best.distance
+            FROM (
+                SELECT
+                    fd.id AS face_id,
+                    nearest.id       AS person_id,
+                    (fd.embedding <=> nearest.representative_embedding) AS distance
+                FROM face_detections fd
+                CROSS JOIN LATERAL (
+                    SELECT p.id, p.representative_embedding
+                    FROM persons p
+                    WHERE p.name IS NOT NULL
+                      AND p.representative_embedding IS NOT NULL
+                    ORDER BY p.representative_embedding <=> fd.embedding
+                    LIMIT 1
+                ) nearest
+                WHERE fd.person_id   IS NULL
+                  AND fd.is_validated = FALSE
+                  AND fd.embedding   IS NOT NULL
+                  AND (fd.embedding <=> nearest.representative_embedding) < %(threshold)s
+            ) best
+            WHERE fd.id = best.face_id
+            """,
+            {"threshold": threshold},
+        )
+        n_suggested = cur.rowcount
+    conn.commit()
+
+    n_skipped = n_candidates - n_suggested
+    log.info(
+        f"Suggest complete. {n_suggested:,} suggestion(s) written, "
+        f"{n_skipped:,} face(s) had no match within threshold {threshold:.3f}."
+    )
+    log.info("Open the Streamlit UI and use 'Review suggestions' to confirm or reject.")
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
 # STATS command
 # ---------------------------------------------------------------------------
 
@@ -597,6 +700,19 @@ def main() -> None:
         "cluster", help="Cluster stored embeddings into persons using HDBSCAN."
     )
 
+    # suggest
+    p_suggest = sub.add_parser(
+        "suggest",
+        help="Suggest person assignments for unassigned faces using nearest-centroid matching.",
+    )
+    p_suggest.add_argument(
+        "--threshold",
+        type=float,
+        default=SUGGEST_DISTANCE_THRESHOLD,
+        help=f"Cosine distance threshold for suggestions (default: {SUGGEST_DISTANCE_THRESHOLD}). "
+             "Lower = more conservative.",
+    )
+
     # stats
     sub.add_parser("stats", help="Print database statistics.")
 
@@ -606,6 +722,8 @@ def main() -> None:
         cmd_scan(args.photo_dir, args.incremental)
     elif args.command == "cluster":
         cmd_cluster()
+    elif args.command == "suggest":
+        cmd_suggest(args.threshold)
     elif args.command == "stats":
         cmd_stats()
 

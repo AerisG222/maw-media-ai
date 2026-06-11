@@ -32,6 +32,7 @@ PERSONS_PAGE_SIZE = 48
 
 QUERY_PARAM_PERSON = "person"
 QUERY_PARAM_UNKNOWN = "unknown"
+QUERY_PARAM_REVIEW = "review"
 
 
 # --- Database Connection ---
@@ -120,7 +121,10 @@ def fetch_persons_count(search: str | None = None, unnamed_only: bool = False) -
 
 
 def fetch_persons_page(
-    search: str | None = None, limit: int = PERSONS_PAGE_SIZE, offset: int = 0, unnamed_only: bool = False
+    search: str | None = None,
+    limit: int = PERSONS_PAGE_SIZE,
+    offset: int = 0,
+    unnamed_only: bool = False,
 ) -> list:
     """Return a page of persons with one sample face for preview.
 
@@ -166,7 +170,9 @@ def fetch_face_count_for_person(person_id: str) -> int:
     return result[0] if result else 0
 
 
-def fetch_faces_for_person(person_id: str, limit: int = FACES_PAGE_SIZE, offset: int = 0) -> list:
+def fetch_faces_for_person(
+    person_id: str, limit: int = FACES_PAGE_SIZE, offset: int = 0
+) -> list:
     """Return a page of faces for a person, ordered by detection score.
 
     Each row: (id, file_path, bounding_box, detection_score)
@@ -264,6 +270,95 @@ def fetch_named_persons_for_assign() -> list:
         """,
         (),
     )
+
+
+def fetch_suggestion_count() -> int:
+    result = execute_single(
+        """
+        SELECT COUNT(*)
+        FROM face_detections
+        WHERE suggested_person_id IS NOT NULL
+          AND is_validated = FALSE
+        """
+    )
+    return result[0] if result else 0
+
+
+def fetch_suggestions_page(limit: int = FACES_PAGE_SIZE, offset: int = 0) -> list:
+    """Return a page of pending suggestions ordered by score (best first).
+
+    Each row: (face_id, file_path, bounding_box, detection_score,
+               suggested_person_id, suggested_name, suggestion_score)
+    """
+    return execute_query(
+        """
+        SELECT fd.id,
+               ph.file_path,
+               fd.bounding_box,
+               fd.detection_score,
+               fd.suggested_person_id,
+               per.name  AS suggested_name,
+               fd.suggestion_score
+        FROM face_detections fd
+        JOIN photos  ph  ON ph.id  = fd.photo_id
+        JOIN persons per ON per.id = fd.suggested_person_id
+        WHERE fd.suggested_person_id IS NOT NULL
+          AND fd.is_validated = FALSE
+        ORDER BY fd.suggestion_score ASC
+        LIMIT %s OFFSET %s
+        """,
+        (limit, offset),
+    )
+
+
+def confirm_suggestions(face_ids: list[str]) -> None:
+    """Accept suggestions: move suggested_person_id → person_id and mark validated."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE face_detections
+                SET person_id           = suggested_person_id,
+                    suggested_person_id = NULL,
+                    suggestion_score    = NULL,
+                    is_validated        = TRUE
+                WHERE id = ANY(%s::uuid[])
+                  AND suggested_person_id IS NOT NULL
+                """,
+                (face_ids,),
+            )
+            # Recompute face_count for every affected person
+            cur.execute(
+                """
+                UPDATE persons p
+                SET face_count = (
+                    SELECT COUNT(*) FROM face_detections WHERE person_id = p.id
+                )
+                WHERE p.id IN (
+                    SELECT DISTINCT person_id FROM face_detections
+                    WHERE id = ANY(%s::uuid[]) AND person_id IS NOT NULL
+                )
+                """,
+                (face_ids,),
+            )
+            conn.commit()
+
+
+def reject_suggestions(face_ids: list[str]) -> None:
+    """Reject suggestions: clear them and mark validated so they won't reappear."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE face_detections
+                SET suggested_person_id = NULL,
+                    suggestion_score    = NULL,
+                    is_validated        = TRUE
+                WHERE id = ANY(%s::uuid[])
+                """,
+                (face_ids,),
+            )
+            conn.commit()
 
 
 # --- Image Processing ---
@@ -585,7 +680,7 @@ def _clear_face_selections(person_id: str):
 def _get_selected_face_ids(person_id: str) -> list[str]:
     prefix = f"remove_face_{person_id}_"
     return [
-        k[len(prefix):]
+        k[len(prefix) :]
         for k, v in st.session_state.items()
         if k.startswith(prefix) and v
     ]
@@ -597,11 +692,14 @@ def main():
 
     person_id = st.query_params.get(QUERY_PARAM_PERSON)
     show_unknown = st.query_params.get(QUERY_PARAM_UNKNOWN, "false") == "true"
+    show_review = st.query_params.get(QUERY_PARAM_REVIEW, "false") == "true"
 
     if person_id:
         render_faces_step(person_id)
     elif show_unknown:
         render_unknown_step()
+    elif show_review:
+        render_review_step()
     else:
         render_persons_step()
 
@@ -622,10 +720,19 @@ def render_persons_step():
     with control_col4:
         first, prev, next, last = render_pagination_controls_persons()
 
-    st.markdown(
-        f'<a href="/?{QUERY_PARAM_UNKNOWN}=true">Unknown Faces</a>',
-        unsafe_allow_html=True,
-    )
+    n_suggestions = fetch_suggestion_count()
+    suggestion_badge = f" ({n_suggestions:,})" if n_suggestions else ""
+    link_col1, link_col2 = st.columns([1, 2])
+    with link_col1:
+        st.markdown(
+            f'<a href="/?{QUERY_PARAM_UNKNOWN}=true">Unknown Faces</a>',
+            unsafe_allow_html=True,
+        )
+    with link_col2:
+        st.markdown(
+            f'<a href="/?{QUERY_PARAM_REVIEW}=true">Review Suggestions{html.escape(suggestion_badge)}</a>',
+            unsafe_allow_html=True,
+        )
 
     unnamed_only = st.session_state.get("choose_unnamed_only", False)
 
@@ -698,6 +805,7 @@ def navigate_to_persons():
     dict = st.query_params.to_dict()
     dict.pop(QUERY_PARAM_PERSON, None)
     dict.pop(QUERY_PARAM_UNKNOWN, None)
+    dict.pop(QUERY_PARAM_REVIEW, None)
     st.query_params.from_dict(dict)
     st.rerun()
 
@@ -766,7 +874,9 @@ def render_faces_step(person_id: str):
             selected_to_merge = st.multiselect(
                 "Select clusters to absorb (their faces move here, then they are deleted):",
                 options=other_persons,
-                format_func=lambda x: f"{x[1] or 'Unnamed'} — {x[2]} faces  [{str(x[0])[:8]}…]",
+                format_func=lambda x: (
+                    f"{x[1] or 'Unnamed'} — {x[2]} faces  [{str(x[0])[:8]}…]"
+                ),
                 key=f"merge_select_{person_id}",
             )
             if selected_to_merge:
@@ -921,7 +1031,9 @@ def render_unknown_step():
                 target_person_id = st.selectbox(
                     "Assign selected faces to:",
                     options=list(person_map.keys()),
-                    format_func=lambda pid: f"{person_map[pid][1]}  ({person_map[pid][2]} faces)",
+                    format_func=lambda pid: (
+                        f"{person_map[pid][1]}  ({person_map[pid][2]} faces)"
+                    ),
                     key="assign_target_person",
                 )
                 target_person = person_map.get(target_person_id)
@@ -975,7 +1087,9 @@ def render_unknown_step():
 
     summary_col, action_col = st.columns([4, 4])
     with summary_col:
-        st.markdown(f"**Showing {start_idx}–{end_idx} of {total_faces} (page {page}/{total_pages})**")
+        st.markdown(
+            f"**Showing {start_idx}–{end_idx} of {total_faces} (page {page}/{total_pages})**"
+        )
 
     if in_assign_mode and target_person:
         page_face_ids = [str(face[0]) for face in faces]
@@ -987,7 +1101,11 @@ def render_unknown_step():
                     st.session_state[SEL_KEY].update(page_face_ids)
                     st.rerun()
             with btn_col2:
-                assign_label = f"Assign {len(selected_ids)} face(s)" if selected_ids else "Assign faces"
+                assign_label = (
+                    f"Assign {len(selected_ids)} face(s)"
+                    if selected_ids
+                    else "Assign faces"
+                )
                 if st.button(
                     assign_label,
                     key="do_assign_unknown",
@@ -1007,7 +1125,9 @@ def render_unknown_step():
         for row_start in range(0, len(faces), GRID_COLS):
             row_faces = faces[row_start : row_start + GRID_COLS]
             cols = st.columns(GRID_COLS)
-            for col_idx, (face_id, file_path, bounding_box, score) in enumerate(row_faces):
+            for col_idx, (face_id, file_path, bounding_box, score) in enumerate(
+                row_faces
+            ):
                 face_id_str = str(face_id)
                 cb_key = f"unknown_face_cb_{face_id_str}"
                 with cols[col_idx]:
@@ -1053,7 +1173,194 @@ def render_unknown_step():
                 )
             )
         flex_style = "display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;justify-content:flex-start;"
-        st.markdown(f"<div style='{flex_style}'>{''.join(cells_html)}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='{flex_style}'>{''.join(cells_html)}</div>",
+            unsafe_allow_html=True,
+        )
+
+
+def navigate_to_review():
+    d = st.query_params.to_dict()
+    d.pop(QUERY_PARAM_PERSON, None)
+    d.pop(QUERY_PARAM_UNKNOWN, None)
+    d[QUERY_PARAM_REVIEW] = "true"
+    st.query_params.from_dict(d)
+    st.rerun()
+
+
+def render_review_face_cell(
+    data_url, file_path, det_score, suggested_name, suggestion_score
+):
+    """Render a suggestion card: face crop + suggested person + confidence."""
+    if data_url:
+        img_html = (
+            f'<img src="{data_url}" alt="face" '
+            f'style="max-width:{CELL_WIDTH}px;max-height:{IMAGE_HEIGHT}px;'
+            f'object-fit:contain;display:block;margin:auto;border-radius:8px" loading="lazy" />'
+        )
+    else:
+        img_html = (
+            f"<div style='width:{CELL_WIDTH}px;height:{IMAGE_HEIGHT}px;background:#EEE;"
+            f"display:flex;align-items:center;justify-content:center;'>"
+            f"<span style='color:#999;font-size:12px;'>No image</span></div>"
+        )
+
+    try:
+        score_pct = f"{(1 - float(suggestion_score)) * 100:.0f}%"
+    except (TypeError, ValueError):
+        score_pct = "?"
+
+    name_html = f"<div style='font-size:0.85rem;font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{html.escape(suggested_name or '?')}</div>"
+    meta_html = (
+        f"<div style='font-size:0.75rem;opacity:0.75;'>Confidence: {score_pct}</div>"
+    )
+
+    return (
+        f"<div style='width:{CELL_WIDTH}px;display:flex;flex-direction:column;align-items:center;'>"
+        f"<div style='width:{CELL_WIDTH}px;height:{IMAGE_HEIGHT}px;display:flex;"
+        f"align-items:center;justify-content:center;'>{img_html}</div>"
+        f"<div style='width:100%;text-align:center;padding-top:4px;'>{name_html}{meta_html}</div>"
+        f"</div>"
+    )
+
+
+def render_review_step():
+    SEL_KEY = "review_selected_set"
+    st.session_state.setdefault(SEL_KEY, set())
+
+    header_col, back_col = st.columns([8, 1])
+    with header_col:
+        st.markdown("## Review Suggestions")
+    with back_col:
+        if st.button("Back to list", key="review_back"):
+            navigate_to_persons()
+
+    total = fetch_suggestion_count()
+    if total == 0:
+        st.info(
+            "No pending suggestions. Run `python scan-faces.py suggest` to generate some."
+        )
+        return
+
+    # Pagination
+    view_page_key = "review_page"
+    st.session_state.setdefault(view_page_key, 1)
+    total_pages = max(1, math.ceil(total / FACES_PAGE_SIZE))
+    st.session_state[view_page_key] = max(
+        1, min(st.session_state[view_page_key], total_pages)
+    )
+
+    pg_cols = st.columns([1, 1, 1, 6])
+    with pg_cols[0]:
+        if st.button("<< First", key="review_first"):
+            st.session_state[view_page_key] = 1
+    with pg_cols[1]:
+        if st.button("◀ Prev", key="review_prev"):
+            st.session_state[view_page_key] = max(
+                1, st.session_state[view_page_key] - 1
+            )
+    with pg_cols[2]:
+        if st.button("Next ▶", key="review_next"):
+            st.session_state[view_page_key] = min(
+                total_pages, st.session_state[view_page_key] + 1
+            )
+    with pg_cols[3]:
+        if st.button("Last >>", key="review_last"):
+            st.session_state[view_page_key] = total_pages
+
+    page = st.session_state[view_page_key]
+    offset = (page - 1) * FACES_PAGE_SIZE
+    faces = fetch_suggestions_page(limit=FACES_PAGE_SIZE, offset=offset)
+
+    start_idx = offset + 1 if total > 0 else 0
+    end_idx = offset + len(faces)
+
+    selected_ids = list(st.session_state[SEL_KEY])
+    page_face_ids = [str(r[0]) for r in faces]
+
+    summary_col, action_col = st.columns([4, 6])
+    with summary_col:
+        st.markdown(
+            f"**Showing {start_idx}–{end_idx} of {total:,} (page {page}/{total_pages})**"
+        )
+    with action_col:
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            if st.button("Select all on page", key="review_select_all"):
+                st.session_state[SEL_KEY].update(page_face_ids)
+                st.rerun()
+        with a2:
+            if st.button(
+                f"Confirm {len(selected_ids)}" if selected_ids else "Confirm",
+                key="review_confirm",
+                type="primary",
+                disabled=not selected_ids,
+            ):
+                try:
+                    confirm_suggestions(selected_ids)
+                    st.session_state[SEL_KEY] = set()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+        with a3:
+            if st.button(
+                f"Reject {len(selected_ids)}" if selected_ids else "Reject",
+                key="review_reject",
+                disabled=not selected_ids,
+            ):
+                try:
+                    reject_suggestions(selected_ids)
+                    st.session_state[SEL_KEY] = set()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+        with a4:
+            if st.button("Confirm all on page", key="review_confirm_page"):
+                try:
+                    confirm_suggestions(page_face_ids)
+                    st.session_state[SEL_KEY] = set()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+
+    selected_set = st.session_state[SEL_KEY]
+    for row_start in range(0, len(faces), GRID_COLS):
+        row_faces = faces[row_start : row_start + GRID_COLS]
+        cols = st.columns(GRID_COLS)
+        for col_idx, (
+            face_id,
+            file_path,
+            bbox,
+            det_score,
+            _,
+            suggested_name,
+            suggestion_score,
+        ) in enumerate(row_faces):
+            face_id_str = str(face_id)
+            cb_key = f"review_face_cb_{face_id_str}"
+            with cols[col_idx]:
+                data_url = get_image_data_url_cached(file_path, bbox)
+                st.markdown(
+                    render_review_face_cell(
+                        data_url, file_path, det_score, suggested_name, suggestion_score
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+                def _toggle(fid=face_id_str):
+                    s = st.session_state[SEL_KEY]
+                    if fid in s:
+                        s.discard(fid)
+                    else:
+                        s.add(fid)
+
+                st.session_state[cb_key] = face_id_str in selected_set
+                st.checkbox(
+                    "Select",
+                    key=cb_key,
+                    on_change=_toggle,
+                    label_visibility="collapsed",
+                )
 
 
 if __name__ == "__main__":
