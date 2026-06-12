@@ -21,6 +21,11 @@ if not DSN:
 CACHE_DIR = Path(__file__).resolve().parent / "image-cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+CACHE_MAX_ENTRIES = 1200
+# Eviction fires when file count exceeds this, trimming back to CACHE_MAX_ENTRIES.
+# The buffer avoids eviction on every single new write.
+_CACHE_EVICT_THRESHOLD = CACHE_MAX_ENTRIES + 200
+
 GRID_COLS = 6
 CELL_WIDTH = 160
 CELL_HEIGHT = 200
@@ -429,6 +434,22 @@ def _atomic_write(path: Path, data: bytes):
     os.replace(str(tmp), str(path))
 
 
+def _evict_disk_cache_if_needed():
+    """Delete the oldest cached thumbnails when the count exceeds _CACHE_EVICT_THRESHOLD."""
+    try:
+        entries = [e for e in os.scandir(CACHE_DIR) if e.name.endswith(".png")]
+        if len(entries) <= _CACHE_EVICT_THRESHOLD:
+            return
+        entries.sort(key=lambda e: e.stat().st_mtime)
+        for entry in entries[: len(entries) - CACHE_MAX_ENTRIES]:
+            try:
+                os.unlink(entry.path)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def get_cached_thumbnail_path(file_path: str, bbox: dict | None = None) -> Path | None:
     """Return path to cached thumbnail PNG, creating it if missing."""
     mtime, exists = _get_file_metadata(file_path)
@@ -453,10 +474,10 @@ def get_cached_thumbnail_path(file_path: str, bbox: dict | None = None) -> Path 
         return None
 
 
-def _get_streamlit_cache_decorator(ttl_seconds: int = 3600):
+def _get_streamlit_cache_decorator(ttl_seconds: int = 3600, max_entries: int = CACHE_MAX_ENTRIES):
     """Return the best available Streamlit cache decorator."""
     if hasattr(st, "cache_data"):
-        return lambda func: st.cache_data(ttl=ttl_seconds)(func)
+        return lambda func: st.cache_data(ttl=ttl_seconds, max_entries=max_entries)(func)
     if hasattr(st, "experimental_memo"):
         return lambda func: st.experimental_memo(func)
     if hasattr(st, "cache"):
@@ -464,7 +485,7 @@ def _get_streamlit_cache_decorator(ttl_seconds: int = 3600):
     return lambda func: func
 
 
-@_get_streamlit_cache_decorator(ttl_seconds=3600)
+@_get_streamlit_cache_decorator(ttl_seconds=3600, max_entries=CACHE_MAX_ENTRIES)
 def get_image_data_url_cached(file_path: str, bbox: dict | None = None) -> str | None:
     """Return a data URL for a cached thumbnail image."""
     try:
@@ -716,6 +737,8 @@ def main():
         render_review_step()
     else:
         render_persons_step()
+
+    _evict_disk_cache_if_needed()
 
 
 def render_persons_step():
