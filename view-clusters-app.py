@@ -103,6 +103,20 @@ def merge_persons_into(target_id: str, source_ids: list[str]):
                 "UPDATE persons SET face_count = (SELECT COUNT(*) FROM face_detections WHERE person_id = %s) WHERE id = %s",
                 (target_id, target_id),
             )
+            # If the target is unnamed, inherit the name from the first named source.
+            cur.execute("SELECT name FROM persons WHERE id = %s", (target_id,))
+            target_row = cur.fetchone()
+            if target_row and target_row[0] is None:
+                cur.execute(
+                    "SELECT name FROM persons WHERE id = ANY(%s::uuid[]) AND name IS NOT NULL ORDER BY name LIMIT 1",
+                    (source_ids,),
+                )
+                name_row = cur.fetchone()
+                if name_row:
+                    cur.execute(
+                        "UPDATE persons SET name = %s WHERE id = %s",
+                        (name_row[0], target_id),
+                    )
             cur.execute(
                 "DELETE FROM persons WHERE id = ANY(%s::uuid[])",
                 (source_ids,),
