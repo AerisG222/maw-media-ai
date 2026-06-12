@@ -423,7 +423,7 @@ def _get_cache_key(file_path: str, bbox: dict | None, mtime: float) -> Path:
     bbox_json = json.dumps(bbox, sort_keys=True) if bbox else ""
     key_str = f"{file_path}|{bbox_json}|{int(mtime)}"
     hash_hex = sha256(key_str.encode("utf-8")).hexdigest()
-    return CACHE_DIR / f"{hash_hex}.png"
+    return CACHE_DIR / f"{hash_hex}.jpg"
 
 
 def _atomic_write(path: Path, data: bytes):
@@ -437,7 +437,7 @@ def _atomic_write(path: Path, data: bytes):
 def _evict_disk_cache_if_needed():
     """Delete the oldest cached thumbnails when the count exceeds _CACHE_EVICT_THRESHOLD."""
     try:
-        entries = [e for e in os.scandir(CACHE_DIR) if e.name.endswith(".png")]
+        entries = [e for e in os.scandir(CACHE_DIR) if e.name.endswith((".jpg", ".png"))]
         if len(entries) <= _CACHE_EVICT_THRESHOLD:
             return
         entries.sort(key=lambda e: e.stat().st_mtime)
@@ -460,14 +460,15 @@ def get_cached_thumbnail_path(file_path: str, bbox: dict | None = None) -> Path 
     if cache_path.exists():
         return cache_path
 
-    # Create the cached PNG
+    # Create the cached JPEG thumbnail at display resolution
     try:
         img = load_and_crop_face(file_path, bbox)
         if img is None:
             return None
 
+        img.thumbnail((CELL_WIDTH, IMAGE_HEIGHT), Image.LANCZOS)
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="PNG", optimize=True)
+        img.convert("RGB").save(buf, format="JPEG", quality=85)
         _atomic_write(cache_path, buf.getvalue())
         return cache_path
     except Exception:
@@ -494,7 +495,7 @@ def get_image_data_url_cached(file_path: str, bbox: dict | None = None) -> str |
             return None
         with open(cache_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("ascii")
-            return f"data:image/png;base64,{b64}"
+            return f"data:image/jpeg;base64,{b64}"
     except Exception:
         return None
 
