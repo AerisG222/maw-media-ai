@@ -499,6 +499,13 @@ def get_image_data_url_cached(file_path: str, bbox: dict | None = None) -> str |
         return None
 
 
+def _prefetch_next_page(file_path_bbox_pairs: list[tuple[str, dict | None]]) -> None:
+    """Warm the disk + memory cache for the next page's images."""
+    for file_path, bbox in file_path_bbox_pairs:
+        if file_path:
+            get_image_data_url_cached(file_path, bbox)
+
+
 # --- HTML Rendering ---
 def render_person_card_image(
     data_url: str | None, width: int = 160, height: int = 160, filename: str = "Image"
@@ -792,8 +799,8 @@ def render_persons_step():
     if next and st.session_state["choose_page"] < page_count:
         st.session_state["choose_page"] += 1
         st.rerun()
-    if last and st.session_state["choose_page"] > 1:
-        st.session_state["choose_page"] = page_count - 1
+    if last and st.session_state["choose_page"] < page_count:
+        st.session_state["choose_page"] = page_count
         st.rerun()
 
     st.write(
@@ -836,6 +843,16 @@ def render_persons_step():
                     if sample_path
                     else "Unknown",
                 )
+
+    current_page = st.session_state["choose_page"]
+    if current_page < page_count:
+        next_persons = fetch_persons_page(
+            search if search else None,
+            limit=PERSONS_PAGE_SIZE,
+            offset=current_page * PERSONS_PAGE_SIZE,
+            unnamed_only=unnamed_only,
+        )
+        _prefetch_next_page([(row[4], row[6]) for row in next_persons if row[4]])
 
 
 def navigate_to_persons():
@@ -1029,6 +1046,12 @@ def render_faces_step(person_id: str):
         container_html = f"<div style='{flex_style}'>{''.join(cells_html)}</div>"
         st.markdown(container_html, unsafe_allow_html=True)
 
+    if page < total_pages:
+        next_faces = fetch_faces_for_person(
+            person_id, limit=FACES_PAGE_SIZE, offset=page * FACES_PAGE_SIZE
+        )
+        _prefetch_next_page([(f[1], f[2]) for f in next_faces])
+
 
 def render_unknown_step():
     # Use an explicit set to track selections rather than individual widget keys.
@@ -1215,6 +1238,16 @@ def render_unknown_step():
             unsafe_allow_html=True,
         )
 
+    if page < total_pages:
+        next_offset = page * FACES_PAGE_SIZE
+        if in_assign_mode and sort_by_similarity and target_person:
+            next_faces = fetch_faces_for_unknown_by_similarity(
+                str(target_person[0]), limit=FACES_PAGE_SIZE, offset=next_offset
+            )
+        else:
+            next_faces = fetch_faces_for_unknown(limit=FACES_PAGE_SIZE, offset=next_offset)
+        _prefetch_next_page([(f[1], f[2]) for f in next_faces])
+
 
 def navigate_to_review():
     d = st.query_params.to_dict()
@@ -1398,6 +1431,12 @@ def render_review_step():
                     on_change=_toggle,
                     label_visibility="collapsed",
                 )
+
+    if page < total_pages:
+        next_suggestions = fetch_suggestions_page(
+            limit=FACES_PAGE_SIZE, offset=page * FACES_PAGE_SIZE
+        )
+        _prefetch_next_page([(r[1], r[2]) for r in next_suggestions])
 
 
 if __name__ == "__main__":
