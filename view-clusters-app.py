@@ -880,30 +880,30 @@ def render_faces_step(person_id: str):
             except Exception as e:
                 st.error(f"Failed to save name: {e}")
 
-    with st.expander("Merge other clusters into this person"):
+    with st.expander("Merge this cluster into another person"):
         other_persons = fetch_all_persons_for_merge(person_id)
         if not other_persons:
-            st.info("No other clusters found.")
+            st.info("No other named clusters found.")
         else:
-            selected_to_merge = st.multiselect(
-                "Select clusters to absorb (their faces move here, then they are deleted):",
+            merge_target = st.selectbox(
+                "Select the person to merge this cluster into (this cluster will be deleted):",
                 options=other_persons,
                 format_func=lambda x: (
                     f"{x[1] or 'Unnamed'} — {x[2]} faces  [{str(x[0])[:8]}…]"
                 ),
+                index=None,
                 key=f"merge_select_{person_id}",
             )
-            if selected_to_merge:
+            if merge_target:
                 if st.button(
-                    f"Merge {len(selected_to_merge)} cluster(s) into this person",
+                    f"Merge this cluster into {merge_target[1]}",
                     key=f"merge_btn_{person_id}",
                     type="primary",
                 ):
-                    source_ids = [str(p[0]) for p in selected_to_merge]
                     try:
-                        merge_persons_into(person_id, source_ids)
-                        st.success(f"Merged {len(source_ids)} cluster(s).")
-                        st.rerun()
+                        merge_persons_into(str(merge_target[0]), [person_id])
+                        st.success(f"Merged into {merge_target[1]}.")
+                        navigate_to_persons()
                     except Exception as e:
                         st.error(f"Merge failed: {e}")
 
