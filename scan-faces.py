@@ -75,6 +75,12 @@ RECOGNITION_DISTANCE_THRESHOLD = float(
 # suggestion.  Lower = more conservative (fewer but higher-confidence suggestions).
 SUGGEST_DISTANCE_THRESHOLD = float(os.getenv("SUGGEST_DISTANCE_THRESHOLD", "0.35"))
 
+# Cosine distance threshold for merge-clusters.
+# Unnamed clusters whose centroid is within this distance of a named person's
+# centroid are merged into that person.  Tighter than suggest because a whole
+# cluster is moved at once.
+MERGE_DISTANCE_THRESHOLD = float(os.getenv("MERGE_DISTANCE_THRESHOLD", "0.25"))
+
 # How many images to process between database commits.
 BATCH_COMMIT_SIZE = int(os.getenv("BATCH_COMMIT_SIZE", "50"))
 
@@ -614,6 +620,108 @@ def cmd_suggest(threshold: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# MERGE-CLUSTERS command
+# ---------------------------------------------------------------------------
+
+
+def cmd_merge_clusters(threshold: float, dry_run: bool) -> None:
+    """
+    For each unnamed cluster, find the nearest named-person centroid via
+    pgvector.  If the cosine distance is below *threshold*, merge the cluster
+    into that person (move all its faces, recompute face_count, delete the
+    empty cluster).
+
+    Always run with --dry-run first to review the plan before committing.
+    """
+    prefix = "[DRY RUN] " if dry_run else ""
+    log.info(f"{prefix}Running merge-clusters (threshold={threshold:.3f})…")
+    conn = get_connection(DB_DSN)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                p_unnamed.id            AS unnamed_id,
+                p_unnamed.cluster_label AS cluster_label,
+                p_unnamed.face_count    AS face_count,
+                nearest.id              AS named_id,
+                nearest.name            AS name,
+                (p_unnamed.representative_embedding <=> nearest.representative_embedding)
+                                        AS distance
+            FROM persons p_unnamed
+            CROSS JOIN LATERAL (
+                SELECT p.id, p.name, p.representative_embedding
+                FROM persons p
+                WHERE p.name IS NOT NULL
+                  AND p.representative_embedding IS NOT NULL
+                ORDER BY p.representative_embedding <=> p_unnamed.representative_embedding
+                LIMIT 1
+            ) nearest
+            WHERE p_unnamed.name IS NULL
+              AND p_unnamed.representative_embedding IS NOT NULL
+              AND (p_unnamed.representative_embedding <=> nearest.representative_embedding)
+                  < %(threshold)s
+            ORDER BY distance ASC
+            """,
+            {"threshold": threshold},
+        )
+        candidates = cur.fetchall()
+
+    if not candidates:
+        log.info("No unnamed clusters found within threshold — nothing to merge.")
+        conn.close()
+        return
+
+    total_faces = sum(row["face_count"] or 0 for row in candidates)
+    log.info(
+        f"{prefix}Found {len(candidates)} unnamed cluster(s) to merge "
+        f"({total_faces:,} faces total):"
+    )
+    for row in candidates:
+        label = (
+            f"cluster_{row['cluster_label']}"
+            if row["cluster_label"] is not None
+            else str(row["unnamed_id"])[:8]
+        )
+        log.info(
+            f"  {label:<20} ({row['face_count'] or 0:>5} faces)"
+            f"  →  \"{row['name']}\"  distance={row['distance']:.4f}"
+        )
+
+    if dry_run:
+        log.info("No changes made. Re-run without --dry-run to apply.")
+        conn.close()
+        return
+
+    for row in tqdm(candidates, desc="Merging clusters"):
+        unnamed_id = row["unnamed_id"]
+        named_id = row["named_id"]
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE face_detections SET person_id = %s WHERE person_id = %s",
+                (named_id, unnamed_id),
+            )
+            cur.execute(
+                """
+                UPDATE persons
+                SET face_count = (SELECT COUNT(*) FROM face_detections WHERE person_id = %s),
+                    updated_at = now()
+                WHERE id = %s
+                """,
+                (named_id, named_id),
+            )
+            cur.execute("DELETE FROM persons WHERE id = %s", (unnamed_id,))
+        conn.commit()
+
+    log.info(
+        f"Merged {len(candidates)} unnamed cluster(s) into named persons "
+        f"({total_faces:,} faces reassigned)."
+    )
+    log.info("Tip: run 'suggest' again to pick up any remaining unassigned faces.")
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
 # STATS command
 # ---------------------------------------------------------------------------
 
@@ -713,6 +821,24 @@ def main() -> None:
              "Lower = more conservative.",
     )
 
+    # merge-clusters
+    p_merge = sub.add_parser(
+        "merge-clusters",
+        help="Merge unnamed clusters into the nearest named person when centroids are close.",
+    )
+    p_merge.add_argument(
+        "--threshold",
+        type=float,
+        default=MERGE_DISTANCE_THRESHOLD,
+        help=f"Cosine distance threshold (default: {MERGE_DISTANCE_THRESHOLD}). "
+             "Lower = more conservative.",
+    )
+    p_merge.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview which clusters would be merged without making any changes.",
+    )
+
     # stats
     sub.add_parser("stats", help="Print database statistics.")
 
@@ -724,6 +850,8 @@ def main() -> None:
         cmd_cluster()
     elif args.command == "suggest":
         cmd_suggest(args.threshold)
+    elif args.command == "merge-clusters":
+        cmd_merge_clusters(args.threshold, args.dry_run)
     elif args.command == "stats":
         cmd_stats()
 
