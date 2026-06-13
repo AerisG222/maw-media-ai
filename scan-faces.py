@@ -531,32 +531,37 @@ def cmd_cluster() -> None:
 
 def cmd_suggest(threshold: float) -> None:
     """
-    For every unassigned, unvalidated face with an embedding, find its nearest
-    named-person centroid via pgvector and write a suggestion when the cosine
-    distance is below *threshold*.
+    For every unassigned or unnamed-cluster face with an embedding, find its
+    nearest named-person centroid via pgvector and write a suggestion when the
+    cosine distance is below *threshold*.
+
+    Candidates are faces where:
+      - person_id IS NULL (completely unassigned), OR
+      - person_id points to a person with name IS NULL (assigned to an unnamed cluster)
 
     Already-suggested faces are re-evaluated so that re-running after labelling
     more clusters can improve or replace earlier suggestions.  Validated faces
-    (is_validated = TRUE) are never touched.
+    (is_validated = TRUE) in NAMED clusters are never touched.
     """
     log.info(f"Running suggest with distance threshold {threshold:.3f}…")
     conn = get_connection(DB_DSN)
 
-    # Count candidates
+    # Count candidates: unassigned faces + faces in unnamed clusters
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT COUNT(*)
-            FROM face_detections
-            WHERE person_id IS NULL
-              AND is_validated = FALSE
-              AND embedding IS NOT NULL
+            FROM face_detections fd
+            LEFT JOIN persons p ON p.id = fd.person_id
+            WHERE (fd.person_id IS NULL OR p.name IS NULL)
+              AND fd.is_validated = FALSE
+              AND fd.embedding IS NOT NULL
             """
         )
         n_candidates = cur.fetchone()["count"]
 
     if n_candidates == 0:
-        log.info("No unassigned, unvalidated faces found — nothing to do.")
+        log.info("No candidate faces found — nothing to do.")
         conn.close()
         return
 
@@ -566,11 +571,17 @@ def cmd_suggest(threshold: float) -> None:
     with conn.cursor() as cur:
         cur.execute(
             """
-            UPDATE face_detections
+            UPDATE face_detections fd
             SET suggested_person_id = NULL,
                 suggestion_score    = NULL
-            WHERE person_id    IS NULL
-              AND is_validated  = FALSE
+            FROM (
+                SELECT fd2.id
+                FROM face_detections fd2
+                LEFT JOIN persons p ON p.id = fd2.person_id
+                WHERE (fd2.person_id IS NULL OR p.name IS NULL)
+                  AND fd2.is_validated = FALSE
+            ) candidates
+            WHERE fd.id = candidates.id
             """
         )
     conn.commit()
@@ -590,6 +601,7 @@ def cmd_suggest(threshold: float) -> None:
                     nearest.id       AS person_id,
                     (fd.embedding <=> nearest.representative_embedding) AS distance
                 FROM face_detections fd
+                LEFT JOIN persons src_p ON src_p.id = fd.person_id
                 CROSS JOIN LATERAL (
                     SELECT p.id, p.representative_embedding
                     FROM persons p
@@ -598,7 +610,7 @@ def cmd_suggest(threshold: float) -> None:
                     ORDER BY p.representative_embedding <=> fd.embedding
                     LIMIT 1
                 ) nearest
-                WHERE fd.person_id   IS NULL
+                WHERE (fd.person_id IS NULL OR src_p.name IS NULL)
                   AND fd.is_validated = FALSE
                   AND fd.embedding   IS NOT NULL
                   AND (fd.embedding <=> nearest.representative_embedding) < %(threshold)s
