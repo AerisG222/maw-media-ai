@@ -291,6 +291,23 @@ def fetch_named_persons_for_assign() -> list:
     )
 
 
+def delete_empty_persons() -> int:
+    """Delete persons with no face_detections. Returns the number deleted."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM persons
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM face_detections WHERE person_id = persons.id
+                )
+                """
+            )
+            deleted = cur.rowcount
+            conn.commit()
+    return deleted
+
+
 def fetch_suggestion_count() -> int:
     result = execute_single(
         """
@@ -767,7 +784,7 @@ def render_persons_step():
 
     n_suggestions = fetch_suggestion_count()
     suggestion_badge = f" ({n_suggestions:,})" if n_suggestions else ""
-    link_col1, link_col2 = st.columns([1, 2])
+    link_col1, link_col2, link_col3 = st.columns([1, 2, 1])
     with link_col1:
         st.markdown(
             f'<a href="/?{QUERY_PARAM_UNKNOWN}=true">Unknown Faces</a>',
@@ -778,6 +795,17 @@ def render_persons_step():
             f'<a href="/?{QUERY_PARAM_REVIEW}=true">Review Suggestions{html.escape(suggestion_badge)}</a>',
             unsafe_allow_html=True,
         )
+    with link_col3:
+        if st.button("Clean up empty clusters", key="cleanup_empty_persons"):
+            try:
+                n_deleted = delete_empty_persons()
+                if n_deleted:
+                    st.success(f"Deleted {n_deleted} empty cluster(s).")
+                    st.rerun()
+                else:
+                    st.info("No empty clusters found.")
+            except Exception as e:
+                st.error(f"Cleanup failed: {e}")
 
     unnamed_only = st.session_state.get("choose_unnamed_only", False)
 
