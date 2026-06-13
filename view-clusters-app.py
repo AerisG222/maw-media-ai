@@ -82,7 +82,7 @@ def remove_faces_from_person(person_id: str, face_ids: list[str]):
 
 
 def assign_faces_to_person(person_id: str, face_ids: list[str]):
-    """Assign faces to a person and sync the face count."""
+    """Assign faces to a person and sync the face count and centroid."""
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -91,6 +91,19 @@ def assign_faces_to_person(person_id: str, face_ids: list[str]):
             )
             cur.execute(
                 "UPDATE persons SET face_count = (SELECT COUNT(*) FROM face_detections WHERE person_id = %s) WHERE id = %s",
+                (person_id, person_id),
+            )
+            cur.execute(
+                """
+                UPDATE persons
+                SET representative_embedding = (
+                    SELECT avg(embedding)::vector
+                    FROM face_detections
+                    WHERE person_id = %s AND embedding IS NOT NULL
+                ),
+                updated_at = now()
+                WHERE id = %s
+                """,
                 (person_id, person_id),
             )
             conn.commit()
@@ -106,6 +119,19 @@ def merge_persons_into(target_id: str, source_ids: list[str]):
             )
             cur.execute(
                 "UPDATE persons SET face_count = (SELECT COUNT(*) FROM face_detections WHERE person_id = %s) WHERE id = %s",
+                (target_id, target_id),
+            )
+            cur.execute(
+                """
+                UPDATE persons
+                SET representative_embedding = (
+                    SELECT avg(embedding)::vector
+                    FROM face_detections
+                    WHERE person_id = %s AND embedding IS NOT NULL
+                ),
+                updated_at = now()
+                WHERE id = %s
+                """,
                 (target_id, target_id),
             )
             # If the target is unnamed, inherit the name from the first named source.
@@ -378,13 +404,19 @@ def confirm_suggestions(face_ids: list[str]) -> None:
                 """,
                 (face_ids,),
             )
-            # Recompute face_count for every affected person
+            # Recompute face_count and centroid for every affected person
             cur.execute(
                 """
                 UPDATE persons p
                 SET face_count = (
                     SELECT COUNT(*) FROM face_detections WHERE person_id = p.id
-                )
+                ),
+                representative_embedding = (
+                    SELECT avg(fd.embedding)::vector
+                    FROM face_detections fd
+                    WHERE fd.person_id = p.id AND fd.embedding IS NOT NULL
+                ),
+                updated_at = now()
                 WHERE p.id IN (
                     SELECT DISTINCT person_id FROM face_detections
                     WHERE id = ANY(%s::uuid[]) AND person_id IS NOT NULL
