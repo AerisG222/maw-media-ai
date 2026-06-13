@@ -349,26 +349,66 @@ def cleanup_persons() -> tuple[int, int]:
     return n_updated, n_deleted
 
 
-def fetch_suggestion_count() -> int:
-    result = execute_single(
+def fetch_suggested_persons() -> list:
+    """Return persons that have pending suggestions, with their suggestion count.
+
+    Each row: (id, name, suggestion_count)
+    """
+    return execute_query(
         """
-        SELECT COUNT(*)
-        FROM face_detections
-        WHERE suggested_person_id IS NOT NULL
-          AND is_validated = FALSE
-        """
+        SELECT per.id, per.name, COUNT(*) AS suggestion_count
+        FROM face_detections fd
+        JOIN persons per ON per.id = fd.suggested_person_id
+        WHERE fd.suggested_person_id IS NOT NULL
+          AND fd.is_validated = FALSE
+        GROUP BY per.id, per.name
+        ORDER BY per.name
+        """,
+        (),
     )
+
+
+def fetch_suggestion_count(person_id: str | None = None) -> int:
+    if person_id:
+        result = execute_single(
+            """
+            SELECT COUNT(*)
+            FROM face_detections
+            WHERE suggested_person_id = %s
+              AND is_validated = FALSE
+            """,
+            (person_id,),
+        )
+    else:
+        result = execute_single(
+            """
+            SELECT COUNT(*)
+            FROM face_detections
+            WHERE suggested_person_id IS NOT NULL
+              AND is_validated = FALSE
+            """
+        )
     return result[0] if result else 0
 
 
-def fetch_suggestions_page(limit: int = FACES_PAGE_SIZE, offset: int = 0) -> list:
+def fetch_suggestions_page(
+    limit: int = FACES_PAGE_SIZE,
+    offset: int = 0,
+    person_id: str | None = None,
+) -> list:
     """Return a page of pending suggestions ordered by score (best first).
 
     Each row: (face_id, file_path, bounding_box, detection_score,
                suggested_person_id, suggested_name, suggestion_score)
     """
+    if person_id:
+        where_extra = "AND fd.suggested_person_id = %s"
+        params = (person_id, limit, offset)
+    else:
+        where_extra = ""
+        params = (limit, offset)
     return execute_query(
-        """
+        f"""
         SELECT fd.id,
                ph.file_path,
                fd.bounding_box,
@@ -381,10 +421,11 @@ def fetch_suggestions_page(limit: int = FACES_PAGE_SIZE, offset: int = 0) -> lis
         JOIN persons per ON per.id = fd.suggested_person_id
         WHERE fd.suggested_person_id IS NOT NULL
           AND fd.is_validated = FALSE
+          {where_extra}
         ORDER BY fd.suggestion_score ASC
         LIMIT %s OFFSET %s
         """,
-        (limit, offset),
+        params,
     )
 
 
@@ -1403,7 +1444,43 @@ def render_review_step():
         if st.button("Back to list", key="review_back"):
             navigate_to_persons()
 
-    total = fetch_suggestion_count()
+    # Person filter — state is managed manually so that confirm/reject reruns
+    # never accidentally clear the filter.  We store the chosen person_id under
+    # FILTER_KEY and pass index= explicitly; the widget has no key= binding so
+    # Streamlit cannot overwrite our state on its own.
+    FILTER_KEY = "review_filter_pid"
+    st.session_state.setdefault(FILTER_KEY, "")
+
+    suggested_persons = fetch_suggested_persons()
+    person_map = {str(p[0]): (p[1], p[2]) for p in suggested_persons}
+    filter_options = [""] + list(person_map.keys())
+    filter_labels = {
+        "": f"All suggestions ({fetch_suggestion_count():,})",
+        **{pid: f"{name}  ({count:,})" for pid, (name, count) in person_map.items()},
+    }
+
+    stored_filter = st.session_state[FILTER_KEY]
+    # If the stored person has no more pending suggestions, drop back to "All".
+    if stored_filter not in filter_options:
+        stored_filter = ""
+        st.session_state[FILTER_KEY] = ""
+
+    selected_filter = st.selectbox(
+        "Filter by person",
+        options=filter_options,
+        format_func=lambda x: filter_labels.get(x, x),
+        index=filter_options.index(stored_filter),
+        label_visibility="collapsed",
+    )
+
+    if selected_filter != stored_filter:
+        st.session_state[FILTER_KEY] = selected_filter
+        st.session_state["review_page"] = 1
+        st.session_state[SEL_KEY] = set()
+
+    active_person_id = selected_filter or None
+
+    total = fetch_suggestion_count(active_person_id)
     if total == 0:
         st.info(
             "No pending suggestions. Run `python scan-faces.py suggest` to generate some."
@@ -1438,7 +1515,7 @@ def render_review_step():
 
     page = st.session_state[view_page_key]
     offset = (page - 1) * FACES_PAGE_SIZE
-    faces = fetch_suggestions_page(limit=FACES_PAGE_SIZE, offset=offset)
+    faces = fetch_suggestions_page(limit=FACES_PAGE_SIZE, offset=offset, person_id=active_person_id)
 
     start_idx = offset + 1 if total > 0 else 0
     end_idx = offset + len(faces)
@@ -1532,7 +1609,7 @@ def render_review_step():
 
     if page < total_pages:
         next_suggestions = fetch_suggestions_page(
-            limit=FACES_PAGE_SIZE, offset=page * FACES_PAGE_SIZE
+            limit=FACES_PAGE_SIZE, offset=page * FACES_PAGE_SIZE, person_id=active_person_id
         )
         _prefetch_next_page([(r[1], r[2]) for r in next_suggestions])
 
