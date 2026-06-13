@@ -764,58 +764,73 @@ def render_face_grid_cell_html(
 
 
 # --- UI Helper Functions ---
-def render_pagination_controls_persons() -> tuple[bool, bool, bool, bool]:
-    cols = st.columns([1, 1, 1, 1])
+def render_pagination_controls_persons() -> tuple[bool, bool, bool, bool, bool, bool]:
+    cols = st.columns(6)
     with cols[0]:
         first = st.button("<< First", key="person_page_first")
     with cols[1]:
-        prev = st.button("◀ Prev", key="person_page_prev")
+        prev10 = st.button("◀ -10", key="person_page_prev10")
     with cols[2]:
-        next = st.button("Next ▶", key="person_page_next")
+        prev = st.button("◀ Prev", key="person_page_prev")
     with cols[3]:
+        next = st.button("Next ▶", key="person_page_next")
+    with cols[4]:
+        next10 = st.button("+10 ▶", key="person_page_next10")
+    with cols[5]:
         last = st.button("Last >>", key="person_page_last")
-
-    return first, prev, next, last
+    return first, prev10, prev, next, next10, last
 
 
 def render_pagination_controls_faces(
     page: int, total_pages: int
-) -> tuple[bool, bool, bool, bool]:
-    cols = st.columns([1, 1, 1, 6])
+) -> tuple[bool, bool, bool, bool, bool, bool]:
+    cols = st.columns(6)
     with cols[0]:
         first = st.button("<< First", key="face_page_first")
     with cols[1]:
-        prev = st.button("◀ Prev", key="face_page_prev")
+        prev10 = st.button("◀ -10", key="face_page_prev10")
     with cols[2]:
-        next = st.button("Next ▶", key="face_page_next")
+        prev = st.button("◀ Prev", key="face_page_prev")
     with cols[3]:
+        next = st.button("Next ▶", key="face_page_next")
+    with cols[4]:
+        next10 = st.button("+10 ▶", key="face_page_next10")
+    with cols[5]:
         last = st.button("Last >>", key="face_page_last")
-    return first, prev, next, last
+    return first, prev10, prev, next, next10, last
 
 
 def render_pagination_controls_unknown(
     page: int, total_pages: int
-) -> tuple[bool, bool, bool, bool]:
-    cols = st.columns([1, 1, 1, 6])
+) -> tuple[bool, bool, bool, bool, bool, bool]:
+    cols = st.columns(6)
     with cols[0]:
         first = st.button("<< First", key="unknown_page_first")
     with cols[1]:
-        prev = st.button("◀ Prev", key="unknown_page_prev")
+        prev10 = st.button("◀ -10", key="unknown_page_prev10")
     with cols[2]:
-        next = st.button("Next ▶", key="unknown_page_next")
+        prev = st.button("◀ Prev", key="unknown_page_prev")
     with cols[3]:
+        next = st.button("Next ▶", key="unknown_page_next")
+    with cols[4]:
+        next10 = st.button("+10 ▶", key="unknown_page_next10")
+    with cols[5]:
         last = st.button("Last >>", key="unknown_page_last")
-    return first, prev, next, last
+    return first, prev10, prev, next, next10, last
 
 
 def update_view_page(action: str, page: int, total_pages: int) -> int:
     """Update the current page based on action."""
     if action == "start":
         return 1
+    elif action == "prev10":
+        return max(1, page - 10)
     elif action == "prev":
         return max(1, page - 1)
     elif action == "next":
         return min(total_pages, page + 1)
+    elif action == "next10":
+        return min(total_pages, page + 10)
     elif action == "end":
         return total_pages
     return page
@@ -861,7 +876,7 @@ def main():
 
 
 def render_persons_step():
-    control_col1, control_col3, control_col4 = st.columns([3, 1, 2])
+    control_col1, control_col3, control_col4 = st.columns([3, 1, 4])
 
     with control_col1:
         search = st.text_input(
@@ -871,10 +886,10 @@ def render_persons_step():
         )
 
     with control_col3:
-        st.checkbox("Unnamed only", key="choose_unnamed_only")
+        st.checkbox("Unnamed", key="choose_unnamed_only")
 
     with control_col4:
-        first, prev, next, last = render_pagination_controls_persons()
+        first, prev10, prev, next, next10, last = render_pagination_controls_persons()
 
     n_suggestions = fetch_suggestion_count()
     suggestion_badge = f" ({n_suggestions:,})" if n_suggestions else ""
@@ -915,16 +930,23 @@ def render_persons_step():
     )
 
     # Handle navigation
-    if first and st.session_state["choose_page"] > 1:
+    cur = st.session_state["choose_page"]
+    if first and cur > 1:
         st.session_state["choose_page"] = 1
         st.rerun()
-    if prev and st.session_state["choose_page"] > 1:
-        st.session_state["choose_page"] -= 1
+    if prev10 and cur > 1:
+        st.session_state["choose_page"] = max(1, cur - 10)
         st.rerun()
-    if next and st.session_state["choose_page"] < page_count:
-        st.session_state["choose_page"] += 1
+    if prev and cur > 1:
+        st.session_state["choose_page"] = cur - 1
         st.rerun()
-    if last and st.session_state["choose_page"] < page_count:
+    if next and cur < page_count:
+        st.session_state["choose_page"] = cur + 1
+        st.rerun()
+    if next10 and cur < page_count:
+        st.session_state["choose_page"] = min(page_count, cur + 10)
+        st.rerun()
+    if last and cur < page_count:
         st.session_state["choose_page"] = page_count
         st.rerun()
 
@@ -1096,18 +1118,21 @@ def render_faces_step(person_id: str):
     )
 
     # Navigation
-    start, prev, next_btn, end = render_pagination_controls_faces(
+    start, prev10, prev, next_btn, next10, end = render_pagination_controls_faces(
         st.session_state[view_page_key], total_pages
     )
 
+    cur = st.session_state[view_page_key]
     if start:
         st.session_state[view_page_key] = 1
+    elif prev10:
+        st.session_state[view_page_key] = max(1, cur - 10)
     elif prev:
-        st.session_state[view_page_key] = max(1, st.session_state[view_page_key] - 1)
+        st.session_state[view_page_key] = max(1, cur - 1)
     elif next_btn:
-        st.session_state[view_page_key] = min(
-            total_pages, st.session_state[view_page_key] + 1
-        )
+        st.session_state[view_page_key] = min(total_pages, cur + 1)
+    elif next10:
+        st.session_state[view_page_key] = min(total_pages, cur + 10)
     elif end:
         st.session_state[view_page_key] = total_pages
 
@@ -1254,18 +1279,21 @@ def render_unknown_step():
         1, min(st.session_state[view_page_key], total_pages)
     )
 
-    start, prev, next_btn, end = render_pagination_controls_unknown(
+    start, prev10, prev, next_btn, next10, end = render_pagination_controls_unknown(
         st.session_state[view_page_key], total_pages
     )
 
+    cur = st.session_state[view_page_key]
     if start:
         st.session_state[view_page_key] = 1
+    elif prev10:
+        st.session_state[view_page_key] = max(1, cur - 10)
     elif prev:
-        st.session_state[view_page_key] = max(1, st.session_state[view_page_key] - 1)
+        st.session_state[view_page_key] = max(1, cur - 1)
     elif next_btn:
-        st.session_state[view_page_key] = min(
-            total_pages, st.session_state[view_page_key] + 1
-        )
+        st.session_state[view_page_key] = min(total_pages, cur + 1)
+    elif next10:
+        st.session_state[view_page_key] = min(total_pages, cur + 10)
     elif end:
         st.session_state[view_page_key] = total_pages
 
@@ -1495,27 +1523,39 @@ def render_review_step():
         1, min(st.session_state[view_page_key], total_pages)
     )
 
-    pg_cols = st.columns([1, 1, 1, 6])
+    pg_cols = st.columns(6)
     with pg_cols[0]:
         if st.button("<< First", key="review_first"):
             st.session_state[view_page_key] = 1
     with pg_cols[1]:
+        if st.button("◀ -10", key="review_prev10"):
+            st.session_state[view_page_key] = max(
+                1, st.session_state[view_page_key] - 10
+            )
+    with pg_cols[2]:
         if st.button("◀ Prev", key="review_prev"):
             st.session_state[view_page_key] = max(
                 1, st.session_state[view_page_key] - 1
             )
-    with pg_cols[2]:
+    with pg_cols[3]:
         if st.button("Next ▶", key="review_next"):
             st.session_state[view_page_key] = min(
                 total_pages, st.session_state[view_page_key] + 1
             )
-    with pg_cols[3]:
+    with pg_cols[4]:
+        if st.button("+10 ▶", key="review_next10"):
+            st.session_state[view_page_key] = min(
+                total_pages, st.session_state[view_page_key] + 10
+            )
+    with pg_cols[5]:
         if st.button("Last >>", key="review_last"):
             st.session_state[view_page_key] = total_pages
 
     page = st.session_state[view_page_key]
     offset = (page - 1) * FACES_PAGE_SIZE
-    faces = fetch_suggestions_page(limit=FACES_PAGE_SIZE, offset=offset, person_id=active_person_id)
+    faces = fetch_suggestions_page(
+        limit=FACES_PAGE_SIZE, offset=offset, person_id=active_person_id
+    )
 
     start_idx = offset + 1 if total > 0 else 0
     end_idx = offset + len(faces)
@@ -1609,7 +1649,9 @@ def render_review_step():
 
     if page < total_pages:
         next_suggestions = fetch_suggestions_page(
-            limit=FACES_PAGE_SIZE, offset=page * FACES_PAGE_SIZE, person_id=active_person_id
+            limit=FACES_PAGE_SIZE,
+            offset=page * FACES_PAGE_SIZE,
+            person_id=active_person_id,
         )
         _prefetch_next_page([(r[1], r[2]) for r in next_suggestions])
 
