@@ -261,15 +261,25 @@ def fetch_faces_for_unknown_by_similarity(
 def fetch_all_persons_for_merge(exclude_id: str) -> list:
     """Return all named persons except exclude_id, sorted by name, for the merge picker.
 
-    Each row: (id, name, face_count)
+    Each row: (id, name, face_count, sample_path, sample_bbox)
     """
     return execute_query(
         """
-        SELECT id, name, face_count
-        FROM persons
-        WHERE id != %s
-          AND name IS NOT NULL
-        ORDER BY name
+        SELECT p.id, p.name, p.face_count,
+               ph.file_path  AS sample_path,
+               fd.bounding_box AS sample_bbox
+        FROM persons p
+        LEFT JOIN LATERAL (
+            SELECT fd.photo_id, fd.bounding_box
+            FROM face_detections fd
+            WHERE fd.person_id = p.id
+            ORDER BY fd.detection_score DESC NULLS LAST
+            LIMIT 1
+        ) fd ON true
+        LEFT JOIN photos ph ON ph.id = fd.photo_id
+        WHERE p.id != %s
+          AND p.name IS NOT NULL
+        ORDER BY p.name
         """,
         (exclude_id,),
     )
@@ -969,17 +979,29 @@ def render_faces_step(person_id: str):
                 key=f"merge_select_{person_id}",
             )
             if merge_target:
-                if st.button(
-                    f"Merge this cluster into {merge_target[1]}",
-                    key=f"merge_btn_{person_id}",
-                    type="primary",
-                ):
-                    try:
-                        merge_persons_into(str(merge_target[0]), [person_id])
-                        st.success(f"Merged into {merge_target[1]}.")
-                        navigate_to_persons()
-                    except Exception as e:
-                        st.error(f"Merge failed: {e}")
+                preview_col, btn_col = st.columns([1, 4])
+                with preview_col:
+                    sample_path, sample_bbox = merge_target[3], merge_target[4]
+                    if sample_path:
+                        data_url = get_image_data_url_cached(sample_path, sample_bbox)
+                        if data_url:
+                            st.markdown(
+                                f'<img src="{data_url}" style="width:80px;height:80px;'
+                                f'object-fit:contain;border-radius:6px;" />',
+                                unsafe_allow_html=True,
+                            )
+                with btn_col:
+                    if st.button(
+                        f"Merge this cluster into {merge_target[1]}",
+                        key=f"merge_btn_{person_id}",
+                        type="primary",
+                    ):
+                        try:
+                            merge_persons_into(str(merge_target[0]), [person_id])
+                            st.success(f"Merged into {merge_target[1]}.")
+                            navigate_to_persons()
+                        except Exception as e:
+                            st.error(f"Merge failed: {e}")
 
     # Faces pagination
     view_page_key = f"view_page_{person_id}"
