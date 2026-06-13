@@ -291,21 +291,26 @@ def fetch_named_persons_for_assign() -> list:
     )
 
 
-def delete_empty_persons() -> int:
-    """Delete persons with no face_detections. Returns the number deleted."""
+def cleanup_persons() -> tuple[int, int]:
+    """Recompute face_count for all persons, then delete any with zero faces.
+
+    Returns (n_updated, n_deleted).
+    """
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                DELETE FROM persons
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM face_detections WHERE person_id = persons.id
+                UPDATE persons
+                SET face_count = (
+                    SELECT COUNT(*) FROM face_detections WHERE person_id = persons.id
                 )
                 """
             )
-            deleted = cur.rowcount
+            n_updated = cur.rowcount
+            cur.execute("DELETE FROM persons WHERE face_count = 0")
+            n_deleted = cur.rowcount
             conn.commit()
-    return deleted
+    return n_updated, n_deleted
 
 
 def fetch_suggestion_count() -> int:
@@ -796,14 +801,14 @@ def render_persons_step():
             unsafe_allow_html=True,
         )
     with link_col3:
-        if st.button("Clean up empty clusters", key="cleanup_empty_persons"):
+        if st.button("Clean up", key="cleanup_empty_persons"):
             try:
-                n_deleted = delete_empty_persons()
+                n_updated, n_deleted = cleanup_persons()
                 if n_deleted:
-                    st.success(f"Deleted {n_deleted} empty cluster(s).")
-                    st.rerun()
+                    st.success(f"Resynced {n_updated} cluster(s), deleted {n_deleted} empty.")
                 else:
-                    st.info("No empty clusters found.")
+                    st.info(f"Resynced {n_updated} cluster(s), none were empty.")
+                st.rerun()
             except Exception as e:
                 st.error(f"Cleanup failed: {e}")
 
