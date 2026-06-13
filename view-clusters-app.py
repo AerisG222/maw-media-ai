@@ -32,8 +32,8 @@ CELL_HEIGHT = 200
 CAPTION_HEIGHT = 72
 IMAGE_HEIGHT = CELL_HEIGHT - CAPTION_HEIGHT
 
-FACES_PAGE_SIZE = 48
-PERSONS_PAGE_SIZE = 48
+FACES_PAGE_SIZE = 24
+PERSONS_PAGE_SIZE = 24
 
 QUERY_PARAM_PERSON = "person"
 QUERY_PARAM_UNKNOWN = "unknown"
@@ -501,7 +501,9 @@ def _atomic_write(path: Path, data: bytes):
 def _evict_disk_cache_if_needed():
     """Delete the oldest cached thumbnails when the count exceeds _CACHE_EVICT_THRESHOLD."""
     try:
-        entries = [e for e in os.scandir(CACHE_DIR) if e.name.endswith((".jpg", ".png"))]
+        entries = [
+            e for e in os.scandir(CACHE_DIR) if e.name.endswith((".jpg", ".png"))
+        ]
         if len(entries) <= _CACHE_EVICT_THRESHOLD:
             return
         entries.sort(key=lambda e: e.stat().st_mtime)
@@ -539,10 +541,14 @@ def get_cached_thumbnail_path(file_path: str, bbox: dict | None = None) -> Path 
         return None
 
 
-def _get_streamlit_cache_decorator(ttl_seconds: int = 3600, max_entries: int = CACHE_MAX_ENTRIES):
+def _get_streamlit_cache_decorator(
+    ttl_seconds: int = 3600, max_entries: int = CACHE_MAX_ENTRIES
+):
     """Return the best available Streamlit cache decorator."""
     if hasattr(st, "cache_data"):
-        return lambda func: st.cache_data(ttl=ttl_seconds, max_entries=max_entries)(func)
+        return lambda func: st.cache_data(ttl=ttl_seconds, max_entries=max_entries)(
+            func
+        )
     if hasattr(st, "experimental_memo"):
         return lambda func: st.experimental_memo(func)
     if hasattr(st, "cache"):
@@ -847,7 +853,9 @@ def render_persons_step():
             try:
                 n_updated, n_deleted = cleanup_persons()
                 if n_deleted:
-                    st.success(f"Resynced {n_updated} cluster(s), deleted {n_deleted} empty.")
+                    st.success(
+                        f"Resynced {n_updated} cluster(s), deleted {n_deleted} empty."
+                    )
                 else:
                     st.info(f"Resynced {n_updated} cluster(s), none were empty.")
                 st.rerun()
@@ -1333,7 +1341,9 @@ def render_unknown_step():
                 str(target_person[0]), limit=FACES_PAGE_SIZE, offset=next_offset
             )
         else:
-            next_faces = fetch_faces_for_unknown(limit=FACES_PAGE_SIZE, offset=next_offset)
+            next_faces = fetch_faces_for_unknown(
+                limit=FACES_PAGE_SIZE, offset=next_offset
+            )
         _prefetch_next_page([(f[1], f[2]) for f in next_faces])
 
 
