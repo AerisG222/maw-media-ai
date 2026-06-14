@@ -109,6 +109,18 @@ def assign_faces_to_person(person_id: str, face_ids: list[str]):
             conn.commit()
 
 
+def clear_cluster(person_id: str):
+    """Unassign all faces from a cluster and delete it."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE face_detections SET person_id = NULL, is_validated = FALSE WHERE person_id = %s",
+                (person_id,),
+            )
+            cur.execute("DELETE FROM persons WHERE id = %s", (person_id,))
+            conn.commit()
+
+
 def merge_persons_into(target_id: str, source_ids: list[str]):
     """Move all faces from source persons into target, recompute count, delete sources."""
     with get_connection() as conn:
@@ -1030,7 +1042,10 @@ def render_faces_step(person_id: str):
         st.session_state[select_mode_key] = False
     in_select_mode = st.session_state[select_mode_key]
 
-    header_col, select_col, back_col = st.columns([6, 2, 1])
+    confirm_clear_key = f"confirm_clear_{person_id}"
+    st.session_state.setdefault(confirm_clear_key, False)
+
+    header_col, select_col, clear_col, back_col = st.columns([6, 2, 2, 1])
     with header_col:
         st.markdown(f"## {html.escape(current_name or 'Unnamed')}")
         st.markdown(f"ID: `{html.escape(str(person_id))}` — Faces: {face_count}")
@@ -1043,6 +1058,26 @@ def render_faces_step(person_id: str):
             if not new_mode:
                 _clear_face_selections(person_id)
             st.rerun()
+
+    with clear_col:
+        if not st.session_state[confirm_clear_key]:
+            if st.button("Clear cluster", key=f"clear_cluster_btn_{person_id}"):
+                st.session_state[confirm_clear_key] = True
+                st.rerun()
+        else:
+            st.warning("Remove all faces and delete this cluster?")
+            yes_col, no_col = st.columns(2)
+            with yes_col:
+                if st.button("Yes, delete", key=f"clear_cluster_yes_{person_id}", type="primary"):
+                    try:
+                        clear_cluster(person_id)
+                        navigate_to_persons()
+                    except Exception as e:
+                        st.error(f"Failed to clear cluster: {e}")
+            with no_col:
+                if st.button("Cancel", key=f"clear_cluster_no_{person_id}"):
+                    st.session_state[confirm_clear_key] = False
+                    st.rerun()
 
     with back_col:
         if st.button("Back to list", key="back_to_list"):
