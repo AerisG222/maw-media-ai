@@ -8,6 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
+import numpy as np
 import psycopg2
 import streamlit as st
 from PIL import Image
@@ -207,6 +208,102 @@ def fetch_persons_page(
         LIMIT %s OFFSET %s
         """,
         (search, like, like, unnamed_only, limit, offset),
+    )
+
+
+def fetch_all_persons_embeddings(
+    search: str | None = None, unnamed_only: bool = False
+) -> list[tuple]:
+    """Fetch all matching persons with centroids for similarity-order computation.
+
+    Returns list of (id, face_count, embedding_floats | None), sorted by face_count desc.
+    """
+    like = f"%{search}%" if search else None
+    rows = execute_query(
+        """
+        SELECT p.id, p.face_count, p.representative_embedding::text
+        FROM persons p
+        WHERE (%s IS NULL OR p.name ILIKE %s OR p.id::text ILIKE %s)
+          AND (NOT %s OR p.name IS NULL)
+        ORDER BY p.face_count DESC NULLS LAST, p.id
+        """,
+        (search, like, like, unnamed_only),
+    )
+    result = []
+    for pid, face_count, emb_text in rows:
+        emb = json.loads(emb_text) if emb_text else None
+        result.append((str(pid), face_count, emb))
+    return result
+
+
+def _compute_similarity_order(persons_data: list[tuple]) -> list[str]:
+    """Greedy nearest-neighbor traversal ordering persons by centroid cosine similarity.
+
+    Starts from the largest cluster and chains each step to the most similar
+    unvisited cluster.  Persons without embeddings are appended at the end.
+
+    persons_data: list of (id, face_count, embedding | None)
+    Returns: ordered list of person ID strings.
+    """
+    with_emb = [(p[0], p[2]) for p in persons_data if p[2] is not None]
+    without_emb = [p[0] for p in persons_data if p[2] is None]
+
+    if not with_emb:
+        return without_emb
+
+    ids = [p[0] for p in with_emb]
+    mat = np.array([p[1] for p in with_emb], dtype=np.float32)
+
+    # L2-normalize so dot product equals cosine similarity
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    mat /= norms
+
+    sim = mat @ mat.T  # (n, n) cosine similarity matrix
+
+    n = len(ids)
+    visited = np.zeros(n, dtype=bool)
+    order: list[int] = []
+    current = 0  # largest cluster is index 0 (sorted by face_count desc)
+    visited[current] = True
+    order.append(current)
+
+    for _ in range(n - 1):
+        row = sim[current].copy()
+        row[visited] = -np.inf
+        nearest = int(np.argmax(row))
+        visited[nearest] = True
+        order.append(nearest)
+        current = nearest
+
+    return [ids[i] for i in order] + without_emb
+
+
+def fetch_persons_by_ids(page_ids: list[str]) -> list:
+    """Fetch a page of persons in the given ID order (used for similarity sort).
+
+    Returns same tuple format as fetch_persons_page.
+    """
+    if not page_ids:
+        return []
+    return execute_query(
+        """
+        SELECT p.id, p.name, p.cluster_label, p.face_count,
+               ph.file_path AS sample_path, fd.detection_score AS sample_score,
+               fd.bounding_box AS sample_bbox
+        FROM persons p
+        LEFT JOIN LATERAL (
+            SELECT fd.photo_id, fd.detection_score, fd.bounding_box
+            FROM face_detections fd
+            WHERE fd.person_id = p.id
+            ORDER BY fd.detection_score DESC NULLS LAST, fd.id
+            LIMIT 1
+        ) fd ON true
+        LEFT JOIN photos ph ON ph.id = fd.photo_id
+        WHERE p.id = ANY(%s::uuid[])
+        ORDER BY array_position(%s::uuid[], p.id)
+        """,
+        (page_ids, page_ids),
     )
 
 
@@ -888,7 +985,7 @@ def main():
 
 
 def render_persons_step():
-    control_col1, control_col3, control_col4 = st.columns([3, 1, 4])
+    control_col1, control_col3, control_col_sim, control_col4 = st.columns([3, 1, 1, 3])
 
     with control_col1:
         search = st.text_input(
@@ -899,6 +996,9 @@ def render_persons_step():
 
     with control_col3:
         st.checkbox("Unnamed", key="choose_unnamed_only")
+
+    with control_col_sim:
+        st.checkbox("Sort by similarity", key="choose_sim_sort")
 
     with control_col4:
         first, prev10, prev, next, next10, last = render_pagination_controls_persons()
@@ -931,9 +1031,33 @@ def render_persons_step():
                 st.error(f"Cleanup failed: {e}")
 
     unnamed_only = st.session_state.get("choose_unnamed_only", False)
+    sim_sort = st.session_state.get("choose_sim_sort", False)
 
-    # Pagination
-    total = fetch_persons_count(search if search else None, unnamed_only=unnamed_only)
+    # Cache key uniquely identifies the current filter combination.
+    # When it changes, the similarity order must be recomputed and the page reset.
+    sim_cache_key = f"{search or ''}:{unnamed_only}"
+
+    if sim_sort:
+        if (
+            st.session_state.get("sim_order_key") != sim_cache_key
+            or "sim_order" not in st.session_state
+        ):
+            with st.spinner("Computing similarity order…"):
+                persons_data = fetch_all_persons_embeddings(
+                    search if search else None, unnamed_only
+                )
+                st.session_state["sim_order"] = _compute_similarity_order(persons_data)
+                st.session_state["sim_order_key"] = sim_cache_key
+                st.session_state["choose_page"] = 1
+
+        ordered_ids = st.session_state["sim_order"]
+        total = len(ordered_ids)
+    else:
+        # Clear stale cache when sim sort is turned off
+        st.session_state.pop("sim_order", None)
+        st.session_state.pop("sim_order_key", None)
+        total = fetch_persons_count(search if search else None, unnamed_only=unnamed_only)
+
     page_count = max(1, math.ceil(total / PERSONS_PAGE_SIZE))
 
     # Clamp current page
@@ -968,12 +1092,16 @@ def render_persons_step():
 
     # Fetch page
     offset = (st.session_state["choose_page"] - 1) * PERSONS_PAGE_SIZE
-    persons = fetch_persons_page(
-        search if search else None,
-        limit=PERSONS_PAGE_SIZE,
-        offset=offset,
-        unnamed_only=unnamed_only,
-    )
+    if sim_sort:
+        page_ids = ordered_ids[offset : offset + PERSONS_PAGE_SIZE]
+        persons = fetch_persons_by_ids(page_ids)
+    else:
+        persons = fetch_persons_page(
+            search if search else None,
+            limit=PERSONS_PAGE_SIZE,
+            offset=offset,
+            unnamed_only=unnamed_only,
+        )
 
     for row_start in range(0, len(persons), GRID_COLS):
         row = persons[row_start : row_start + GRID_COLS]
@@ -1005,12 +1133,18 @@ def render_persons_step():
 
     current_page = st.session_state["choose_page"]
     if current_page < page_count:
-        next_persons = fetch_persons_page(
-            search if search else None,
-            limit=PERSONS_PAGE_SIZE,
-            offset=current_page * PERSONS_PAGE_SIZE,
-            unnamed_only=unnamed_only,
-        )
+        if sim_sort:
+            next_ids = ordered_ids[
+                current_page * PERSONS_PAGE_SIZE : (current_page + 1) * PERSONS_PAGE_SIZE
+            ]
+            next_persons = fetch_persons_by_ids(next_ids)
+        else:
+            next_persons = fetch_persons_page(
+                search if search else None,
+                limit=PERSONS_PAGE_SIZE,
+                offset=current_page * PERSONS_PAGE_SIZE,
+                unnamed_only=unnamed_only,
+            )
         _prefetch_next_page([(row[4], row[6]) for row in next_persons if row[4]])
 
 
