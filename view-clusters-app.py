@@ -836,7 +836,12 @@ def render_clickable_person_card(
 
 
 def render_face_grid_cell_html(
-    data_url: str | None, width: int, height: int, filename: str, score: float | None
+    data_url: str | None,
+    width: int,
+    height: int,
+    filename: str,
+    score: float | None,
+    file_path: str | None = None,
 ) -> str:
     if data_url:
         img_html = (
@@ -864,8 +869,10 @@ def render_face_grid_cell_html(
         f"font-size:11px;color:#666;text-align:center;'>{html.escape(score_text)}</div>"
     )
 
+    title_attr = f" title='{html.escape(file_path)}'" if file_path else ""
+
     return (
-        f"<div style='width:{CELL_WIDTH}px;display:flex;flex-direction:column;align-items:center;'>"
+        f"<div{title_attr} style='width:{CELL_WIDTH}px;display:flex;flex-direction:column;align-items:center;cursor:default;'>"
         f"<div style='width:{CELL_WIDTH}px;height:{IMAGE_HEIGHT}px;display:flex;"
         f"align-items:center;justify-content:center;'>{img_html}</div>"
         f"{score_div}</div>"
@@ -1352,6 +1359,7 @@ def render_faces_step(person_id: str):
                             height=IMAGE_HEIGHT,
                             filename=os.path.basename(file_path),
                             score=score,
+                            file_path=file_path,
                         ),
                         unsafe_allow_html=True,
                     )
@@ -1370,6 +1378,7 @@ def render_faces_step(person_id: str):
                 height=IMAGE_HEIGHT,
                 filename=os.path.basename(file_path),
                 score=score,
+                file_path=file_path,
             )
             cells_html.append(cell_html)
 
@@ -1533,6 +1542,7 @@ def render_unknown_step():
                             height=IMAGE_HEIGHT,
                             filename=os.path.basename(file_path),
                             score=score,
+                            file_path=file_path,
                         ),
                         unsafe_allow_html=True,
                     )
@@ -1564,6 +1574,7 @@ def render_unknown_step():
                     height=IMAGE_HEIGHT,
                     filename=os.path.basename(file_path),
                     score=score,
+                    file_path=file_path,
                 )
             )
         flex_style = "display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;justify-content:flex-start;"
