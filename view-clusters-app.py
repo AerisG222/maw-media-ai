@@ -1408,7 +1408,7 @@ def render_unknown_step():
     with header_col:
         st.markdown("## Uncategorized Faces")
     with select_col:
-        toggle_label = "Cancel selection" if in_assign_mode else "Select to assign"
+        toggle_label = "Cancel selection" if in_assign_mode else "Select multiple"
         if st.button(toggle_label, key="toggle_assign_unknown"):
             new_mode = not in_assign_mode
             st.session_state[assign_mode_key] = new_mode
@@ -1419,33 +1419,51 @@ def render_unknown_step():
         if st.button("Back to list", key="back_to_list"):
             navigate_to_persons()
 
-    # Target person + sort controls
-    sort_by_similarity = False
+    # Target person + sort controls — always visible so browsing by similarity
+    # doesn't require entering bulk-select mode first.
+    # Manual state management (no key= on selectbox) avoids the widget-state
+    # reset that occurs when st.rerun() is called from inside a column context.
+    TARGET_KEY = "unknown_target_pid"
+    st.session_state.setdefault(TARGET_KEY, "")
+
+    named_persons = fetch_named_persons_for_assign()
     target_person = None
-    if in_assign_mode:
-        named_persons = fetch_named_persons_for_assign()
-        if named_persons:
-            person_map = {str(p[0]): p for p in named_persons}
-            ctrl_col1, ctrl_col2 = st.columns([4, 4])
-            with ctrl_col1:
-                target_person_id = st.selectbox(
-                    "Assign selected faces to:",
-                    options=list(person_map.keys()),
-                    format_func=lambda pid: (
-                        f"{person_map[pid][1]}  ({person_map[pid][2]} faces)"
-                    ),
-                    key="assign_target_person",
-                )
-                target_person = person_map.get(target_person_id)
-            with ctrl_col2:
-                # setdefault so value= never overrides existing state
-                st.session_state.setdefault("sort_by_similarity", True)
-                sort_by_similarity = st.checkbox(
-                    "Sort by similarity to selected person",
-                    key="sort_by_similarity",
-                )
-        else:
-            st.warning("No named persons found. Label some clusters first.")
+    sort_by_similarity = False
+    if named_persons:
+        person_map = {str(p[0]): p for p in named_persons}
+        person_options = [""] + list(person_map.keys())
+
+        stored_target = st.session_state[TARGET_KEY]
+        if stored_target not in person_options:
+            stored_target = ""
+            st.session_state[TARGET_KEY] = ""
+
+        ctrl_col1, ctrl_col2 = st.columns([4, 2])
+        with ctrl_col1:
+            selected_target = st.selectbox(
+                "Target person:",
+                options=person_options,
+                format_func=lambda pid: (
+                    "— none —"
+                    if pid == ""
+                    else f"{person_map[pid][1]}  ({person_map[pid][2]} faces)"
+                ),
+                index=person_options.index(stored_target),
+            )  # No key= — prevents Streamlit from overwriting state on rerun
+        if selected_target != stored_target:
+            st.session_state[TARGET_KEY] = selected_target
+            st.session_state[SEL_KEY] = set()
+        target_person = person_map.get(st.session_state[TARGET_KEY])
+
+        with ctrl_col2:
+            st.session_state.setdefault("sort_by_similarity", True)
+            sort_by_similarity = st.checkbox(
+                "Sort by similarity",
+                key="sort_by_similarity",
+                disabled=target_person is None,
+            )
+    else:
+        st.warning("No named persons found. Label some clusters first.")
 
     # Pagination
     view_page_key = "view_page_unknown"
@@ -1478,7 +1496,7 @@ def render_unknown_step():
     page = st.session_state[view_page_key]
     offset = (page - 1) * FACES_PAGE_SIZE
 
-    if in_assign_mode and sort_by_similarity and target_person:
+    if sort_by_similarity and target_person:
         faces = fetch_faces_for_unknown_by_similarity(
             str(target_person[0]), limit=FACES_PAGE_SIZE, offset=offset
         )
@@ -1494,16 +1512,18 @@ def render_unknown_step():
             f"**Showing {start_idx}–{end_idx} of {total_faces} (page {page}/{total_pages})**"
         )
 
-    if in_assign_mode and target_person:
+    if target_person:
         page_face_ids = [str(face[0]) for face in faces]
-        selected_ids = list(st.session_state[SEL_KEY])
         with action_col:
             btn_col1, btn_col2 = st.columns(2)
             with btn_col1:
                 if st.button("Select all on page", key="select_all_unknown"):
                     st.session_state[SEL_KEY].update(page_face_ids)
-                    st.rerun()
             with btn_col2:
+                # Read AFTER the select-all button may have updated the set
+                # in this same render pass — a list copy taken earlier would
+                # be stale and leave the assign button permanently disabled.
+                selected_ids = list(st.session_state[SEL_KEY])
                 assign_label = (
                     f"Assign {len(selected_ids)} face(s)"
                     if selected_ids
@@ -1523,7 +1543,11 @@ def render_unknown_step():
                     except Exception as e:
                         st.error(f"Assignment failed: {e}")
 
-    if in_assign_mode:
+    # Use the Streamlit-columns layout whenever we need per-face widgets
+    # (quick-assign buttons or bulk-select checkboxes).  Fall back to a single
+    # static HTML block when just browsing — it's faster to render.
+    needs_columns = target_person is not None or in_assign_mode
+    if needs_columns:
         selected_set = st.session_state[SEL_KEY]
         for row_start in range(0, len(faces), GRID_COLS):
             row_faces = faces[row_start : row_start + GRID_COLS]
@@ -1532,7 +1556,6 @@ def render_unknown_step():
                 row_faces
             ):
                 face_id_str = str(face_id)
-                cb_key = f"unknown_face_cb_{face_id_str}"
                 with cols[col_idx]:
                     data_url = get_image_data_url_cached(file_path, bounding_box)
                     st.markdown(
@@ -1547,6 +1570,23 @@ def render_unknown_step():
                         unsafe_allow_html=True,
                     )
 
+                    if target_person is not None:
+                        if st.button(
+                            "Assign",
+                            key=f"quick_assign_{face_id_str}",
+                            use_container_width=True,
+                        ):
+                            try:
+                                assign_faces_to_person(
+                                    str(target_person[0]), [face_id_str]
+                                )
+                                st.session_state[SEL_KEY].discard(face_id_str)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Assignment failed: {e}")
+
+                    cb_key = f"unknown_face_cb_{face_id_str}"
+
                     def _toggle(fid=face_id_str):
                         s = st.session_state[SEL_KEY]
                         if fid in s:
@@ -1554,8 +1594,6 @@ def render_unknown_step():
                         else:
                             s.add(fid)
 
-                    # Sync key from the authoritative set before rendering so
-                    # Select All (which only updates the set) is reflected here.
                     st.session_state[cb_key] = face_id_str in selected_set
                     st.checkbox(
                         "Select",
@@ -1585,7 +1623,7 @@ def render_unknown_step():
 
     if page < total_pages:
         next_offset = page * FACES_PAGE_SIZE
-        if in_assign_mode and sort_by_similarity and target_person:
+        if sort_by_similarity and target_person:
             next_faces = fetch_faces_for_unknown_by_similarity(
                 str(target_person[0]), limit=FACES_PAGE_SIZE, offset=next_offset
             )
