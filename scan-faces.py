@@ -7,14 +7,11 @@ generates 512-dim embeddings, clusters them with HDBSCAN, and writes
 everything to Postgres (with pgvector) for querying from your .NET app.
 
 Usage:
-    # First-time full scan:
+    # Scan new/unscanned photos (already-scanned photos are skipped):
     python scan_faces.py scan --photo-dir /path/to/photos
 
     # Cluster detected faces into persons:
     python scan_faces.py cluster
-
-    # Process only new/unscanned photos (incremental):
-    python scan_faces.py scan --photo-dir /path/to/photos --incremental
 
     # Suggest person assignments for unvalidated faces (writes suggested_person_id):
     python scan_faces.py suggest
@@ -24,10 +21,14 @@ Usage:
 """
 
 import argparse
+import itertools
+import json
 import logging
 import os
 import sys
 import time
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -37,6 +38,8 @@ import psycopg
 from insightface.app import FaceAnalysis
 from psycopg.rows import dict_row
 from tqdm import tqdm
+
+from face_cache import face_crop_path
 
 # ---------------------------------------------------------------------------
 # Configuration — override via environment variables or edit defaults below
@@ -81,8 +84,21 @@ SUGGEST_DISTANCE_THRESHOLD = float(os.getenv("SUGGEST_DISTANCE_THRESHOLD", "0.35
 # cluster is moved at once.
 MERGE_DISTANCE_THRESHOLD = float(os.getenv("MERGE_DISTANCE_THRESHOLD", "0.25"))
 
+# Laplacian variance threshold below which a face crop is considered blurry.
+# Higher = sharper.  Typical face crops: <50 very blurry, 50-150 moderate, >150 sharp.
+BLUR_SCORE_THRESHOLD = float(os.getenv("BLUR_SCORE_THRESHOLD", "80.0"))
+
+# Longest-edge cap (px) for the JPEG face crops cached on disk for the UI.
+# Large enough for crisp thumbnails, small enough to keep the cache compact.
+FACE_CROP_MAX_DIM = int(os.getenv("FACE_CROP_MAX_DIM", "400"))
+
 # How many images to process between database commits.
 BATCH_COMMIT_SIZE = int(os.getenv("BATCH_COMMIT_SIZE", "50"))
+
+# Background threads used to decode/resize images ahead of detection.  Detection
+# itself runs serially on the single model; this just overlaps the (slow, e.g.
+# AVIF) image I/O with inference.  Override with --workers or SCAN_LOADER_THREADS.
+SCAN_LOADER_THREADS = int(os.getenv("SCAN_LOADER_THREADS", "4"))
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -160,24 +176,27 @@ def upsert_photo(
 def insert_face(
     conn: psycopg.Connection,
     photo_id: str,
+    face_id: str,
     bbox: dict,
     embedding: np.ndarray,
     det_score: float,
     face_w: int,
     face_h: int,
+    blur_score: float | None = None,
     person_id: str | None = None,
 ) -> str:
-    """Insert a face detection row; return the face id (UUID string)."""
-    import json
+    """Insert a face detection row; return the face id (UUID string).
 
-    face_id = str(uuid.uuid7())
+    The caller supplies ``face_id`` so it can name the cached crop file before
+    the row exists.
+    """
     vec_str = "[" + ",".join(f"{v:.8f}" for v in embedding.tolist()) + "]"
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO face_detections
-                (id, photo_id, bounding_box, embedding, detection_score, face_width_px, face_height_px, person_id)
-            VALUES (%s, %s, %s, %s::vector, %s, %s, %s, %s)
+                (id, photo_id, bounding_box, embedding, detection_score, face_width_px, face_height_px, blur_score, person_id)
+            VALUES (%s, %s, %s, %s::vector, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -188,6 +207,7 @@ def insert_face(
                 det_score,
                 face_w,
                 face_h,
+                blur_score,
                 person_id,
             ),
         )
@@ -300,6 +320,82 @@ def detect_faces(img: np.ndarray) -> list[dict]:
     return results
 
 
+def _crop_region(img_bgr: np.ndarray, bbox: dict) -> np.ndarray | None:
+    """Return the face crop (BGR ndarray) for a bbox, or None if degenerate.
+
+    Uses the normalized (0–1) coordinates scaled to the actual image size, so
+    the crop is correct regardless of whether the image was downscaled since
+    detection.  The stored ``*_px`` values assume the resolution detection ran
+    at and would mis-crop a full-resolution re-read of a large photo.
+    """
+    img_h, img_w = img_bgr.shape[:2]
+    x = bbox.get("x")
+    y = bbox.get("y")
+    w = bbox.get("width")
+    h = bbox.get("height")
+
+    if None not in (x, y, w, h):
+        x1 = int(round(x * img_w))
+        y1 = int(round(y * img_h))
+        x2 = int(round((x + w) * img_w))
+        y2 = int(round((y + h) * img_h))
+    else:
+        # Fall back to pixel coords for older rows lacking normalized values.
+        x1 = int(bbox.get("x_px", 0))
+        y1 = int(bbox.get("y_px", 0))
+        x2 = x1 + int(bbox.get("width_px", 0))
+        y2 = y1 + int(bbox.get("height_px", 0))
+
+    x1, y1 = max(0, min(x1, img_w)), max(0, min(y1, img_h))
+    x2, y2 = max(0, min(x2, img_w)), max(0, min(y2, img_h))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return img_bgr[y1:y2, x1:x2]
+
+
+def blur_score_for_crop(img_bgr: np.ndarray, bbox: dict) -> float:
+    """Return the Laplacian variance of a face crop. Higher = sharper.
+
+    Computed on the full-resolution crop so scores stay comparable regardless
+    of the (possibly downscaled) JPEG saved for the UI.
+    """
+    crop = _crop_region(img_bgr, bbox)
+    if crop is None:
+        return 0.0
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def write_face_crop(img_bgr: np.ndarray, bbox: dict, crop_path: Path) -> bool:
+    """Write a JPEG of the face crop to *crop_path* (creating parent dirs).
+
+    The crop is downscaled so its longest edge is at most FACE_CROP_MAX_DIM and
+    written atomically.  Returns True on success.
+    """
+    crop = _crop_region(img_bgr, bbox)
+    if crop is None:
+        return False
+
+    ch, cw = crop.shape[:2]
+    longest = max(ch, cw)
+    if longest > FACE_CROP_MAX_DIM:
+        scale = FACE_CROP_MAX_DIM / longest
+        crop = cv2.resize(
+            crop,
+            (max(1, round(cw * scale)), max(1, round(ch * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    crop_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = crop_path.with_name(f"{crop_path.stem}.tmp-{uuid.uuid4().hex}.jpg")
+    ok = cv2.imwrite(str(tmp), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if ok:
+        os.replace(str(tmp), str(crop_path))
+    else:
+        tmp.unlink(missing_ok=True)
+    return bool(ok)
+
+
 # ---------------------------------------------------------------------------
 # Directory walker
 # ---------------------------------------------------------------------------
@@ -326,9 +422,34 @@ def iter_images(photo_dir: str) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
-def cmd_scan(photo_dir: str, incremental: bool) -> None:
+def _iter_prefetched_images(paths: list[str | Path], n_workers: int):
+    """Yield ``(path_str, img)`` in order, decoding images in worker threads.
+
+    A bounded look-ahead keeps at most ~2×workers images resident so image I/O
+    overlaps with detection on the main thread without ballooning memory.
+    ``img`` is None when a file could not be loaded (same as load_image).
+    """
+    n_workers = max(1, n_workers)
+    window = n_workers * 2
+    with ThreadPoolExecutor(
+        max_workers=n_workers, thread_name_prefix="img-load"
+    ) as pool:
+        it = iter(paths)
+        pending: deque = deque()
+        for p in itertools.islice(it, window):
+            pending.append((str(p), pool.submit(load_image, str(p))))
+
+        while pending:
+            path_str, fut = pending.popleft()
+            img = fut.result()
+            nxt = next(it, None)
+            if nxt is not None:
+                pending.append((str(nxt), pool.submit(load_image, str(nxt))))
+            yield path_str, img
+
+
+def cmd_scan(photo_dir: str, workers: int = SCAN_LOADER_THREADS) -> None:
     log.info(f"Scanning photos in: {photo_dir}")
-    log.info(f"Incremental mode: {incremental}")
 
     conn = get_connection(DB_DSN)
     if not check_schema(conn):
@@ -340,31 +461,32 @@ def cmd_scan(photo_dir: str, incremental: bool) -> None:
     all_images = iter_images(photo_dir)
     log.info(f"Found {len(all_images):,} image(s) in directory tree.")
 
-    if incremental:
-        already_scanned = get_already_scanned_paths(conn)
-        images_to_scan = [p for p in all_images if str(p) not in already_scanned]
-        log.info(
-            f"{len(already_scanned):,} already scanned; {len(images_to_scan):,} new image(s) to process."
-        )
-    else:
-        images_to_scan = all_images
-        log.info("Full scan: processing all images.")
+    # Skip images that already have a photos row.
+    already_scanned = get_already_scanned_paths(conn)
+    images_to_scan = [p for p in all_images if str(p) not in already_scanned]
+    log.info(
+        f"{len(already_scanned):,} already scanned; {len(images_to_scan):,} new image(s) to process."
+    )
 
     if not images_to_scan:
         log.info("Nothing to scan.")
         conn.close()
         return
 
+    # Load the model before the loop so its startup cost isn't attributed to the
+    # first image and the decode threads have detection to overlap with.
+    get_face_app()
+    log.info(f"Decoding images with {max(1, workers)} loader thread(s).")
+
     total_faces = 0
     errors = 0
     batch_count = 0
 
-    with tqdm(images_to_scan, unit="img", desc="Scanning") as pbar:
-        for img_path in pbar:
-            path_str = str(img_path)
+    with tqdm(total=len(images_to_scan), unit="img", desc="Scanning") as pbar:
+        for path_str, img in _iter_prefetched_images(images_to_scan, workers):
+            pbar.update(1)
             pbar.set_postfix(faces=total_faces, errors=errors)
 
-            img = load_image(path_str)
             if img is None:
                 photo_id = upsert_photo(conn, path_str, error="Failed to load image")
                 errors += 1
@@ -374,14 +496,27 @@ def cmd_scan(photo_dir: str, incremental: bool) -> None:
                 photo_id = upsert_photo(conn, path_str)
 
                 for face in faces:
+                    face_id = str(uuid.uuid7())
+                    bbox = face["bbox"]
+                    # Extract the crop for the UI and score its sharpness while
+                    # the source image is already in memory.  Only compute blur
+                    # when the crop isn't already cached on disk.
+                    crop_path = face_crop_path(path_str, face_id)
+                    if crop_path.exists():
+                        blur = None
+                    else:
+                        blur = blur_score_for_crop(img, bbox)
+                        write_face_crop(img, bbox, crop_path)
                     insert_face(
                         conn,
                         photo_id,
-                        face["bbox"],
+                        face_id,
+                        bbox,
                         face["embedding"],
                         face["det_score"],
                         face["face_w"],
                         face["face_h"],
+                        blur_score=blur,
                     )
                     total_faces += 1
 
@@ -794,6 +929,131 @@ def cmd_stats() -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# DETECT-BLUR command
+# ---------------------------------------------------------------------------
+
+
+def cmd_detect_blur(overwrite: bool = False, workers: int = SCAN_LOADER_THREADS) -> None:
+    """
+    Backfill the UI face-crop cache and blur scores for already-scanned faces.
+
+    For every face this ensures both:
+      * a cached JPEG crop under image-cache/faces (written when missing), and
+      * a blur_score (Laplacian variance of the crop; higher = sharper).
+
+    Faces are grouped by source photo so each image file is loaded only once,
+    and a photo is only opened when at least one of its faces still needs work.
+    Images are decoded in background threads to overlap I/O with scoring.
+    Re-run with --overwrite to re-write every crop and re-score every face.
+    """
+    log.info("Running detect-blur%s…", " (overwrite)" if overwrite else "")
+    conn = get_connection(DB_DSN)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT fd.id, ph.file_path, fd.bounding_box, fd.blur_score
+            FROM face_detections fd
+            JOIN photos ph ON ph.id = fd.photo_id
+            ORDER BY ph.file_path
+            """
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        log.info("No faces found — nothing to do.")
+        conn.close()
+        return
+
+    # Group by file path to load each image only once.
+    by_photo: dict[str, list] = defaultdict(list)
+    for row in rows:
+        by_photo[row["file_path"]].append(row)
+
+    # Decide what each face needs before touching any (slow) source file, so we
+    # only decode photos that actually have work to do.
+    photos_with_work: list[tuple[str, list]] = []
+    for file_path, faces in by_photo.items():
+        work = []
+        for face in faces:
+            crop_path = face_crop_path(file_path, face["id"])
+            need_blur = overwrite or face["blur_score"] is None
+            need_crop = overwrite or not crop_path.exists()
+            if need_blur or need_crop:
+                work.append((face, crop_path, need_blur, need_crop))
+        if work:
+            photos_with_work.append((file_path, work))
+
+    if not photos_with_work:
+        log.info("All faces already have crops and blur scores — nothing to do.")
+        conn.close()
+        return
+
+    log.info(
+        "%d photo(s) need work; decoding with %d loader thread(s).",
+        len(photos_with_work),
+        max(1, workers),
+    )
+    work_by_path = dict(photos_with_work)
+    paths = [fp for fp, _ in photos_with_work]
+
+    n_scored = 0
+    n_crops = 0
+    n_errors = 0
+    processed = 0
+
+    with conn.cursor() as cur:
+        for file_path, img in tqdm(
+            _iter_prefetched_images(paths, workers),
+            total=len(paths),
+            unit="photo",
+            desc="Backfilling",
+        ):
+            work = work_by_path[file_path]
+            if img is None:
+                log.warning(
+                    "Could not read %s — setting blur_score=0 for %d face(s).",
+                    file_path,
+                    len(work),
+                )
+                ids = [f["id"] for f, _, need_blur, _ in work if need_blur]
+                if ids:
+                    cur.execute(
+                        "UPDATE face_detections SET blur_score = 0 WHERE id = ANY(%s::uuid[])",
+                        (ids,),
+                    )
+                n_errors += len(work)
+                continue
+
+            for face, crop_path, need_blur, need_crop in work:
+                bbox = face["bounding_box"]
+                if isinstance(bbox, str):
+                    bbox = json.loads(bbox)
+                if need_blur:
+                    score = blur_score_for_crop(img, bbox)
+                    cur.execute(
+                        "UPDATE face_detections SET blur_score = %s WHERE id = %s",
+                        (score, face["id"]),
+                    )
+                    n_scored += 1
+                if need_crop and write_face_crop(img, bbox, crop_path):
+                    n_crops += 1
+
+            processed += 1
+            if processed % BATCH_COMMIT_SIZE == 0:
+                conn.commit()
+
+    conn.commit()
+    log.info(
+        "detect-blur complete. %d scored, %d crop(s) written, %d unreadable (blur set to 0).",
+        n_scored,
+        n_crops,
+        n_errors,
+    )
+    conn.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Face detection & recognition scanner for local photo libraries.",
@@ -803,16 +1063,21 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # scan
-    p_scan = sub.add_parser("scan", help="Detect faces in photos and store embeddings.")
+    p_scan = sub.add_parser(
+        "scan",
+        help="Detect faces in new photos and store embeddings (skips already-scanned).",
+    )
     p_scan.add_argument(
         "--photo-dir",
         required=True,
         help="Root directory of your photo library.",
     )
     p_scan.add_argument(
-        "--incremental",
-        action="store_true",
-        help="Skip photos that have already been scanned.",
+        "--workers",
+        type=int,
+        default=SCAN_LOADER_THREADS,
+        help=f"Background image-decode threads (default: {SCAN_LOADER_THREADS}). "
+             "Detection stays serial; this overlaps image I/O with inference.",
     )
 
     # cluster
@@ -851,19 +1116,38 @@ def main() -> None:
         help="Preview which clusters would be merged without making any changes.",
     )
 
+    # detect-blur
+    p_blur = sub.add_parser(
+        "detect-blur",
+        help="Backfill cached face crops and blur scores for already-scanned faces.",
+    )
+    p_blur.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Re-write every crop and re-score every face, even if already present.",
+    )
+    p_blur.add_argument(
+        "--workers",
+        type=int,
+        default=SCAN_LOADER_THREADS,
+        help=f"Background image-decode threads (default: {SCAN_LOADER_THREADS}).",
+    )
+
     # stats
     sub.add_parser("stats", help="Print database statistics.")
 
     args = parser.parse_args()
 
     if args.command == "scan":
-        cmd_scan(args.photo_dir, args.incremental)
+        cmd_scan(args.photo_dir, args.workers)
     elif args.command == "cluster":
         cmd_cluster()
     elif args.command == "suggest":
         cmd_suggest(args.threshold)
     elif args.command == "merge-clusters":
         cmd_merge_clusters(args.threshold, args.dry_run)
+    elif args.command == "detect-blur":
+        cmd_detect_blur(args.overwrite, args.workers)
     elif args.command == "stats":
         cmd_stats()
 
