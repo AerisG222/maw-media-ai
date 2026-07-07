@@ -44,9 +44,10 @@ PERSONS_PAGE_SIZE = 24
 # red-highlight threshold used when rendering individual face cells).
 BLUR_SCORE_THRESHOLD = 80
 
-QUERY_PARAM_PERSON = "person"
-QUERY_PARAM_UNKNOWN = "unknown"
-QUERY_PARAM_REVIEW = "review"
+# Which view is showing. Navigation stays within one websocket session (set
+# these and st.rerun()), so filter/page state in st.session_state persists.
+VIEW_KEY = "view"  # "persons" | "faces" | "unknown" | "review"
+VIEW_PERSON_KEY = "view_person_id"
 
 
 # --- Database Connection ---
@@ -902,9 +903,8 @@ def render_clickable_person_card(
     width: int = 160,
     height: int = 160,
     filename: str = "Image",
-):
-    """Render a single clickable card for a cluster/person."""
-    # Build Image HTML
+) -> bool:
+    """Render a cluster/person card. Returns True when its button is clicked."""
     if data_url:
         style = f"width:{width}px;height:{height}px;object-fit:contain;display:block;margin:auto;user-select:none;border-radius:8px;"
         img_html = (
@@ -918,48 +918,26 @@ def render_clickable_person_card(
             f'<span style="color:#999;font-size:12px;">No preview</span></div>'
         )
 
-    # Build Metadata HTML
-    name_html = f'<div style="margin-top:8px;margin-bottom:2px;font-size:0.95rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"><strong>{html.escape(name or "Unnamed")}</strong></div>'
-
     if top_score is not None:
         try:
             score_text = f"{float(top_score):.2f}"
         except (ValueError, TypeError):
             score_text = str(top_score)
-        meta_html = f'<span style="font-size:0.8rem;opacity:0.8;">Faces: {face_count} | Top: {score_text}</span>'
+        meta = f"Faces: {face_count} | Top: {score_text}"
     else:
-        meta_html = (
-            f'<span style="font-size:0.8rem;opacity:0.8;">Faces: {face_count}</span>'
-        )
+        meta = f"Faces: {face_count}"
 
-    card_html = f"""
-    <a href="?{QUERY_PARAM_PERSON}={html.escape(str(person_id))}" target="_self" style="text-decoration:none;color:inherit;display:block;">
-        <div style="
-            border: 1px solid var(--secondary-background-color);
-            border-radius: 8px;
-            padding: 12px;
-            background-color: var(--secondary-background-color);
-            transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s;
-            cursor: pointer;
-            text-align: center;
-            height: {height + 75}px;
-            box-sizing: border-box;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-        " onmouseover="this.style.transform='scale(1.02)';this.style.borderColor='var(--primary-color)';"
-           onmouseout="this.style.transform='scale(1)';this.style.borderColor='var(--secondary-background-color)';">
-            <div>
-                {img_html}
-            </div>
-            <div>
-                {name_html}
-                {meta_html}
-            </div>
-        </div>
-    </a>
-    """
-    st.markdown(card_html, unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="text-align:center;">{img_html}'
+        f'<div style="font-size:0.8rem;opacity:0.8;margin-top:6px;">{html.escape(meta)}</div>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    return st.button(
+        name or "Unnamed",
+        key=f"open_person_{person_id}",
+        use_container_width=True,
+    )
 
 
 def render_face_grid_cell_html(
@@ -1112,15 +1090,26 @@ def main():
     st.set_page_config(page_title="Face Clusters Viewer", layout="wide")
     st.title("Face Cluster Explorer")
 
-    person_id = st.query_params.get(QUERY_PARAM_PERSON)
-    show_unknown = st.query_params.get(QUERY_PARAM_UNKNOWN, "false") == "true"
-    show_review = st.query_params.get(QUERY_PARAM_REVIEW, "false") == "true"
+    # Streamlit drops widget-keyed state when the widget isn't rendered in a run
+    # (e.g. the persons-list filters while viewing a cluster). Re-assigning each
+    # value to itself keeps it alive so the filters survive navigating in and out.
+    for _k in (
+        "choose_search",
+        "choose_unnamed_only",
+        "choose_sim_sort",
+        "choose_hide_blurry",
+    ):
+        if _k in st.session_state:
+            st.session_state[_k] = st.session_state[_k]
 
-    if person_id:
+    view = st.session_state.get(VIEW_KEY, "persons")
+    person_id = st.session_state.get(VIEW_PERSON_KEY)
+
+    if view == "faces" and person_id:
         render_faces_step(person_id)
-    elif show_unknown:
+    elif view == "unknown":
         render_unknown_step()
-    elif show_review:
+    elif view == "review":
         render_review_step()
     else:
         render_persons_step()
@@ -1136,7 +1125,6 @@ def render_persons_step():
     with control_col1:
         search = st.text_input(
             "Search by name or id",
-            value=st.session_state.get("choose_search", ""),
             key="choose_search",
         )
 
@@ -1161,15 +1149,13 @@ def render_persons_step():
     suggestion_badge = f" ({n_suggestions:,})" if n_suggestions else ""
     link_col1, link_col2, link_col3 = st.columns([1, 2, 1])
     with link_col1:
-        st.markdown(
-            f'<a href="/?{QUERY_PARAM_UNKNOWN}=true">Unknown Faces</a>',
-            unsafe_allow_html=True,
-        )
+        if st.button("Unknown Faces", key="goto_unknown"):
+            navigate_to_unknown()
     with link_col2:
-        st.markdown(
-            f'<a href="/?{QUERY_PARAM_REVIEW}=true">Review Suggestions{html.escape(suggestion_badge)}</a>',
-            unsafe_allow_html=True,
-        )
+        if st.button(
+            f"Review Suggestions{suggestion_badge}", key="goto_review"
+        ):
+            navigate_to_review()
     with link_col3:
         if st.button("Clean up", key="cleanup_empty_persons"):
             try:
@@ -1193,17 +1179,18 @@ def render_persons_step():
     sim_cache_key = f"{search or ''}:{unnamed_only}:{hide_blurry}"
 
     if sim_sort:
-        if (
-            st.session_state.get("sim_order_key") != sim_cache_key
-            or "sim_order" not in st.session_state
-        ):
+        prev_key = st.session_state.get("sim_order_key")
+        if prev_key != sim_cache_key or "sim_order" not in st.session_state:
             with st.spinner("Computing similarity order…"):
                 persons_data = fetch_all_persons_embeddings(
                     search if search else None, unnamed_only, hide_blurry=hide_blurry
                 )
                 st.session_state["sim_order"] = _compute_similarity_order(persons_data)
+                # Reset to page 1 only when the user actually changed the filter,
+                # not on a fresh restore (prev_key is None) where the URL page stands.
+                if prev_key is not None and prev_key != sim_cache_key:
+                    st.session_state["choose_page"] = 1
                 st.session_state["sim_order_key"] = sim_cache_key
-                st.session_state["choose_page"] = 1
 
         ordered_ids = st.session_state["sim_order"]
         total = len(ordered_ids)
@@ -1285,7 +1272,7 @@ def render_persons_step():
                 if sample_path:
                     data_url = face_thumb_url(sample_path, sample_face_id, sample_bbox)
 
-                render_clickable_person_card(
+                if render_clickable_person_card(
                     person_id=person_id,
                     data_url=data_url,
                     name=name,
@@ -1296,7 +1283,8 @@ def render_persons_step():
                     filename=os.path.basename(sample_path)
                     if sample_path
                     else "Unknown",
-                )
+                ):
+                    navigate_to_faces(str(person_id))
 
                 # Clear button — only for unnamed clusters. Two-step confirm so
                 # a misclick in the grid can't delete a cluster.
@@ -1365,11 +1353,19 @@ def render_persons_step():
 
 
 def navigate_to_persons():
-    dict = st.query_params.to_dict()
-    dict.pop(QUERY_PARAM_PERSON, None)
-    dict.pop(QUERY_PARAM_UNKNOWN, None)
-    dict.pop(QUERY_PARAM_REVIEW, None)
-    st.query_params.from_dict(dict)
+    st.session_state[VIEW_KEY] = "persons"
+    st.session_state[VIEW_PERSON_KEY] = None
+    st.rerun()
+
+
+def navigate_to_faces(person_id: str):
+    st.session_state[VIEW_KEY] = "faces"
+    st.session_state[VIEW_PERSON_KEY] = person_id
+    st.rerun()
+
+
+def navigate_to_unknown():
+    st.session_state[VIEW_KEY] = "unknown"
     st.rerun()
 
 
@@ -1903,11 +1899,8 @@ def render_unknown_step():
 
 
 def navigate_to_review():
-    d = st.query_params.to_dict()
-    d.pop(QUERY_PARAM_PERSON, None)
-    d.pop(QUERY_PARAM_UNKNOWN, None)
-    d[QUERY_PARAM_REVIEW] = "true"
-    st.query_params.from_dict(d)
+    st.session_state[VIEW_KEY] = "review"
+    st.session_state[VIEW_PERSON_KEY] = None
     st.rerun()
 
 
