@@ -903,8 +903,8 @@ def render_clickable_person_card(
     width: int = 160,
     height: int = 160,
     filename: str = "Image",
-) -> bool:
-    """Render a cluster/person card. Returns True when its button is clicked."""
+) -> None:
+    """Render a cluster/person card's image and metadata (no action button)."""
     if data_url:
         style = f"width:{width}px;height:{height}px;object-fit:contain;display:block;margin:auto;user-select:none;border-radius:8px;"
         img_html = (
@@ -932,11 +932,6 @@ def render_clickable_person_card(
         f'<div style="font-size:0.8rem;opacity:0.8;margin-top:6px;">{html.escape(meta)}</div>'
         f"</div>",
         unsafe_allow_html=True,
-    )
-    return st.button(
-        name or "Unnamed",
-        key=f"open_person_{person_id}",
-        use_container_width=True,
     )
 
 
@@ -1272,7 +1267,7 @@ def render_persons_step():
                 if sample_path:
                     data_url = face_thumb_url(sample_path, sample_face_id, sample_bbox)
 
-                if render_clickable_person_card(
+                render_clickable_person_card(
                     person_id=person_id,
                     data_url=data_url,
                     name=name,
@@ -1283,30 +1278,31 @@ def render_persons_step():
                     filename=os.path.basename(sample_path)
                     if sample_path
                     else "Unknown",
-                ):
-                    navigate_to_faces(str(person_id))
+                )
 
-                # Clear button — only for unnamed clusters. Two-step confirm so
-                # a misclick in the grid can't delete a cluster.
-                if not name:
+                # Named clusters get a single full-width name button. Unnamed
+                # clusters share the row with a trash button (two-step confirm so
+                # a misclick can't delete a cluster).
+                if name:
+                    if st.button(
+                        name,
+                        key=f"open_person_{person_id}",
+                        use_container_width=True,
+                    ):
+                        navigate_to_faces(str(person_id))
+                else:
                     confirm_key = f"confirm_clear_list_{person_id}"
                     st.session_state.setdefault(confirm_key, False)
-                    if not st.session_state[confirm_key]:
-                        if st.button(
-                            "Clear",
-                            key=f"clear_list_{person_id}",
-                            use_container_width=True,
-                        ):
-                            st.session_state[confirm_key] = True
-                            st.rerun()
-                    else:
+                    if st.session_state[confirm_key]:
+                        # Confirm state replaces the row with ✓ / ✗.
                         yes_col, no_col = st.columns(2)
                         with yes_col:
                             if st.button(
-                                "✓ Delete",
+                                "✓",
                                 key=f"clear_list_yes_{person_id}",
-                                use_container_width=True,
                                 type="primary",
+                                use_container_width=True,
+                                help="Confirm delete",
                             ):
                                 try:
                                     clear_cluster(str(person_id))
@@ -1320,11 +1316,30 @@ def render_persons_step():
                                     st.error(f"Failed to clear: {e}")
                         with no_col:
                             if st.button(
-                                "✗ Cancel",
+                                "✗",
                                 key=f"clear_list_no_{person_id}",
                                 use_container_width=True,
+                                help="Cancel",
                             ):
                                 st.session_state[confirm_key] = False
+                                st.rerun()
+                    else:
+                        name_col, trash_col = st.columns([4, 1])
+                        with name_col:
+                            if st.button(
+                                "Unnamed",
+                                key=f"open_person_{person_id}",
+                                use_container_width=True,
+                            ):
+                                navigate_to_faces(str(person_id))
+                        with trash_col:
+                            if st.button(
+                                "🗑️",
+                                key=f"clear_list_{person_id}",
+                                use_container_width=True,
+                                help="Clear this cluster",
+                            ):
+                                st.session_state[confirm_key] = True
                                 st.rerun()
 
     current_page = st.session_state["choose_page"]
