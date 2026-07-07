@@ -380,7 +380,11 @@ def fetch_faces_for_person(
 
     Each row: (id, file_path, bounding_box, detection_score, blur_score)
     """
-    blur_filter = "AND (fd.blur_score IS NULL OR fd.blur_score >= %s)" if min_blur_score is not None else ""
+    blur_filter = (
+        "AND (fd.blur_score IS NULL OR fd.blur_score >= %s)"
+        if min_blur_score is not None
+        else ""
+    )
     params = [person_id]
     if min_blur_score is not None:
         params.append(min_blur_score)
@@ -422,7 +426,11 @@ def fetch_faces_for_unknown(
 
     Each row: (id, file_path, bounding_box, detection_score, blur_score)
     """
-    blur_filter = "AND (fd.blur_score IS NULL OR fd.blur_score >= %s)" if min_blur_score is not None else ""
+    blur_filter = (
+        "AND (fd.blur_score IS NULL OR fd.blur_score >= %s)"
+        if min_blur_score is not None
+        else ""
+    )
     params = []
     if min_blur_score is not None:
         params.append(min_blur_score)
@@ -451,7 +459,11 @@ def fetch_faces_for_unknown_by_similarity(
 
     Each row: (id, file_path, bounding_box, detection_score, blur_score)
     """
-    blur_filter = "AND (fd.blur_score IS NULL OR fd.blur_score >= %s)" if min_blur_score is not None else ""
+    blur_filter = (
+        "AND (fd.blur_score IS NULL OR fd.blur_score >= %s)"
+        if min_blur_score is not None
+        else ""
+    )
     params = []
     if min_blur_score is not None:
         params.append(min_blur_score)
@@ -822,9 +834,7 @@ def _crop_str(file_path: str | None, face_id) -> str | None:
     return str(face_cache.face_crop_path(file_path, str(face_id)))
 
 
-def face_thumb_url(
-    file_path: str, face_id, bbox: dict | None = None
-) -> str | None:
+def face_thumb_url(file_path: str, face_id, bbox: dict | None = None) -> str | None:
     """Data URL for a face, preferring its pre-extracted crop when present."""
     return get_image_data_url_cached(
         file_path, bbox, crop_path=_crop_str(file_path, face_id)
@@ -896,7 +906,7 @@ def render_clickable_person_card(
     """Render a single clickable card for a cluster/person."""
     # Build Image HTML
     if data_url:
-        style = f"width:{width}px;height:{height}px;object-fit:cover;display:block;margin:auto;user-select:none;border-radius:8px;"
+        style = f"width:{width}px;height:{height}px;object-fit:contain;display:block;margin:auto;user-select:none;border-radius:8px;"
         img_html = (
             f'<img src="{data_url}" alt="{html.escape(filename)}" width="{width}" height="{height}" '
             f'style="{style}" draggable="false" />'
@@ -964,7 +974,7 @@ def render_face_grid_cell_html(
     if data_url:
         img_html = (
             f'<img src="{data_url}" alt="{html.escape(filename)}" width="{width}" height="{height}" '
-            f'style="width:{width}px;height:{height}px;object-fit:cover;'
+            f'style="width:{width}px;height:{height}px;object-fit:contain;'
             f'display:block;margin:auto;pointer-events:none;border-radius:8px" loading="lazy" />'
         )
     else:
@@ -983,7 +993,9 @@ def render_face_grid_cell_html(
     if blur_score is not None:
         try:
             color = "#c00" if float(blur_score) < 80 else "#666"
-            parts.append(f'<span style="color:{color}">Blur: {float(blur_score):.0f}</span>')
+            parts.append(
+                f'<span style="color:{color}">Blur: {float(blur_score):.0f}</span>'
+            )
         except (ValueError, TypeError):
             pass
     info_html = " · ".join(parts)
@@ -1117,8 +1129,8 @@ def main():
 
 
 def render_persons_step():
-    control_col1, control_col3, control_col_sim, control_col_blur, control_col4 = st.columns(
-        [3, 1, 1, 1, 3]
+    control_col1, control_col3, control_col_sim, control_col_blur, control_col4 = (
+        st.columns([3, 1, 1, 1, 3])
     )
 
     with control_col1:
@@ -1286,11 +1298,53 @@ def render_persons_step():
                     else "Unknown",
                 )
 
+                # Clear button — only for unnamed clusters. Two-step confirm so
+                # a misclick in the grid can't delete a cluster.
+                if not name:
+                    confirm_key = f"confirm_clear_list_{person_id}"
+                    st.session_state.setdefault(confirm_key, False)
+                    if not st.session_state[confirm_key]:
+                        if st.button(
+                            "Clear",
+                            key=f"clear_list_{person_id}",
+                            use_container_width=True,
+                        ):
+                            st.session_state[confirm_key] = True
+                            st.rerun()
+                    else:
+                        yes_col, no_col = st.columns(2)
+                        with yes_col:
+                            if st.button(
+                                "✓ Delete",
+                                key=f"clear_list_yes_{person_id}",
+                                use_container_width=True,
+                                type="primary",
+                            ):
+                                try:
+                                    clear_cluster(str(person_id))
+                                    st.session_state.pop(confirm_key, None)
+                                    # A cluster was removed — invalidate the
+                                    # cached similarity order so it recomputes.
+                                    st.session_state.pop("sim_order", None)
+                                    st.session_state.pop("sim_order_key", None)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Failed to clear: {e}")
+                        with no_col:
+                            if st.button(
+                                "✗ Cancel",
+                                key=f"clear_list_no_{person_id}",
+                                use_container_width=True,
+                            ):
+                                st.session_state[confirm_key] = False
+                                st.rerun()
+
     current_page = st.session_state["choose_page"]
     if current_page < page_count:
         if sim_sort:
             next_ids = ordered_ids[
-                current_page * PERSONS_PAGE_SIZE : (current_page + 1) * PERSONS_PAGE_SIZE
+                current_page * PERSONS_PAGE_SIZE : (current_page + 1)
+                * PERSONS_PAGE_SIZE
             ]
             next_persons = fetch_persons_by_ids(next_ids)
         else:
@@ -1302,7 +1356,11 @@ def render_persons_step():
                 hide_blurry=hide_blurry,
             )
         _prefetch_next_page(
-            [(row[4], row[6], _crop_str(row[4], row[7])) for row in next_persons if row[4]]
+            [
+                (row[4], row[6], _crop_str(row[4], row[7]))
+                for row in next_persons
+                if row[4]
+            ]
         )
 
 
@@ -1360,7 +1418,9 @@ def render_faces_step(person_id: str):
             st.warning("Remove all faces and delete this cluster?")
             yes_col, no_col = st.columns(2)
             with yes_col:
-                if st.button("Yes, delete", key=f"clear_cluster_yes_{person_id}", type="primary"):
+                if st.button(
+                    "Yes, delete", key=f"clear_cluster_yes_{person_id}", type="primary"
+                ):
                     try:
                         clear_cluster(person_id)
                         navigate_to_persons()
@@ -1483,7 +1543,9 @@ def render_faces_step(person_id: str):
     # Fetch faces
     page = st.session_state[view_page_key]
     offset = (page - 1) * FACES_PAGE_SIZE
-    faces = fetch_faces_for_person(person_id, limit=FACES_PAGE_SIZE, offset=offset, min_blur_score=active_blur)
+    faces = fetch_faces_for_person(
+        person_id, limit=FACES_PAGE_SIZE, offset=offset, min_blur_score=active_blur
+    )
 
     # Summary + remove action row
     start_idx = offset + 1 if total_faces > 0 else 0
@@ -1515,9 +1577,13 @@ def render_faces_step(person_id: str):
         for row_start in range(0, len(faces), GRID_COLS):
             row_faces = faces[row_start : row_start + GRID_COLS]
             cols = st.columns(GRID_COLS)
-            for col_idx, (face_id, file_path, bounding_box, score, blur_score) in enumerate(
-                row_faces
-            ):
+            for col_idx, (
+                face_id,
+                file_path,
+                bounding_box,
+                score,
+                blur_score,
+            ) in enumerate(row_faces):
                 with cols[col_idx]:
                     data_url = face_thumb_url(file_path, face_id, bounding_box)
                     st.markdown(
@@ -1558,7 +1624,9 @@ def render_faces_step(person_id: str):
 
     if page < total_pages:
         next_faces = fetch_faces_for_person(
-            person_id, limit=FACES_PAGE_SIZE, offset=page * FACES_PAGE_SIZE,
+            person_id,
+            limit=FACES_PAGE_SIZE,
+            offset=page * FACES_PAGE_SIZE,
             min_blur_score=active_blur,
         )
         _prefetch_next_page([(f[1], f[2], _crop_str(f[1], f[0])) for f in next_faces])
@@ -1682,12 +1750,15 @@ def render_unknown_step():
 
     if sort_by_similarity and target_person:
         faces = fetch_faces_for_unknown_by_similarity(
-            str(target_person[0]), limit=FACES_PAGE_SIZE, offset=offset,
+            str(target_person[0]),
+            limit=FACES_PAGE_SIZE,
+            offset=offset,
             min_blur_score=active_blur_unknown,
         )
     else:
-        faces = fetch_faces_for_unknown(limit=FACES_PAGE_SIZE, offset=offset,
-                                        min_blur_score=active_blur_unknown)
+        faces = fetch_faces_for_unknown(
+            limit=FACES_PAGE_SIZE, offset=offset, min_blur_score=active_blur_unknown
+        )
 
     start_idx = offset + 1 if total_faces > 0 else 0
     end_idx = offset + len(faces)
@@ -1738,9 +1809,13 @@ def render_unknown_step():
         for row_start in range(0, len(faces), GRID_COLS):
             row_faces = faces[row_start : row_start + GRID_COLS]
             cols = st.columns(GRID_COLS)
-            for col_idx, (face_id, file_path, bounding_box, score, blur_score) in enumerate(
-                row_faces
-            ):
+            for col_idx, (
+                face_id,
+                file_path,
+                bounding_box,
+                score,
+                blur_score,
+            ) in enumerate(row_faces):
                 face_id_str = str(face_id)
                 with cols[col_idx]:
                     data_url = face_thumb_url(file_path, face_id, bounding_box)
@@ -1813,12 +1888,15 @@ def render_unknown_step():
         next_offset = page * FACES_PAGE_SIZE
         if sort_by_similarity and target_person:
             next_faces = fetch_faces_for_unknown_by_similarity(
-                str(target_person[0]), limit=FACES_PAGE_SIZE, offset=next_offset,
+                str(target_person[0]),
+                limit=FACES_PAGE_SIZE,
+                offset=next_offset,
                 min_blur_score=active_blur_unknown,
             )
         else:
             next_faces = fetch_faces_for_unknown(
-                limit=FACES_PAGE_SIZE, offset=next_offset,
+                limit=FACES_PAGE_SIZE,
+                offset=next_offset,
                 min_blur_score=active_blur_unknown,
             )
         _prefetch_next_page([(f[1], f[2], _crop_str(f[1], f[0])) for f in next_faces])
@@ -1841,7 +1919,7 @@ def render_review_face_cell(
         img_html = (
             f'<img src="{data_url}" alt="face" width="{CELL_WIDTH}" height="{IMAGE_HEIGHT}" '
             f'style="width:{CELL_WIDTH}px;height:{IMAGE_HEIGHT}px;'
-            f'object-fit:cover;display:block;margin:auto;border-radius:8px" loading="lazy" />'
+            f'object-fit:contain;display:block;margin:auto;border-radius:8px" loading="lazy" />'
         )
     else:
         img_html = (
@@ -2061,7 +2139,9 @@ def render_review_step():
             offset=page * FACES_PAGE_SIZE,
             person_id=active_person_id,
         )
-        _prefetch_next_page([(r[1], r[2], _crop_str(r[1], r[0])) for r in next_suggestions])
+        _prefetch_next_page(
+            [(r[1], r[2], _crop_str(r[1], r[0])) for r in next_suggestions]
+        )
 
 
 if __name__ == "__main__":
