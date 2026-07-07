@@ -1384,6 +1384,16 @@ def navigate_to_unknown():
     st.rerun()
 
 
+@st.dialog("Original photo", width="large")
+def _show_original_photo(file_path: str):
+    """Modal showing the full original image so a face can be seen in context."""
+    st.caption(file_path)
+    if os.path.exists(file_path):
+        st.image(file_path, use_container_width=True)
+    else:
+        st.error("Original file not found.")
+
+
 def render_faces_step(person_id: str):
     if not person_id:
         st.error("No person selected; returning to list.")
@@ -1583,55 +1593,45 @@ def render_faces_step(person_id: str):
                     except Exception as e:
                         st.error(f"Failed to remove faces: {e}")
 
-    # Render face grid
-    if in_select_mode:
-        for row_start in range(0, len(faces), GRID_COLS):
-            row_faces = faces[row_start : row_start + GRID_COLS]
-            cols = st.columns(GRID_COLS)
-            for col_idx, (
-                face_id,
-                file_path,
-                bounding_box,
-                score,
-                blur_score,
-            ) in enumerate(row_faces):
-                with cols[col_idx]:
-                    data_url = face_thumb_url(file_path, face_id, bounding_box)
-                    st.markdown(
-                        render_face_grid_cell_html(
-                            data_url,
-                            width=CELL_WIDTH,
-                            height=IMAGE_HEIGHT,
-                            filename=os.path.basename(file_path),
-                            score=score,
-                            file_path=file_path,
-                            blur_score=blur_score,
-                        ),
-                        unsafe_allow_html=True,
-                    )
+    # Render face grid — one column per face so each can carry a "view original"
+    # button (and, in select mode, a selection checkbox).
+    for row_start in range(0, len(faces), GRID_COLS):
+        row_faces = faces[row_start : row_start + GRID_COLS]
+        cols = st.columns(GRID_COLS)
+        for col_idx, (
+            face_id,
+            file_path,
+            bounding_box,
+            score,
+            blur_score,
+        ) in enumerate(row_faces):
+            with cols[col_idx]:
+                data_url = face_thumb_url(file_path, face_id, bounding_box)
+                st.markdown(
+                    render_face_grid_cell_html(
+                        data_url,
+                        width=CELL_WIDTH,
+                        height=IMAGE_HEIGHT,
+                        filename=os.path.basename(file_path),
+                        score=score,
+                        file_path=file_path,
+                        blur_score=blur_score,
+                    ),
+                    unsafe_allow_html=True,
+                )
+                if st.button(
+                    "🔍",
+                    key=f"view_orig_{person_id}_{face_id}",
+                    help="Open the original photo to see this face in context",
+                    use_container_width=True,
+                ):
+                    _show_original_photo(file_path)
+                if in_select_mode:
                     st.checkbox(
                         "Select",
                         key=_face_selection_key(person_id, face_id),
                         label_visibility="collapsed",
                     )
-    else:
-        cells_html = []
-        for face_id, file_path, bounding_box, score, blur_score in faces:
-            data_url = face_thumb_url(file_path, face_id, bounding_box)
-            cell_html = render_face_grid_cell_html(
-                data_url,
-                width=CELL_WIDTH,
-                height=IMAGE_HEIGHT,
-                filename=os.path.basename(file_path),
-                score=score,
-                file_path=file_path,
-                blur_score=blur_score,
-            )
-            cells_html.append(cell_html)
-
-        flex_style = "display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;justify-content:flex-start;"
-        container_html = f"<div style='{flex_style}'>{''.join(cells_html)}</div>"
-        st.markdown(container_html, unsafe_allow_html=True)
 
     if page < total_pages:
         next_faces = fetch_faces_for_person(
