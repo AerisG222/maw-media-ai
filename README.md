@@ -90,33 +90,72 @@ Or edit the `DB_DSN` default at the top of `scan-faces.py`.
 
 ## Usage
 
-### Full scan (first time)
+The scanner is a single CLI with subcommands. Run any command with `-h` for
+its full options. A typical pipeline is:
 
-Detects faces in every photo and stores embeddings. No clustering yet.
+```
+scan → cluster → detect-blur → (label some clusters in the UI) → suggest → merge-clusters
+```
+
+### Scan for faces
+
+Detects faces in the photo library and stores embeddings. Photos already in
+the database are skipped automatically, so this is safe to re-run as new
+photos arrive — no separate "incremental" flag is needed.
 
 ```bash
 python scan-faces.py scan --photo-dir /path/to/photos
 ```
 
+Image decoding is overlapped with inference on background threads. Tune with
+`--workers N` (detection itself stays serial).
+
 ### Cluster into persons
 
 Groups all stored embeddings into person clusters using HDBSCAN.
-Run this after a full scan, or after adding many new photos.
+Run this after a scan, or after adding many new photos.
 
 ```bash
 python scan-faces.py cluster
 ```
 
-### Incremental scan (ongoing)
+### Detect blur
 
-Skips photos already in the database; processes only new arrivals.
+Computes a blur score (Laplacian variance of the face crop; higher = sharper)
+for each face and caches a display-sized crop on disk for the web UI. Only
+faces missing a score/crop are processed unless `--overwrite` is given.
 
 ```bash
-python scan-faces.py scan --photo-dir /path/to/photos --incremental
+python scan-faces.py detect-blur
+python scan-faces.py detect-blur --overwrite   # re-score and re-crop everything
 ```
 
-After adding a batch of new photos, re-run clustering so the new faces
-get folded into existing persons (or new ones are created).
+The web UI can then filter out blurry faces so you spend labelling effort on
+the clearest ones. Accepts `--workers N` like `scan`.
+
+### Suggest assignments
+
+After you've labelled some clusters (given them names), this finds unassigned
+faces — and faces still sitting in unnamed clusters — whose nearest named
+person is within a cosine-distance threshold, and records a suggestion for
+each. Review and confirm them in the web UI's "Review Suggestions" view.
+
+```bash
+python scan-faces.py suggest
+python scan-faces.py suggest --threshold 0.30   # lower = more conservative
+```
+
+### Merge clusters
+
+Merges unnamed clusters into the nearest named person when their centroids are
+close (tighter default threshold than `suggest`, since a whole cluster moves at
+once). Preview first with `--dry-run`.
+
+```bash
+python scan-faces.py merge-clusters --dry-run
+python scan-faces.py merge-clusters
+python scan-faces.py merge-clusters --threshold 0.20
+```
 
 ### Check stats
 
@@ -129,27 +168,38 @@ python scan-faces.py stats
 ## Labelling persons
 
 After clustering, each person has a row in the `persons` table with
-`name = NULL`. You need to label them once. Options:
+`name = NULL`. You label them once, then let `suggest` / `merge-clusters`
+fold the remaining unassigned faces into the named people.
 
-**Option A — SQL directly:**
+**Recommended — the Streamlit web UI** (see below). It shows a grid of face
+thumbnails per cluster, lets you name clusters, assign uncategorised faces
+(sorted by similarity to a chosen person), merge similar clusters, review
+suggestions, and hide blurry faces. This is by far the most efficient
+workflow for large libraries.
+
+**Or SQL directly** (person `id` is a UUID):
 ```sql
--- Find a cluster and see sample faces
+-- Find the biggest unnamed clusters
 SELECT per.id, per.face_count, per.cluster_label
-FROM persons per ORDER BY face_count DESC;
+FROM persons per WHERE per.name IS NULL ORDER BY face_count DESC;
 
 -- Name a person
-UPDATE persons SET name = 'Jane Smith' WHERE id = 42;
+UPDATE persons SET name = 'Jane Smith'
+WHERE id = '00000000-0000-0000-0000-000000000000';
 ```
 
-**Option B — Build a simple Razor admin page** that shows a grid of face
-thumbnails per cluster (crop using the `bounding_box` coordinates) and
-lets you type a name. This is the most efficient workflow for large libraries.
+Once some clusters are named, run `suggest` and/or `merge-clusters` (above) to
+propagate those labels to the rest of the faces.
 
 ---
 
 ## Viewing Clusters and Faces (Web UI)
 
-A simple web interface is provided to browse detected persons/clusters and their associated faces.
+A Streamlit web interface is provided to browse persons/clusters and their
+faces, and to drive the whole labelling workflow: naming clusters, assigning
+uncategorised faces (optionally sorted by similarity to a target person),
+merging similar clusters, reviewing `suggest` results, clearing unwanted
+clusters, and filtering out blurry faces.
 
 ### 1. Install Streamlit (if not already done)
 
@@ -164,10 +214,13 @@ Make sure your `FACE_SCANNER_DSN` environment variable is set, as described abov
 ### 3. Run the viewer
 
 ```bash
-streamlit run view_clusters_app.py
+streamlit run view-clusters-app.py
 ```
 
 Then open the provided URL in your browser (usually http://localhost:8501).
+
+> Tip: run `detect-blur` first so the UI has cached face crops (faster
+> thumbnails) and blur scores available for filtering.
 
 ---
 
