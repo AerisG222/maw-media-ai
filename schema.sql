@@ -118,8 +118,11 @@ GROUP BY p.id, p.file_path, p.file_name;
 ALTER TABLE face_detections
     ADD COLUMN IF NOT EXISTS suggested_person_id  UUID    REFERENCES persons(id) ON DELETE SET NULL,
     ADD COLUMN IF NOT EXISTS suggestion_score     FLOAT,
-    ADD COLUMN IF NOT EXISTS blur_score           FLOAT,
     ADD COLUMN IF NOT EXISTS is_validated         BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Blur scoring was removed; drop the column if an earlier schema created it.
+ALTER TABLE face_detections
+    DROP COLUMN IF EXISTS blur_score;
 
 
 -- ---------------------------------------------------------------------------

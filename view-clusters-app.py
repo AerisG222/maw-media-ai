@@ -40,10 +40,6 @@ IMAGE_HEIGHT = CELL_HEIGHT - CAPTION_HEIGHT
 FACES_PAGE_SIZE = 24
 PERSONS_PAGE_SIZE = 24
 
-# Faces with a blur_score below this are considered blurry (matches the
-# red-highlight threshold used when rendering individual face cells).
-BLUR_SCORE_THRESHOLD = 80
-
 # Which view is showing. Navigation stays within one websocket session (set
 # these and st.rerun()), so filter/page state in st.session_state persists.
 VIEW_KEY = "view"  # "persons" | "faces" | "unknown" | "review"
@@ -178,32 +174,13 @@ def merge_persons_into(target_id: str, source_ids: list[str]):
 
 
 # --- Data Fetching ---
-def _not_primarily_blurry_clause(alias: str = "p") -> str:
-    """SQL boolean fragment: TRUE unless a majority of the person's faces are blurry.
-
-    Faces with a NULL blur_score (not yet scored) are not counted as blurry, so
-    unscored clusters are always kept.  `alias` is the persons-table alias used
-    by the surrounding query.
-    """
-    return f"""(
-        SELECT COUNT(*) FILTER (
-                   WHERE fd.blur_score IS NOT NULL
-                     AND fd.blur_score < {BLUR_SCORE_THRESHOLD}
-               ) <= COUNT(*) / 2.0
-        FROM face_detections fd
-        WHERE fd.person_id = {alias}.id
-    )"""
-
-
 def fetch_persons_count(
     search: str | None = None,
     unnamed_only: bool = False,
-    hide_blurry: bool = False,
 ) -> int:
     like = f"%{search}%" if search else None
-    blur_cond = f"AND {_not_primarily_blurry_clause('persons')}" if hide_blurry else ""
     result = execute_single(
-        f"SELECT COUNT(1) FROM persons WHERE (%s IS NULL OR name ILIKE %s OR id::text ILIKE %s) AND (NOT %s OR name IS NULL) {blur_cond}",
+        "SELECT COUNT(1) FROM persons WHERE (%s IS NULL OR name ILIKE %s OR id::text ILIKE %s) AND (NOT %s OR name IS NULL)",
         (search, like, like, unnamed_only),
     )
     return result[0] if result else 0
@@ -214,16 +191,14 @@ def fetch_persons_page(
     limit: int = PERSONS_PAGE_SIZE,
     offset: int = 0,
     unnamed_only: bool = False,
-    hide_blurry: bool = False,
 ) -> list:
     """Return a page of persons with one sample face for preview.
 
     Each row: (id, name, cluster_label, face_count, sample_path, sample_score, sample_bbox, sample_face_id)
     """
     like = f"%{search}%" if search else None
-    blur_cond = f"AND {_not_primarily_blurry_clause('p')}" if hide_blurry else ""
     return execute_query(
-        f"""
+        """
         SELECT p.id, p.name, p.cluster_label, p.face_count,
                ph.file_path AS sample_path, fd.detection_score AS sample_score,
                fd.bounding_box AS sample_bbox, fd.id AS sample_face_id
@@ -238,7 +213,6 @@ def fetch_persons_page(
         LEFT JOIN photos ph ON ph.id = fd.photo_id
         WHERE (%s IS NULL OR p.name ILIKE %s OR p.id::text ILIKE %s)
           AND (NOT %s OR p.name IS NULL)
-          {blur_cond}
         ORDER BY p.face_count DESC NULLS LAST, p.id
         LIMIT %s OFFSET %s
         """,
@@ -249,21 +223,18 @@ def fetch_persons_page(
 def fetch_all_persons_embeddings(
     search: str | None = None,
     unnamed_only: bool = False,
-    hide_blurry: bool = False,
 ) -> list[tuple]:
     """Fetch all matching persons with centroids for similarity-order computation.
 
     Returns list of (id, face_count, embedding_floats | None), sorted by face_count desc.
     """
     like = f"%{search}%" if search else None
-    blur_cond = f"AND {_not_primarily_blurry_clause('p')}" if hide_blurry else ""
     rows = execute_query(
-        f"""
+        """
         SELECT p.id, p.face_count, p.representative_embedding::text
         FROM persons p
         WHERE (%s IS NULL OR p.name ILIKE %s OR p.id::text ILIKE %s)
           AND (NOT %s OR p.name IS NULL)
-          {blur_cond}
         ORDER BY p.face_count DESC NULLS LAST, p.id
         """,
         (search, like, like, unnamed_only),
@@ -354,20 +325,12 @@ def fetch_person(person_id: str) -> tuple | None:
     )
 
 
-def fetch_face_count_for_person(
-    person_id: str, min_blur_score: float | None = None
-) -> int:
+def fetch_face_count_for_person(person_id: str) -> int:
     """Return the number of faces for a person."""
-    if min_blur_score is not None:
-        result = execute_single(
-            "SELECT COUNT(*) FROM face_detections WHERE person_id = %s AND (blur_score IS NULL OR blur_score >= %s)",
-            (person_id, min_blur_score),
-        )
-    else:
-        result = execute_single(
-            "SELECT COUNT(*) FROM face_detections WHERE person_id = %s",
-            (person_id,),
-        )
+    result = execute_single(
+        "SELECT COUNT(*) FROM face_detections WHERE person_id = %s",
+        (person_id,),
+    )
     return result[0] if result else 0
 
 
@@ -375,78 +338,50 @@ def fetch_faces_for_person(
     person_id: str,
     limit: int = FACES_PAGE_SIZE,
     offset: int = 0,
-    min_blur_score: float | None = None,
 ) -> list:
     """Return a page of faces for a person, ordered by detection score.
 
-    Each row: (id, file_path, bounding_box, detection_score, blur_score)
+    Each row: (id, file_path, bounding_box, detection_score)
     """
-    blur_filter = (
-        "AND (fd.blur_score IS NULL OR fd.blur_score >= %s)"
-        if min_blur_score is not None
-        else ""
-    )
-    params = [person_id]
-    if min_blur_score is not None:
-        params.append(min_blur_score)
-    params += [limit, offset]
     return execute_query(
-        f"""
-        SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score, fd.blur_score
+        """
+        SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score
         FROM face_detections fd
         JOIN photos p ON fd.photo_id = p.id
         WHERE fd.person_id = %s
-          {blur_filter}
         ORDER BY fd.detection_score DESC NULLS LAST, fd.id
         LIMIT %s OFFSET %s
         """,
-        params,
+        (person_id, limit, offset),
     )
 
 
-def fetch_face_count_for_unknown(min_blur_score: float | None = None) -> int:
+def fetch_face_count_for_unknown() -> int:
     """Return the number of faces that are not associated with any person."""
-    if min_blur_score is not None:
-        result = execute_single(
-            "SELECT COUNT(*) FROM face_detections WHERE person_id IS NULL AND (blur_score IS NULL OR blur_score >= %s)",
-            (min_blur_score,),
-        )
-    else:
-        result = execute_single(
-            "SELECT COUNT(*) FROM face_detections WHERE person_id IS NULL",
-        )
+    result = execute_single(
+        "SELECT COUNT(*) FROM face_detections WHERE person_id IS NULL",
+    )
     return result[0] if result else 0
 
 
 def fetch_faces_for_unknown(
     limit: int = FACES_PAGE_SIZE,
     offset: int = 0,
-    min_blur_score: float | None = None,
 ) -> list:
     """Return a page of unassigned faces ordered by detection score.
 
-    Each row: (id, file_path, bounding_box, detection_score, blur_score)
+    Each row: (id, file_path, bounding_box, detection_score)
     """
-    blur_filter = (
-        "AND (fd.blur_score IS NULL OR fd.blur_score >= %s)"
-        if min_blur_score is not None
-        else ""
-    )
-    params = []
-    if min_blur_score is not None:
-        params.append(min_blur_score)
-    params += [limit, offset]
     return execute_query(
-        f"""
-        SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score, fd.blur_score
+        """
+        SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score
         FROM face_detections fd
         JOIN photos p ON fd.photo_id = p.id
         WHERE fd.person_id IS NULL
-          {blur_filter}
         ORDER BY fd.detection_score DESC NULLS LAST, fd.id
         LIMIT %s OFFSET %s
         """,
-        params,
+        (limit, offset),
     )
 
 
@@ -454,35 +389,24 @@ def fetch_faces_for_unknown_by_similarity(
     person_id: str,
     limit: int = FACES_PAGE_SIZE,
     offset: int = 0,
-    min_blur_score: float | None = None,
 ) -> list:
     """Return unassigned faces sorted by cosine similarity to a person's centroid.
 
-    Each row: (id, file_path, bounding_box, detection_score, blur_score)
+    Each row: (id, file_path, bounding_box, detection_score)
     """
-    blur_filter = (
-        "AND (fd.blur_score IS NULL OR fd.blur_score >= %s)"
-        if min_blur_score is not None
-        else ""
-    )
-    params = []
-    if min_blur_score is not None:
-        params.append(min_blur_score)
-    params += [person_id, limit, offset]
     return execute_query(
-        f"""
-        SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score, fd.blur_score
+        """
+        SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score
         FROM face_detections fd
         JOIN photos p ON fd.photo_id = p.id
         WHERE fd.person_id IS NULL
           AND fd.embedding IS NOT NULL
-          {blur_filter}
         ORDER BY fd.embedding <=> (
             SELECT representative_embedding FROM persons WHERE id = %s
         ) ASC
         LIMIT %s OFFSET %s
         """,
-        params,
+        (person_id, limit, offset),
     )
 
 
@@ -942,7 +866,6 @@ def render_face_grid_cell_html(
     filename: str,
     score: float | None,
     file_path: str | None = None,
-    blur_score: float | None = None,
 ) -> str:
     if data_url:
         img_html = (
@@ -963,14 +886,6 @@ def render_face_grid_cell_html(
             parts.append(f"Det: {float(score):.2f}")
         except (ValueError, TypeError):
             parts.append(f"Det: {html.escape(str(score))}")
-    if blur_score is not None:
-        try:
-            color = "#c00" if float(blur_score) < 80 else "#666"
-            parts.append(
-                f'<span style="color:{color}">Blur: {float(blur_score):.0f}</span>'
-            )
-        except (ValueError, TypeError):
-            pass
     info_html = " · ".join(parts)
 
     score_div = (
@@ -1092,7 +1007,6 @@ def main():
         "choose_search",
         "choose_unnamed_only",
         "choose_sim_sort",
-        "choose_hide_blurry",
     ):
         if _k in st.session_state:
             st.session_state[_k] = st.session_state[_k]
@@ -1113,8 +1027,8 @@ def main():
 
 
 def render_persons_step():
-    control_col1, control_col3, control_col_sim, control_col_blur, control_col4 = (
-        st.columns([3, 1, 1, 1, 3])
+    control_col1, control_col3, control_col_sim, control_col4 = st.columns(
+        [3, 1, 1, 3]
     )
 
     with control_col1:
@@ -1128,14 +1042,6 @@ def render_persons_step():
 
     with control_col_sim:
         st.checkbox("Sort by similarity", key="choose_sim_sort")
-
-    with control_col_blur:
-        st.checkbox(
-            "Hide blurry",
-            key="choose_hide_blurry",
-            help="Hide clusters where a majority of faces are blurry "
-            f"(blur score below {BLUR_SCORE_THRESHOLD}). Run detect-blur to populate scores.",
-        )
 
     with control_col4:
         first, prev10, prev, next, next10, last = render_pagination_controls_persons()
@@ -1167,18 +1073,17 @@ def render_persons_step():
 
     unnamed_only = st.session_state.get("choose_unnamed_only", False)
     sim_sort = st.session_state.get("choose_sim_sort", False)
-    hide_blurry = st.session_state.get("choose_hide_blurry", False)
 
     # Cache key uniquely identifies the current filter combination.
     # When it changes, the similarity order must be recomputed and the page reset.
-    sim_cache_key = f"{search or ''}:{unnamed_only}:{hide_blurry}"
+    sim_cache_key = f"{search or ''}:{unnamed_only}"
 
     if sim_sort:
         prev_key = st.session_state.get("sim_order_key")
         if prev_key != sim_cache_key or "sim_order" not in st.session_state:
             with st.spinner("Computing similarity order…"):
                 persons_data = fetch_all_persons_embeddings(
-                    search if search else None, unnamed_only, hide_blurry=hide_blurry
+                    search if search else None, unnamed_only
                 )
                 st.session_state["sim_order"] = _compute_similarity_order(persons_data)
                 # Reset to page 1 only when the user actually changed the filter,
@@ -1196,7 +1101,6 @@ def render_persons_step():
         total = fetch_persons_count(
             search if search else None,
             unnamed_only=unnamed_only,
-            hide_blurry=hide_blurry,
         )
 
     page_count = max(1, math.ceil(total / PERSONS_PAGE_SIZE))
@@ -1242,7 +1146,6 @@ def render_persons_step():
             limit=PERSONS_PAGE_SIZE,
             offset=offset,
             unnamed_only=unnamed_only,
-            hide_blurry=hide_blurry,
         )
 
     for row_start in range(0, len(persons), GRID_COLS):
@@ -1356,7 +1259,6 @@ def render_persons_step():
                 limit=PERSONS_PAGE_SIZE,
                 offset=current_page * PERSONS_PAGE_SIZE,
                 unnamed_only=unnamed_only,
-                hide_blurry=hide_blurry,
             )
         _prefetch_next_page(
             [
@@ -1521,22 +1423,7 @@ def render_faces_step(person_id: str):
     if view_page_key not in st.session_state:
         st.session_state[view_page_key] = 1
 
-    # Blur filter
-    blur_filter_key = f"blur_filter_{person_id}"
-    st.session_state.setdefault(blur_filter_key, 0)
-    blur_col, _ = st.columns([3, 7])
-    with blur_col:
-        min_blur = st.number_input(
-            "Min blur score (0 = show all)",
-            min_value=0,
-            max_value=1000,
-            step=10,
-            key=blur_filter_key,
-            help="Hide faces with a blur score below this value. Run detect-blur to populate scores.",
-        )
-    active_blur = int(min_blur) if min_blur > 0 else None
-
-    total_faces = fetch_face_count_for_person(person_id, min_blur_score=active_blur)
+    total_faces = fetch_face_count_for_person(person_id)
     total_pages = max(1, math.ceil(total_faces / FACES_PAGE_SIZE))
     st.session_state[view_page_key] = max(
         1, min(st.session_state[view_page_key], total_pages)
@@ -1565,7 +1452,7 @@ def render_faces_step(person_id: str):
     page = st.session_state[view_page_key]
     offset = (page - 1) * FACES_PAGE_SIZE
     faces = fetch_faces_for_person(
-        person_id, limit=FACES_PAGE_SIZE, offset=offset, min_blur_score=active_blur
+        person_id, limit=FACES_PAGE_SIZE, offset=offset
     )
 
     # Summary + remove action row
@@ -1603,7 +1490,6 @@ def render_faces_step(person_id: str):
             file_path,
             bounding_box,
             score,
-            blur_score,
         ) in enumerate(row_faces):
             with cols[col_idx]:
                 data_url = face_thumb_url(file_path, face_id, bounding_box)
@@ -1615,7 +1501,6 @@ def render_faces_step(person_id: str):
                         filename=os.path.basename(file_path),
                         score=score,
                         file_path=file_path,
-                        blur_score=blur_score,
                     ),
                     unsafe_allow_html=True,
                 )
@@ -1638,7 +1523,6 @@ def render_faces_step(person_id: str):
             person_id,
             limit=FACES_PAGE_SIZE,
             offset=page * FACES_PAGE_SIZE,
-            min_blur_score=active_blur,
         )
         _prefetch_next_page([(f[1], f[2], _crop_str(f[1], f[0])) for f in next_faces])
 
@@ -1715,24 +1599,11 @@ def render_unknown_step():
     else:
         st.warning("No named persons found. Label some clusters first.")
 
-    # Blur filter
-    blur_col, _ = st.columns([3, 7])
-    with blur_col:
-        min_blur_unknown = st.number_input(
-            "Min blur score (0 = show all)",
-            min_value=0,
-            max_value=1000,
-            step=10,
-            key="unknown_blur_filter",
-            help="Hide faces with a blur score below this value. Run detect-blur to populate scores.",
-        )
-    active_blur_unknown = int(min_blur_unknown) if min_blur_unknown > 0 else None
-
     # Pagination
     view_page_key = "view_page_unknown"
     st.session_state.setdefault(view_page_key, 1)
 
-    total_faces = fetch_face_count_for_unknown(min_blur_score=active_blur_unknown)
+    total_faces = fetch_face_count_for_unknown()
     total_pages = max(1, math.ceil(total_faces / FACES_PAGE_SIZE))
     st.session_state[view_page_key] = max(
         1, min(st.session_state[view_page_key], total_pages)
@@ -1764,11 +1635,10 @@ def render_unknown_step():
             str(target_person[0]),
             limit=FACES_PAGE_SIZE,
             offset=offset,
-            min_blur_score=active_blur_unknown,
         )
     else:
         faces = fetch_faces_for_unknown(
-            limit=FACES_PAGE_SIZE, offset=offset, min_blur_score=active_blur_unknown
+            limit=FACES_PAGE_SIZE, offset=offset
         )
 
     start_idx = offset + 1 if total_faces > 0 else 0
@@ -1825,7 +1695,6 @@ def render_unknown_step():
                 file_path,
                 bounding_box,
                 score,
-                blur_score,
             ) in enumerate(row_faces):
                 face_id_str = str(face_id)
                 with cols[col_idx]:
@@ -1838,7 +1707,6 @@ def render_unknown_step():
                             filename=os.path.basename(file_path),
                             score=score,
                             file_path=file_path,
-                            blur_score=blur_score,
                         ),
                         unsafe_allow_html=True,
                     )
@@ -1876,7 +1744,7 @@ def render_unknown_step():
                     )
     else:
         cells_html = []
-        for face_id, file_path, bounding_box, score, blur_score in faces:
+        for face_id, file_path, bounding_box, score in faces:
             data_url = face_thumb_url(file_path, face_id, bounding_box)
             cells_html.append(
                 render_face_grid_cell_html(
@@ -1886,7 +1754,6 @@ def render_unknown_step():
                     filename=os.path.basename(file_path),
                     score=score,
                     file_path=file_path,
-                    blur_score=blur_score,
                 )
             )
         flex_style = "display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;justify-content:flex-start;"
@@ -1902,13 +1769,11 @@ def render_unknown_step():
                 str(target_person[0]),
                 limit=FACES_PAGE_SIZE,
                 offset=next_offset,
-                min_blur_score=active_blur_unknown,
             )
         else:
             next_faces = fetch_faces_for_unknown(
                 limit=FACES_PAGE_SIZE,
                 offset=next_offset,
-                min_blur_score=active_blur_unknown,
             )
         _prefetch_next_page([(f[1], f[2], _crop_str(f[1], f[0])) for f in next_faces])
 

@@ -94,14 +94,15 @@ The scanner is a single CLI with subcommands. Run any command with `-h` for
 its full options. A typical pipeline is:
 
 ```
-scan → cluster → detect-blur → (label some clusters in the UI) → suggest → merge-clusters
+scan → cluster → (label some clusters in the UI) → suggest → merge-clusters
 ```
 
 ### Scan for faces
 
-Detects faces in the photo library and stores embeddings. Photos already in
-the database are skipped automatically, so this is safe to re-run as new
-photos arrive — no separate "incremental" flag is needed.
+Detects faces in the photo library, stores embeddings, and caches a
+display-sized crop of each face on disk for the web UI. Photos already in the
+database are skipped automatically, so this is safe to re-run as new photos
+arrive — no separate "incremental" flag is needed.
 
 ```bash
 python scan-faces.py scan --photo-dir /path/to/photos
@@ -118,20 +119,6 @@ Run this after a scan, or after adding many new photos.
 ```bash
 python scan-faces.py cluster
 ```
-
-### Detect blur
-
-Computes a blur score (Laplacian variance of the face crop; higher = sharper)
-for each face and caches a display-sized crop on disk for the web UI. Only
-faces missing a score/crop are processed unless `--overwrite` is given.
-
-```bash
-python scan-faces.py detect-blur
-python scan-faces.py detect-blur --overwrite   # re-score and re-crop everything
-```
-
-The web UI can then filter out blurry faces so you spend labelling effort on
-the clearest ones. Accepts `--workers N` like `scan`.
 
 ### Suggest assignments
 
@@ -173,9 +160,8 @@ fold the remaining unassigned faces into the named people.
 
 **Recommended — the Streamlit web UI** (see below). It shows a grid of face
 thumbnails per cluster, lets you name clusters, assign uncategorised faces
-(sorted by similarity to a chosen person), merge similar clusters, review
-suggestions, and hide blurry faces. This is by far the most efficient
-workflow for large libraries.
+(sorted by similarity to a chosen person), merge similar clusters, and review
+suggestions. This is by far the most efficient workflow for large libraries.
 
 **Or SQL directly** (person `id` is a UUID):
 ```sql
@@ -198,8 +184,8 @@ propagate those labels to the rest of the faces.
 A Streamlit web interface is provided to browse persons/clusters and their
 faces, and to drive the whole labelling workflow: naming clusters, assigning
 uncategorised faces (optionally sorted by similarity to a target person),
-merging similar clusters, reviewing `suggest` results, clearing unwanted
-clusters, and filtering out blurry faces.
+merging similar clusters, reviewing `suggest` results, and clearing unwanted
+clusters.
 
 ### 1. Install Streamlit (if not already done)
 
@@ -218,9 +204,6 @@ streamlit run view-clusters-app.py
 ```
 
 Then open the provided URL in your browser (usually http://localhost:8501).
-
-> Tip: run `detect-blur` first so the UI has cached face crops (faster
-> thumbnails) and blur scores available for filtering.
 
 ---
 
