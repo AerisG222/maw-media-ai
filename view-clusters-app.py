@@ -115,6 +115,20 @@ def assign_faces_to_person(person_id: str, face_ids: list[str]):
             conn.commit()
 
 
+def set_preferred_face(person_id: str, face_id: str | None):
+    """Set (or clear, when face_id is None) the UI preview face for a cluster.
+
+    Presentation only — never used by matching/clustering logic.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE persons SET preferred_face_id = %s WHERE id = %s",
+                (face_id, person_id),
+            )
+            conn.commit()
+
+
 def clear_cluster(person_id: str):
     """Unassign all faces from a cluster and delete it."""
     with get_connection() as conn:
@@ -207,7 +221,8 @@ def fetch_persons_page(
             SELECT fd.id, fd.photo_id, fd.detection_score, fd.bounding_box
             FROM face_detections fd
             WHERE fd.person_id = p.id
-            ORDER BY fd.detection_score DESC NULLS LAST, fd.id
+            ORDER BY (fd.id = p.preferred_face_id) DESC NULLS LAST,
+                     fd.detection_score DESC NULLS LAST, fd.id
             LIMIT 1
         ) fd ON true
         LEFT JOIN photos ph ON ph.id = fd.photo_id
@@ -306,7 +321,8 @@ def fetch_persons_by_ids(page_ids: list[str]) -> list:
             SELECT fd.id, fd.photo_id, fd.detection_score, fd.bounding_box
             FROM face_detections fd
             WHERE fd.person_id = p.id
-            ORDER BY fd.detection_score DESC NULLS LAST, fd.id
+            ORDER BY (fd.id = p.preferred_face_id) DESC NULLS LAST,
+                     fd.detection_score DESC NULLS LAST, fd.id
             LIMIT 1
         ) fd ON true
         LEFT JOIN photos ph ON ph.id = fd.photo_id
@@ -318,9 +334,9 @@ def fetch_persons_by_ids(page_ids: list[str]) -> list:
 
 
 def fetch_person(person_id: str) -> tuple | None:
-    """Return person data: (id, name, cluster_label, face_count)."""
+    """Return person data: (id, name, cluster_label, face_count, preferred_face_id)."""
     return execute_single(
-        "SELECT id, name, cluster_label, face_count FROM persons WHERE id = %s",
+        "SELECT id, name, cluster_label, face_count, preferred_face_id FROM persons WHERE id = %s",
         (person_id,),
     )
 
@@ -426,7 +442,8 @@ def fetch_all_persons_for_merge(exclude_id: str) -> list:
             SELECT fd.id, fd.photo_id, fd.bounding_box
             FROM face_detections fd
             WHERE fd.person_id = p.id
-            ORDER BY fd.detection_score DESC NULLS LAST
+            ORDER BY (fd.id = p.preferred_face_id) DESC NULLS LAST,
+                     fd.detection_score DESC NULLS LAST
             LIMIT 1
         ) fd ON true
         LEFT JOIN photos ph ON ph.id = fd.photo_id
@@ -1307,9 +1324,10 @@ def render_faces_step(person_id: str):
         st.error("Selected person not found in database.")
         navigate_to_persons()
 
-    _, current_name, _, face_count = (
-        person_row if person_row else (None, "Unknown", None, 0)
+    _, current_name, _, face_count, preferred_face_id = (
+        person_row if person_row else (None, "Unknown", None, 0, None)
     )
+    preferred_face_id = str(preferred_face_id) if preferred_face_id else None
 
     select_mode_key = f"select_mode_{person_id}"
     if select_mode_key not in st.session_state:
@@ -1505,13 +1523,29 @@ def render_faces_step(person_id: str):
                     ),
                     unsafe_allow_html=True,
                 )
-                if st.button(
-                    "🔍",
-                    key=f"view_orig_{person_id}_{face_id}",
-                    help="Open the original photo to see this face in context",
-                    use_container_width=True,
-                ):
-                    _show_original_photo(file_path)
+                view_col, star_col = st.columns(2)
+                with view_col:
+                    if st.button(
+                        "🔍",
+                        key=f"view_orig_{person_id}_{face_id}",
+                        help="Open the original photo to see this face in context",
+                        use_container_width=True,
+                    ):
+                        _show_original_photo(file_path)
+                with star_col:
+                    is_pref = preferred_face_id == str(face_id)
+                    if st.button(
+                        "⭐" if is_pref else "☆",
+                        key=f"pref_face_{person_id}_{face_id}",
+                        help="Current cluster preview — click to clear"
+                        if is_pref
+                        else "Use this face as the cluster preview",
+                        use_container_width=True,
+                    ):
+                        set_preferred_face(
+                            person_id, None if is_pref else str(face_id)
+                        )
+                        st.rerun()
                 if in_select_mode:
                     st.checkbox(
                         "Select",

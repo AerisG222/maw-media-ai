@@ -126,6 +126,17 @@ ALTER TABLE face_detections
 
 
 -- ---------------------------------------------------------------------------
+-- New columns on persons
+-- ---------------------------------------------------------------------------
+
+-- UI-only: the face a human picked to represent the cluster in listings.
+-- Purely presentational — it never feeds the matching/clustering logic.
+ALTER TABLE persons
+    ADD COLUMN IF NOT EXISTS preferred_face_id UUID
+        REFERENCES face_detections(id) ON DELETE SET NULL;
+
+
+-- ---------------------------------------------------------------------------
 -- Index to make the review query fast (pending suggestions for review)
 -- ---------------------------------------------------------------------------
 
