@@ -867,15 +867,18 @@ def render_face_grid_cell_html(
     score: float | None,
     file_path: str | None = None,
 ) -> str:
+    title_attr = f" title='{html.escape(file_path)}'" if file_path else ""
+
     if data_url:
         img_html = (
-            f'<img src="{data_url}" alt="{html.escape(filename)}" width="{width}" height="{height}" '
+            f'<img src="{data_url}" alt="{html.escape(filename)}" width="{width}" height="{height}"'
+            f'{title_attr} draggable="false" '
             f'style="width:{width}px;height:{height}px;object-fit:contain;'
-            f'display:block;margin:auto;pointer-events:none;border-radius:8px" loading="lazy" />'
+            f'display:block;margin:auto;border-radius:8px" loading="lazy" />'
         )
     else:
         img_html = (
-            f"<div style='width:{width}px;height:{height}px;background:#EEE;"
+            f"<div{title_attr} style='width:{width}px;height:{height}px;background:#EEE;"
             f"display:flex;align-items:center;justify-content:center;'>"
             f"<span style='color:#999;font-size:12px;'>Could not load</span></div>"
         )
@@ -893,8 +896,6 @@ def render_face_grid_cell_html(
         f"-webkit-box-orient:vertical;text-overflow:ellipsis;white-space:normal;"
         f"font-size:11px;color:#666;text-align:center;'>{info_html}</div>"
     )
-
-    title_attr = f" title='{html.escape(file_path)}'" if file_path else ""
 
     return (
         f"<div{title_attr} style='width:{CELL_WIDTH}px;display:flex;flex-direction:column;align-items:center;cursor:default;'>"
