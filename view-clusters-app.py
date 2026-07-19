@@ -4,12 +4,14 @@ import io
 import json
 import math
 import os
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
 import psycopg2
+import psycopg2.pool
 import streamlit as st
 from PIL import Image
 
@@ -47,8 +49,30 @@ VIEW_PERSON_KEY = "view_person_id"
 
 
 # --- Database Connection ---
+@st.cache_resource
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    """One shared connection pool for the whole app.
+
+    Cached as a Streamlit resource so it's created once and reused across reruns
+    and sessions, instead of opening (and leaking) a connection per query.
+    """
+    return psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=10, dsn=DSN)
+
+
+@contextmanager
 def get_connection():
-    return psycopg2.connect(DSN)
+    """Borrow a pooled connection; commit on success, roll back on error, and
+    always return it to the pool."""
+    pool = _get_pool()
+    conn = pool.getconn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pool.putconn(conn)
 
 
 def execute_query(query: str, params: tuple = ()):
@@ -69,7 +93,6 @@ def execute_update(query: str, params: tuple = ()):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params)
-            conn.commit()
 
 
 def remove_faces_from_person(person_id: str, face_ids: list[str]):
@@ -797,44 +820,6 @@ def _prefetch_next_page(items: list[tuple]) -> None:
 
 
 # --- HTML Rendering ---
-def render_person_card_image(
-    data_url: str | None, width: int = 160, height: int = 160, filename: str = "Image"
-):
-    """Render a face preview image with a placeholder for missing images."""
-    if data_url:
-        style = f"width:{width}px;height:{height}px;object-fit:contain;display:block;margin:auto;user-select:none;"
-        html_fragment = (
-            f'<img src="{data_url}" alt="{html.escape(filename)}" '
-            f'style="{style}" draggable="false" />'
-        )
-        st.markdown(html_fragment, unsafe_allow_html=True)
-    else:
-        st.markdown(
-            f'<div style="width:{width}px;height:{height}px;background:#EEE;'
-            f'display:flex;align-items:center;justify-content:center;">'
-            f'<span style="color:#999;font-size:12px;">No preview</span></div>',
-            unsafe_allow_html=True,
-        )
-
-
-def render_person_card_meta(name: str | None, face_count: int, top_score: float | None):
-    """Render the title and metadata for a person card."""
-    st.markdown(
-        f'<div style="margin-bottom:0;"><strong>{html.escape(name or "Unnamed")}</strong></div>',
-        unsafe_allow_html=True,
-    )
-
-    if top_score is not None:
-        try:
-            score_text = f"{float(top_score):.2f}"
-        except (ValueError, TypeError):
-            score_text = str(top_score)
-        st.markdown(
-            f'<span style="font-size:0.8rem;">Faces: {face_count} | Top: {score_text}</span>',
-            unsafe_allow_html=True,
-        )
-
-
 def render_clickable_person_card(
     person_id: str | int,
     data_url: str | None,
@@ -923,76 +908,30 @@ def render_face_grid_cell_html(
 
 
 # --- UI Helper Functions ---
-def render_pagination_controls_persons() -> tuple[bool, bool, bool, bool, bool, bool]:
-    cols = st.columns(6)
-    with cols[0]:
-        first = st.button("<< First", key="person_page_first")
-    with cols[1]:
-        prev10 = st.button("◀ -10", key="person_page_prev10")
-    with cols[2]:
-        prev = st.button("◀ Prev", key="person_page_prev")
-    with cols[3]:
-        next = st.button("Next ▶", key="person_page_next")
-    with cols[4]:
-        next10 = st.button("+10 ▶", key="person_page_next10")
-    with cols[5]:
-        last = st.button("Last >>", key="person_page_last")
-    return first, prev10, prev, next, next10, last
+_PAGINATION_BUTTONS = (
+    ("first", "<< First"),
+    ("prev10", "◀ -10"),
+    ("prev", "◀ Prev"),
+    ("next", "Next ▶"),
+    ("next10", "+10 ▶"),
+    ("last", "Last >>"),
+)
 
 
-def render_pagination_controls_faces(
-    page: int, total_pages: int
+def render_pagination_controls(
+    key_prefix: str,
 ) -> tuple[bool, bool, bool, bool, bool, bool]:
-    cols = st.columns(6)
-    with cols[0]:
-        first = st.button("<< First", key="face_page_first")
-    with cols[1]:
-        prev10 = st.button("◀ -10", key="face_page_prev10")
-    with cols[2]:
-        prev = st.button("◀ Prev", key="face_page_prev")
-    with cols[3]:
-        next = st.button("Next ▶", key="face_page_next")
-    with cols[4]:
-        next10 = st.button("+10 ▶", key="face_page_next10")
-    with cols[5]:
-        last = st.button("Last >>", key="face_page_last")
-    return first, prev10, prev, next, next10, last
+    """Render the six page-navigation buttons; return their click states in the
+    order (first, prev10, prev, next, next10, last).
 
-
-def render_pagination_controls_unknown(
-    page: int, total_pages: int
-) -> tuple[bool, bool, bool, bool, bool, bool]:
-    cols = st.columns(6)
-    with cols[0]:
-        first = st.button("<< First", key="unknown_page_first")
-    with cols[1]:
-        prev10 = st.button("◀ -10", key="unknown_page_prev10")
-    with cols[2]:
-        prev = st.button("◀ Prev", key="unknown_page_prev")
-    with cols[3]:
-        next = st.button("Next ▶", key="unknown_page_next")
-    with cols[4]:
-        next10 = st.button("+10 ▶", key="unknown_page_next10")
-    with cols[5]:
-        last = st.button("Last >>", key="unknown_page_last")
-    return first, prev10, prev, next, next10, last
-
-
-def update_view_page(action: str, page: int, total_pages: int) -> int:
-    """Update the current page based on action."""
-    if action == "start":
-        return 1
-    elif action == "prev10":
-        return max(1, page - 10)
-    elif action == "prev":
-        return max(1, page - 1)
-    elif action == "next":
-        return min(total_pages, page + 1)
-    elif action == "next10":
-        return min(total_pages, page + 10)
-    elif action == "end":
-        return total_pages
-    return page
+    *key_prefix* namespaces the widget keys so multiple pagers can coexist.
+    """
+    cols = st.columns(len(_PAGINATION_BUTTONS))
+    clicks = []
+    for col, (name, label) in zip(cols, _PAGINATION_BUTTONS):
+        with col:
+            clicks.append(st.button(label, key=f"{key_prefix}_{name}"))
+    return tuple(clicks)
 
 
 def _face_selection_key(person_id: str, face_id) -> str:
@@ -1062,7 +1001,9 @@ def render_persons_step():
         st.checkbox("Sort by similarity", key="choose_sim_sort")
 
     with control_col4:
-        first, prev10, prev, next, next10, last = render_pagination_controls_persons()
+        first, prev10, prev, next, next10, last = render_pagination_controls(
+            "person_page"
+        )
 
     n_suggestions = fetch_suggestion_count()
     suggestion_badge = f" ({n_suggestions:,})" if n_suggestions else ""
@@ -1449,8 +1390,8 @@ def render_faces_step(person_id: str):
     )
 
     # Navigation
-    start, prev10, prev, next_btn, next10, end = render_pagination_controls_faces(
-        st.session_state[view_page_key], total_pages
+    start, prev10, prev, next_btn, next10, end = render_pagination_controls(
+        "face_page"
     )
 
     cur = st.session_state[view_page_key]
@@ -1644,8 +1585,8 @@ def render_unknown_step():
         1, min(st.session_state[view_page_key], total_pages)
     )
 
-    start, prev10, prev, next_btn, next10, end = render_pagination_controls_unknown(
-        st.session_state[view_page_key], total_pages
+    start, prev10, prev, next_btn, next10, end = render_pagination_controls(
+        "unknown_page"
     )
 
     cur = st.session_state[view_page_key]
