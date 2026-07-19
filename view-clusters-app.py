@@ -1716,37 +1716,45 @@ def render_unknown_step():
                     except Exception as e:
                         st.error(f"Assignment failed: {e}")
 
-    # Use the Streamlit-columns layout whenever we need per-face widgets
-    # (quick-assign buttons or bulk-select checkboxes).  Fall back to a single
-    # static HTML block when just browsing — it's faster to render.
-    needs_columns = target_person is not None or in_assign_mode
-    if needs_columns:
-        selected_set = st.session_state[SEL_KEY]
-        for row_start in range(0, len(faces), GRID_COLS):
-            row_faces = faces[row_start : row_start + GRID_COLS]
-            cols = st.columns(GRID_COLS)
-            for col_idx, (
-                face_id,
-                file_path,
-                bounding_box,
-                score,
-            ) in enumerate(row_faces):
-                face_id_str = str(face_id)
-                with cols[col_idx]:
-                    data_url = face_thumb_url(file_path, face_id, bounding_box)
-                    st.markdown(
-                        render_face_grid_cell_html(
-                            data_url,
-                            width=CELL_WIDTH,
-                            height=IMAGE_HEIGHT,
-                            filename=os.path.basename(file_path),
-                            score=score,
-                            file_path=file_path,
-                        ),
-                        unsafe_allow_html=True,
-                    )
+    # One column per face so each can carry a "view original" button. The
+    # quick-assign button and selection checkbox are shown only when relevant.
+    selected_set = st.session_state[SEL_KEY]
+    show_checkbox = target_person is not None or in_assign_mode
+    for row_start in range(0, len(faces), GRID_COLS):
+        row_faces = faces[row_start : row_start + GRID_COLS]
+        cols = st.columns(GRID_COLS)
+        for col_idx, (
+            face_id,
+            file_path,
+            bounding_box,
+            score,
+        ) in enumerate(row_faces):
+            face_id_str = str(face_id)
+            with cols[col_idx]:
+                data_url = face_thumb_url(file_path, face_id, bounding_box)
+                st.markdown(
+                    render_face_grid_cell_html(
+                        data_url,
+                        width=CELL_WIDTH,
+                        height=IMAGE_HEIGHT,
+                        filename=os.path.basename(file_path),
+                        score=score,
+                        file_path=file_path,
+                    ),
+                    unsafe_allow_html=True,
+                )
 
-                    if target_person is not None:
+                if target_person is not None:
+                    view_col, assign_col = st.columns(2)
+                    with view_col:
+                        if st.button(
+                            "🔍",
+                            key=f"unknown_view_orig_{face_id_str}",
+                            help="Open the original photo to see this face in context",
+                            use_container_width=True,
+                        ):
+                            _show_original_photo(file_path)
+                    with assign_col:
                         if st.button(
                             "Assign",
                             key=f"quick_assign_{face_id_str}",
@@ -1760,7 +1768,16 @@ def render_unknown_step():
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Assignment failed: {e}")
+                else:
+                    if st.button(
+                        "🔍",
+                        key=f"unknown_view_orig_{face_id_str}",
+                        help="Open the original photo to see this face in context",
+                        use_container_width=True,
+                    ):
+                        _show_original_photo(file_path)
 
+                if show_checkbox:
                     cb_key = f"unknown_face_cb_{face_id_str}"
 
                     def _toggle(fid=face_id_str):
@@ -1777,25 +1794,6 @@ def render_unknown_step():
                         on_change=_toggle,
                         label_visibility="collapsed",
                     )
-    else:
-        cells_html = []
-        for face_id, file_path, bounding_box, score in faces:
-            data_url = face_thumb_url(file_path, face_id, bounding_box)
-            cells_html.append(
-                render_face_grid_cell_html(
-                    data_url,
-                    width=CELL_WIDTH,
-                    height=IMAGE_HEIGHT,
-                    filename=os.path.basename(file_path),
-                    score=score,
-                    file_path=file_path,
-                )
-            )
-        flex_style = "display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;justify-content:flex-start;"
-        st.markdown(
-            f"<div style='{flex_style}'>{''.join(cells_html)}</div>",
-            unsafe_allow_html=True,
-        )
 
     if page < total_pages:
         next_offset = page * FACES_PAGE_SIZE
@@ -1823,15 +1821,18 @@ def render_review_face_cell(
     data_url, file_path, det_score, suggested_name, suggestion_score
 ):
     """Render a suggestion card: face crop + suggested person + confidence."""
+    title_attr = f" title='{html.escape(file_path)}'" if file_path else ""
+
     if data_url:
         img_html = (
-            f'<img src="{data_url}" alt="face" width="{CELL_WIDTH}" height="{IMAGE_HEIGHT}" '
+            f'<img src="{data_url}" alt="face" width="{CELL_WIDTH}" height="{IMAGE_HEIGHT}"'
+            f'{title_attr} draggable="false" '
             f'style="width:{CELL_WIDTH}px;height:{IMAGE_HEIGHT}px;'
             f'object-fit:contain;display:block;margin:auto;border-radius:8px" loading="lazy" />'
         )
     else:
         img_html = (
-            f"<div style='width:{CELL_WIDTH}px;height:{IMAGE_HEIGHT}px;background:#EEE;"
+            f"<div{title_attr} style='width:{CELL_WIDTH}px;height:{IMAGE_HEIGHT}px;background:#EEE;"
             f"display:flex;align-items:center;justify-content:center;'>"
             f"<span style='color:#999;font-size:12px;'>No image</span></div>"
         )
@@ -1847,7 +1848,7 @@ def render_review_face_cell(
     )
 
     return (
-        f"<div style='width:{CELL_WIDTH}px;display:flex;flex-direction:column;align-items:center;'>"
+        f"<div{title_attr} style='width:{CELL_WIDTH}px;display:flex;flex-direction:column;align-items:center;'>"
         f"<div style='width:{CELL_WIDTH}px;height:{IMAGE_HEIGHT}px;display:flex;"
         f"align-items:center;justify-content:center;'>{img_html}</div>"
         f"<div style='width:100%;text-align:center;padding-top:4px;'>{name_html}{meta_html}</div>"
@@ -2025,6 +2026,13 @@ def render_review_step():
                     ),
                     unsafe_allow_html=True,
                 )
+                if st.button(
+                    "🔍",
+                    key=f"review_view_orig_{face_id_str}",
+                    help="Open the original photo to see this face in context",
+                    use_container_width=True,
+                ):
+                    _show_original_photo(file_path)
 
                 def _toggle(fid=face_id_str):
                     s = st.session_state[SEL_KEY]
