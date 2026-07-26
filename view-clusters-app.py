@@ -791,19 +791,6 @@ def face_thumb_url(file_path: str, face_id, bbox: dict | None = None) -> str | N
     )
 
 
-def _prefetch_next_page(items: list[tuple]) -> None:
-    """Warm the disk + memory cache for the next page's images.
-
-    Each item is (file_path, bbox) or (file_path, bbox, crop_path).
-    """
-    for item in items:
-        file_path = item[0]
-        bbox = item[1]
-        crop_path = item[2] if len(item) > 2 else None
-        if file_path:
-            get_image_data_url_cached(file_path, bbox, crop_path=crop_path)
-
-
 # --- HTML Rendering ---
 def render_clickable_person_card(
     person_id: str | int,
@@ -1188,29 +1175,6 @@ def render_persons_step():
                                 st.session_state[confirm_key] = True
                                 st.rerun()
 
-    current_page = st.session_state["choose_page"]
-    if current_page < page_count:
-        if sim_sort:
-            next_ids = ordered_ids[
-                current_page * PERSONS_PAGE_SIZE : (current_page + 1)
-                * PERSONS_PAGE_SIZE
-            ]
-            next_persons = fetch_persons_by_ids(next_ids)
-        else:
-            next_persons = fetch_persons_page(
-                search if search else None,
-                limit=PERSONS_PAGE_SIZE,
-                offset=current_page * PERSONS_PAGE_SIZE,
-                unnamed_only=unnamed_only,
-            )
-        _prefetch_next_page(
-            [
-                (row[4], row[6], _crop_str(row[4], row[7]))
-                for row in next_persons
-                if row[4]
-            ]
-        )
-
 
 def navigate_to_persons():
     st.session_state[VIEW_KEY] = "persons"
@@ -1478,14 +1442,6 @@ def render_faces_step(person_id: str):
                         label_visibility="collapsed",
                     )
 
-    if page < total_pages:
-        next_faces = fetch_faces_for_person(
-            person_id,
-            limit=FACES_PAGE_SIZE,
-            offset=page * FACES_PAGE_SIZE,
-        )
-        _prefetch_next_page([(f[1], f[2], _crop_str(f[1], f[0])) for f in next_faces])
-
 
 def render_unknown_step():
     # Use an explicit set to track selections rather than individual widget keys.
@@ -1719,21 +1675,6 @@ def render_unknown_step():
                         on_change=_toggle,
                         label_visibility="collapsed",
                     )
-
-    if page < total_pages:
-        next_offset = page * FACES_PAGE_SIZE
-        if sort_by_similarity and target_person:
-            next_faces = fetch_faces_for_unknown_by_similarity(
-                str(target_person[0]),
-                limit=FACES_PAGE_SIZE,
-                offset=next_offset,
-            )
-        else:
-            next_faces = fetch_faces_for_unknown(
-                limit=FACES_PAGE_SIZE,
-                offset=next_offset,
-            )
-        _prefetch_next_page([(f[1], f[2], _crop_str(f[1], f[0])) for f in next_faces])
 
 
 def navigate_to_review():
@@ -1973,16 +1914,6 @@ def render_review_step():
                     on_change=_toggle,
                     label_visibility="collapsed",
                 )
-
-    if page < total_pages:
-        next_suggestions = fetch_suggestions_page(
-            limit=FACES_PAGE_SIZE,
-            offset=page * FACES_PAGE_SIZE,
-            person_id=active_person_id,
-        )
-        _prefetch_next_page(
-            [(r[1], r[2], _crop_str(r[1], r[0])) for r in next_suggestions]
-        )
 
 
 if __name__ == "__main__":
