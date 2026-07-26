@@ -78,6 +78,34 @@ RECOGNITION_DISTANCE_THRESHOLD = float(
 # suggestion.  Lower = more conservative (fewer but higher-confidence suggestions).
 SUGGEST_DISTANCE_THRESHOLD = float(os.getenv("SUGGEST_DISTANCE_THRESHOLD", "0.35"))
 
+# Minimum classifier probability for a suggestion (0-1, higher = stricter).
+# Used by `suggest --method classifier` (the default).  Measured on 154k labelled
+# faces, held-out precision was ~100% at 0.90 and ~99.9% at 0.80, while the
+# centroid method could not reach either bar at any useful coverage.  0.90 was
+# spot-checked in the UI and looked clean, so the default sits at 0.80 to roughly
+# double volume for a fraction of a percent of extra review work.  Raise it back
+# to 0.90 if rejections start feeling frequent.
+# SUGGEST_MAX_DISTANCE still applies as a veto, so both gates must pass.
+SUGGEST_MIN_CONFIDENCE = float(os.getenv("SUGGEST_MIN_CONFIDENCE", "0.80"))
+
+# Distance veto for the classifier path.  This is NOT the same calibration as
+# SUGGEST_DISTANCE_THRESHOLD above: that one is the centroid method's primary
+# gate, whereas this is a secondary sanity check on top of the confidence bar.
+# Measured over 154k labelled (known-correct) faces, distance-to-own-centroid
+# runs median 0.31 / 90th pct 0.50 / 95th pct 0.56, so 0.60 keeps ~96% of
+# genuinely-correct assignments while still rejecting far-away matches
+# (unassigned candidates sit at a median of 0.80).
+SUGGEST_MAX_DISTANCE = float(os.getenv("SUGGEST_MAX_DISTANCE", "0.60"))
+
+# Cold-start guards: below either of these the classifier has too little to learn
+# from and `suggest` falls back to nearest-centroid.
+CLASSIFIER_MIN_CLASSES = int(os.getenv("CLASSIFIER_MIN_CLASSES", "5"))
+CLASSIFIER_MIN_FACES = int(os.getenv("CLASSIFIER_MIN_FACES", "100"))
+
+# Max training faces per person.  Caps the influence of very large clusters and
+# keeps training fast; measured to make no meaningful difference to accuracy.
+CLASSIFIER_MAX_PER_CLASS = int(os.getenv("CLASSIFIER_MAX_PER_CLASS", "1500"))
+
 # Cosine distance threshold for merge-clusters.
 # Unnamed clusters whose centroid is within this distance of a named person's
 # centroid are merged into that person.  Tighter than suggest because a whole
@@ -673,11 +701,227 @@ def cmd_cluster(rebuild_all: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 
-def cmd_suggest(threshold: float) -> None:
+def _parse_vec(text: str) -> np.ndarray:
+    return np.fromstring(text.strip("[]"), sep=",", dtype=np.float32)
+
+
+def _load_training_set(conn: psycopg.Connection) -> tuple[np.ndarray, np.ndarray]:
+    """Every face belonging to a NAMED person: (embeddings, person_id strings)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT fd.person_id::text AS pid, fd.embedding::text AS emb
+            FROM face_detection fd
+            JOIN person p ON p.id = fd.person_id
+            WHERE p.name IS NOT NULL AND fd.embedding IS NOT NULL
+            """
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return np.empty((0, 512), dtype=np.float32), np.empty(0, dtype=object)
+    X = np.empty((len(rows), 512), dtype=np.float32)
+    y = np.empty(len(rows), dtype=object)
+    for i, r in enumerate(rows):
+        X[i] = _parse_vec(r["emb"])
+        y[i] = r["pid"]
+    return X, y
+
+
+def _fit_suggester(X: np.ndarray, y: np.ndarray, rng: np.random.Generator):
+    """Fit the logistic-regression classifier plus per-person centroids.
+
+    Returns (clf, classes, centroids) where centroids[i] is the L2-normalised
+    mean embedding of classes[i] -- used as the sanity veto alongside the
+    classifier's probability.
     """
-    For every unassigned or unnamed-cluster face with an embedding, find its
-    nearest named-person centroid via pgvector and write a suggestion when the
-    cosine distance is below *threshold*.
+    from sklearn.linear_model import LogisticRegression
+
+    # Cap over-represented people so one large cluster can't dominate the fit.
+    keep = []
+    for cls in np.unique(y):
+        idx = np.flatnonzero(y == cls)
+        if len(idx) > CLASSIFIER_MAX_PER_CLASS:
+            idx = rng.choice(idx, CLASSIFIER_MAX_PER_CLASS, replace=False)
+        keep.append(idx)
+    keep = np.concatenate(keep)
+
+    log.info(
+        f"Training classifier on {len(keep):,} face(s) "
+        f"across {len(np.unique(y)):,} people…"
+    )
+    clf = LogisticRegression(max_iter=1000, C=10.0, class_weight="balanced")
+    clf.fit(X[keep], y[keep])
+
+    # Centroids come from ALL labelled faces, matching person.representative_embedding.
+    classes = clf.classes_
+    centroids = np.empty((len(classes), X.shape[1]), dtype=np.float32)
+    for i, cls in enumerate(classes):
+        v = X[y == cls].mean(axis=0)
+        n = np.linalg.norm(v)
+        centroids[i] = v / n if n > 0 else v
+    return clf, classes, centroids
+
+
+def _iter_candidate_batches(conn: psycopg.Connection, batch: int = 20000):
+    """Yield (ids, embeddings) for unassigned / unnamed-cluster faces."""
+    with conn.cursor(name="cand_cur") as cur:   # server-side cursor: bounded memory
+        cur.itersize = batch
+        cur.execute(
+            """
+            SELECT fd.id::text AS fid, fd.embedding::text AS emb
+            FROM face_detection fd
+            LEFT JOIN person p ON p.id = fd.person_id
+            WHERE (fd.person_id IS NULL OR p.name IS NULL)
+              AND fd.embedding IS NOT NULL
+            """
+        )
+        ids, vecs = [], []
+        for row in cur:
+            ids.append(row["fid"])
+            vecs.append(_parse_vec(row["emb"]))
+            if len(ids) >= batch:
+                yield ids, np.vstack(vecs)
+                ids, vecs = [], []
+        if ids:
+            yield ids, np.vstack(vecs)
+
+
+def _suggest_with_classifier(
+    conn: psycopg.Connection, threshold: float, min_confidence: float
+) -> int:
+    """Score candidates with the classifier, gated by centroid distance.
+
+    Writes suggestion_score as (1 - probability) so it keeps the column's
+    existing "lower is better" contract, which the review UI relies on for both
+    its confidence display and its ordering.
+    """
+    rng = np.random.default_rng(0)
+    X, y = _load_training_set(conn)
+    n_classes = len(np.unique(y)) if len(y) else 0
+
+    if n_classes < CLASSIFIER_MIN_CLASSES or len(y) < CLASSIFIER_MIN_FACES:
+        log.warning(
+            f"Only {len(y):,} labelled face(s) across {n_classes} person(s) — "
+            f"below the classifier minimum "
+            f"({CLASSIFIER_MIN_FACES:,} faces / {CLASSIFIER_MIN_CLASSES} people). "
+            "Falling back to nearest-centroid."
+        )
+        return _suggest_with_centroid(conn, threshold)
+
+    log.info(f"Loaded {len(y):,} labelled face(s) across {n_classes:,} people.")
+    t0 = time.time()
+    clf, classes, centroids = _fit_suggester(X, y, rng)
+    log.info(f"Classifier trained in {time.time() - t0:.1f}s.")
+    del X, y
+
+    # Stage accepted suggestions in a temp table, then apply in one UPDATE.
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TEMP TABLE suggestion_stage (
+                face_id   UUID PRIMARY KEY,
+                person_id UUID NOT NULL,
+                score     FLOAT NOT NULL
+            ) ON COMMIT DROP
+            """
+        )
+
+    n_seen = n_accept = 0
+    for ids, Xc in _iter_candidate_batches(conn):
+        n_seen += len(ids)
+        proba = clf.predict_proba(Xc)
+        best = proba.argmax(axis=1)
+        conf = proba[np.arange(len(ids)), best]
+
+        # Veto: the face must also sit within `threshold` cosine distance of the
+        # predicted person's centroid.  Guards against a confident-but-wrong
+        # assignment for someone who simply isn't in the labelled set.
+        Xn = Xc / np.clip(np.linalg.norm(Xc, axis=1, keepdims=True), 1e-9, None)
+        dist = 1.0 - np.einsum("ij,ij->i", Xn, centroids[best])
+
+        ok = (conf >= min_confidence) & (dist < threshold)
+        if ok.any():
+            rows = [
+                (ids[i], classes[best[i]], float(1.0 - conf[i]))
+                for i in np.flatnonzero(ok)
+            ]
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO suggestion_stage (face_id, person_id, score) "
+                    "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                    rows,
+                )
+            n_accept += len(rows)
+        log.info(f"  scored {n_seen:,} candidate(s), {n_accept:,} accepted…")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE face_detection fd
+            SET suggested_person_id = s.person_id,
+                suggestion_score    = s.score
+            FROM suggestion_stage s
+            WHERE fd.id = s.face_id
+            """
+        )
+        n_written = cur.rowcount
+    conn.commit()
+    return n_written
+
+
+def _suggest_with_centroid(conn: psycopg.Connection, threshold: float) -> int:
+    """Original behaviour: nearest named-person centroid via pgvector."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE face_detection fd
+            SET suggested_person_id = best.person_id,
+                suggestion_score    = best.distance
+            FROM (
+                SELECT
+                    fd.id AS face_id,
+                    nearest.id       AS person_id,
+                    (fd.embedding <=> nearest.representative_embedding) AS distance
+                FROM face_detection fd
+                LEFT JOIN person src_p ON src_p.id = fd.person_id
+                CROSS JOIN LATERAL (
+                    SELECT p.id, p.representative_embedding
+                    FROM person p
+                    WHERE p.name IS NOT NULL
+                      AND p.representative_embedding IS NOT NULL
+                    ORDER BY p.representative_embedding <=> fd.embedding
+                    LIMIT 1
+                ) nearest
+                WHERE (fd.person_id IS NULL OR src_p.name IS NULL)
+                  AND fd.embedding   IS NOT NULL
+                  AND (fd.embedding <=> nearest.representative_embedding) < %(threshold)s
+            ) best
+            WHERE fd.id = best.face_id
+            """,
+            {"threshold": threshold},
+        )
+        n = cur.rowcount
+    conn.commit()
+    return n
+
+
+def cmd_suggest(
+    threshold: float,
+    min_confidence: float = SUGGEST_MIN_CONFIDENCE,
+    method: str = "classifier",
+    max_distance: float = SUGGEST_MAX_DISTANCE,
+) -> None:
+    """
+    For every unassigned or unnamed-cluster face with an embedding, predict the
+    most likely named person and write a suggestion when confidence is high
+    enough.
+
+    method="classifier" (default) fits a logistic regression on the current
+    labels in memory each run — so it is never stale — and accepts a suggestion
+    only when BOTH the predicted probability clears *min_confidence* AND the
+    face is within *threshold* cosine distance of that person's centroid.
+
+    method="centroid" reproduces the original nearest-centroid behaviour.
 
     Candidates are faces where:
       - person_id IS NULL (completely unassigned), OR
@@ -687,7 +931,15 @@ def cmd_suggest(threshold: float) -> None:
     touched.  Already-suggested candidates are re-evaluated so that re-running
     after labelling more clusters can improve or replace earlier suggestions.
     """
-    log.info(f"Running suggest with distance threshold {threshold:.3f}…")
+    if method not in ("classifier", "centroid"):
+        raise ValueError(f"unknown method {method!r}")
+    if method == "classifier":
+        log.info(
+            f"Running suggest [classifier] (min confidence {min_confidence:.2f}, "
+            f"distance veto {max_distance:.3f})…"
+        )
+    else:
+        log.info(f"Running suggest [centroid] (distance threshold {threshold:.3f})…")
     conn = get_connection(DB_DSN)
 
     # Count candidates: unassigned faces + faces in unnamed clusters
@@ -729,44 +981,15 @@ def cmd_suggest(threshold: float) -> None:
     conn.commit()
     log.info("Cleared previous suggestions on candidate faces.")
 
-    # For each candidate, find the single closest named-person centroid and
-    # write a suggestion if within the threshold.
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE face_detection fd
-            SET suggested_person_id = best.person_id,
-                suggestion_score    = best.distance
-            FROM (
-                SELECT
-                    fd.id AS face_id,
-                    nearest.id       AS person_id,
-                    (fd.embedding <=> nearest.representative_embedding) AS distance
-                FROM face_detection fd
-                LEFT JOIN person src_p ON src_p.id = fd.person_id
-                CROSS JOIN LATERAL (
-                    SELECT p.id, p.representative_embedding
-                    FROM person p
-                    WHERE p.name IS NOT NULL
-                      AND p.representative_embedding IS NOT NULL
-                    ORDER BY p.representative_embedding <=> fd.embedding
-                    LIMIT 1
-                ) nearest
-                WHERE (fd.person_id IS NULL OR src_p.name IS NULL)
-                  AND fd.embedding   IS NOT NULL
-                  AND (fd.embedding <=> nearest.representative_embedding) < %(threshold)s
-            ) best
-            WHERE fd.id = best.face_id
-            """,
-            {"threshold": threshold},
-        )
-        n_suggested = cur.rowcount
-    conn.commit()
+    if method == "classifier":
+        n_suggested = _suggest_with_classifier(conn, max_distance, min_confidence)
+    else:
+        n_suggested = _suggest_with_centroid(conn, threshold)
 
     n_skipped = n_candidates - n_suggested
     log.info(
         f"Suggest complete. {n_suggested:,} suggestion(s) written, "
-        f"{n_skipped:,} face(s) had no match within threshold {threshold:.3f}."
+        f"{n_skipped:,} face(s) did not clear the bar."
     )
     log.info("Open the Streamlit UI and use 'Review suggestions' to confirm or reject.")
     conn.close()
@@ -974,8 +1197,31 @@ def main() -> None:
         "--threshold",
         type=float,
         default=SUGGEST_DISTANCE_THRESHOLD,
-        help=f"Cosine distance threshold for suggestions (default: {SUGGEST_DISTANCE_THRESHOLD}). "
-             "Lower = more conservative.",
+        help=f"Cosine distance veto (default: {SUGGEST_DISTANCE_THRESHOLD}). "
+             "A face must be within this distance of the predicted person's "
+             "centroid. Lower = more conservative.",
+    )
+    p_suggest.add_argument(
+        "--min-confidence",
+        type=float,
+        default=SUGGEST_MIN_CONFIDENCE,
+        help=f"Minimum classifier probability (default: {SUGGEST_MIN_CONFIDENCE}). "
+             "Higher = more conservative. Ignored by --method centroid.",
+    )
+    p_suggest.add_argument(
+        "--max-distance",
+        type=float,
+        default=SUGGEST_MAX_DISTANCE,
+        help=f"Distance veto for --method classifier (default: {SUGGEST_MAX_DISTANCE}). "
+             "A prediction is rejected if the face is farther than this from the "
+             "predicted person's centroid. Ignored by --method centroid.",
+    )
+    p_suggest.add_argument(
+        "--method",
+        choices=("classifier", "centroid"),
+        default="classifier",
+        help="classifier (default) fits a logistic regression on current labels "
+             "each run; centroid reproduces the original nearest-centroid logic.",
     )
 
     # merge-clusters
@@ -1015,7 +1261,9 @@ def main() -> None:
                 return
         cmd_cluster(args.rebuild_all)
     elif args.command == "suggest":
-        cmd_suggest(args.threshold)
+        cmd_suggest(
+            args.threshold, args.min_confidence, args.method, args.max_distance
+        )
     elif args.command == "merge-clusters":
         cmd_merge_clusters(args.threshold, args.dry_run)
     elif args.command == "stats":
