@@ -32,7 +32,6 @@ CREATE TABLE IF NOT EXISTS person (
     id                          UUID PRIMARY KEY,
     name                        VARCHAR(255),            -- set by human operator
     representative_embedding    vector(512),             -- centroid of all face embeddings
-    face_count                  INT DEFAULT 0,
     created_at                  TIMESTAMPTZ DEFAULT now(),
     updated_at                  TIMESTAMPTZ DEFAULT now()
 );
@@ -97,8 +96,29 @@ CREATE INDEX IF NOT EXISTS face_detection_unassigned_idx
 
 
 -- ---------------------------------------------------------------------------
--- Useful views for your .NET application
+-- Views
 -- ---------------------------------------------------------------------------
+
+-- person, with face_count computed live.  face_count is deliberately NOT stored
+-- on the person table: a denormalised counter drifted in practice (direct SQL
+-- bypassed the application paths that maintained it), and Postgres generated
+-- columns cannot aggregate over another table.  Write to `person`; read from
+-- `person_v` whenever you need the count.
+CREATE OR REPLACE VIEW person_v AS
+SELECT p.id,
+       p.name,
+       p.representative_embedding,
+       p.created_at,
+       p.updated_at,
+       p.preferred_face_id,
+       coalesce(c.n, 0)::int AS face_count
+FROM person p
+LEFT JOIN (
+    SELECT person_id, count(*) AS n
+    FROM face_detection
+    WHERE person_id IS NOT NULL
+    GROUP BY person_id
+) c ON c.person_id = p.id;
 
 -- All photos that contain at least one recognised (named) person.
 CREATE OR REPLACE VIEW photos_with_named_persons AS

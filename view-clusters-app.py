@@ -96,31 +96,23 @@ def execute_update(query: str, params: tuple = ()):
 
 
 def remove_faces_from_person(person_id: str, face_ids: list[str]):
-    """Unassign the given faces from a person and sync the face count."""
+    """Unassign the given faces from a person (face_count comes from the person_v view)."""
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE face_detection SET person_id = NULL WHERE id = ANY(%s::uuid[])",
                 (face_ids,),
             )
-            cur.execute(
-                "UPDATE person SET face_count = (SELECT COUNT(*) FROM face_detection WHERE person_id = %s) WHERE id = %s",
-                (person_id, person_id),
-            )
             conn.commit()
 
 
 def assign_faces_to_person(person_id: str, face_ids: list[str]):
-    """Assign faces to a person and sync the face count and centroid."""
+    """Assign faces to a person and refresh its centroid (face_count comes from the person_v view)."""
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE face_detection SET person_id = %s WHERE id = ANY(%s::uuid[])",
                 (person_id, face_ids),
-            )
-            cur.execute(
-                "UPDATE person SET face_count = (SELECT COUNT(*) FROM face_detection WHERE person_id = %s) WHERE id = %s",
-                (person_id, person_id),
             )
             cur.execute(
                 """
@@ -165,16 +157,15 @@ def clear_cluster(person_id: str):
 
 
 def merge_persons_into(target_id: str, source_ids: list[str]):
-    """Move all faces from source persons into target, recompute count, delete sources."""
+    """Move all faces from source persons into target, refresh centroid, delete sources.
+
+    face_count is computed by the person_v view.
+    """
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE face_detection SET person_id = %s WHERE person_id = ANY(%s::uuid[])",
                 (target_id, source_ids),
-            )
-            cur.execute(
-                "UPDATE person SET face_count = (SELECT COUNT(*) FROM face_detection WHERE person_id = %s) WHERE id = %s",
-                (target_id, target_id),
             )
             cur.execute(
                 """
@@ -239,7 +230,7 @@ def fetch_persons_page(
         SELECT p.id, p.name, p.face_count,
                ph.file_path AS sample_path, fd.detection_score AS sample_score,
                fd.bounding_box AS sample_bbox, fd.id AS sample_face_id
-        FROM person p
+        FROM person_v p
         LEFT JOIN LATERAL (
             SELECT fd.id, fd.photo_id, fd.detection_score, fd.bounding_box
             FROM face_detection fd
@@ -270,7 +261,7 @@ def fetch_all_persons_embeddings(
     rows = execute_query(
         """
         SELECT p.id, p.face_count, p.representative_embedding::text
-        FROM person p
+        FROM person_v p
         WHERE (%s IS NULL OR p.name ILIKE %s OR p.id::text ILIKE %s)
           AND (NOT %s OR p.name IS NULL)
         ORDER BY p.face_count DESC NULLS LAST, p.id
@@ -339,7 +330,7 @@ def fetch_persons_by_ids(page_ids: list[str]) -> list:
         SELECT p.id, p.name, p.face_count,
                ph.file_path AS sample_path, fd.detection_score AS sample_score,
                fd.bounding_box AS sample_bbox, fd.id AS sample_face_id
-        FROM person p
+        FROM person_v p
         LEFT JOIN LATERAL (
             SELECT fd.id, fd.photo_id, fd.detection_score, fd.bounding_box
             FROM face_detection fd
@@ -359,7 +350,7 @@ def fetch_persons_by_ids(page_ids: list[str]) -> list:
 def fetch_person(person_id: str) -> tuple | None:
     """Return person data: (id, name, face_count, preferred_face_id)."""
     return execute_single(
-        "SELECT id, name, face_count, preferred_face_id FROM person WHERE id = %s",
+        "SELECT id, name, face_count, preferred_face_id FROM person_v WHERE id = %s",
         (person_id,),
     )
 
@@ -460,7 +451,7 @@ def fetch_all_persons_for_merge(exclude_id: str) -> list:
                ph.file_path  AS sample_path,
                fd.bounding_box AS sample_bbox,
                fd.id AS sample_face_id
-        FROM person p
+        FROM person_v p
         LEFT JOIN LATERAL (
             SELECT fd.id, fd.photo_id, fd.bounding_box
             FROM face_detection fd
@@ -486,7 +477,7 @@ def fetch_named_persons_for_assign() -> list:
     return execute_query(
         """
         SELECT id, name, face_count
-        FROM person
+        FROM person_v
         WHERE name IS NOT NULL
         ORDER BY name
         """,
@@ -495,25 +486,23 @@ def fetch_named_persons_for_assign() -> list:
 
 
 def cleanup_persons() -> tuple[int, int]:
-    """Recompute face_count for all persons, then delete any with zero faces.
+    """Delete persons that have no faces left.
 
-    Returns (n_updated, n_deleted).
+    face_count is computed live by the person_v view, so there is no stored
+    counter to resync.
+
+    Returns (n_checked, n_deleted).
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM person")
+            n_checked = cur.fetchone()[0]
             cur.execute(
-                """
-                UPDATE person
-                SET face_count = (
-                    SELECT COUNT(*) FROM face_detection WHERE person_id = person.id
-                )
-                """
+                "DELETE FROM person p WHERE NOT EXISTS ("
+                "  SELECT 1 FROM face_detection fd WHERE fd.person_id = p.id)"
             )
-            n_updated = cur.rowcount
-            cur.execute("DELETE FROM person WHERE face_count = 0")
             n_deleted = cur.rowcount
-            conn.commit()
-    return n_updated, n_deleted
+    return n_checked, n_deleted
 
 
 def fetch_suggested_persons() -> list:
@@ -607,14 +596,12 @@ def confirm_suggestions(face_ids: list[str]) -> None:
                 """,
                 (face_ids,),
             )
-            # Recompute face_count and centroid for every affected person
+            # Refresh the centroid for every affected person
+            # (face_count is computed by the person_v view).
             cur.execute(
                 """
                 UPDATE person p
-                SET face_count = (
-                    SELECT COUNT(*) FROM face_detection WHERE person_id = p.id
-                ),
-                representative_embedding = (
+                SET representative_embedding = (
                     SELECT avg(fd.embedding)::vector
                     FROM face_detection fd
                     WHERE fd.person_id = p.id AND fd.embedding IS NOT NULL

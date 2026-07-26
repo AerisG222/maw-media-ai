@@ -167,7 +167,7 @@ suggestions. This is by far the most efficient workflow for large libraries.
 ```sql
 -- Find the biggest unnamed clusters
 SELECT per.id, per.face_count
-FROM person per WHERE per.name IS NULL ORDER BY face_count DESC;
+FROM person_v per WHERE per.name IS NULL ORDER BY face_count DESC;
 
 -- Name a person
 UPDATE person SET name = 'Jane Smith'

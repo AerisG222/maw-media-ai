@@ -23,9 +23,9 @@ SELECT id, person_id FROM ranked WHERE rn > 1;
 
 DELETE FROM face_detection WHERE id IN (SELECT id FROM to_del);
 
+-- face_count is not stored (see person_v); only the timestamp needs touching.
 UPDATE person p
-SET face_count = (SELECT count(*) FROM face_detection fd WHERE fd.person_id = p.id),
-    updated_at = now()
+SET updated_at = now()
 WHERE p.id IN (SELECT DISTINCT person_id FROM to_del WHERE person_id IS NOT NULL);
 COMMIT;
 

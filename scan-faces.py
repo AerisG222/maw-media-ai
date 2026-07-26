@@ -640,11 +640,11 @@ def cmd_cluster(rebuild_all: bool = False) -> None:
             person_id = str(uuid.uuid7())
             cur.execute(
                 """
-                INSERT INTO person (id, representative_embedding, face_count)
-                VALUES (%s, %s::vector, %s)
+                INSERT INTO person (id, representative_embedding)
+                VALUES (%s, %s::vector)
                 RETURNING id
                 """,
-                (person_id, centroid_str, len(indices)),
+                (person_id, centroid_str),
             )
             person_id = cur.fetchone()["id"]
 
@@ -781,7 +781,7 @@ def cmd_merge_clusters(threshold: float, dry_run: bool) -> None:
     """
     For each unnamed cluster, find the nearest named-person centroid via
     pgvector.  If the cosine distance is below *threshold*, merge the cluster
-    into that person (move all its faces, recompute face_count, delete the
+    into that person (move all its faces, delete the
     empty cluster).
 
     Always run with --dry-run first to review the plan before committing.
@@ -800,7 +800,7 @@ def cmd_merge_clusters(threshold: float, dry_run: bool) -> None:
                 nearest.name            AS name,
                 (p_unnamed.representative_embedding <=> nearest.representative_embedding)
                                         AS distance
-            FROM person p_unnamed
+            FROM person_v p_unnamed
             CROSS JOIN LATERAL (
                 SELECT p.id, p.name, p.representative_embedding
                 FROM person p
@@ -849,14 +849,10 @@ def cmd_merge_clusters(threshold: float, dry_run: bool) -> None:
                 "UPDATE face_detection SET person_id = %s WHERE person_id = %s",
                 (named_id, unnamed_id),
             )
+            # face_count is computed by the person_v view.
             cur.execute(
-                """
-                UPDATE person
-                SET face_count = (SELECT COUNT(*) FROM face_detection WHERE person_id = %s),
-                    updated_at = now()
-                WHERE id = %s
-                """,
-                (named_id, named_id),
+                "UPDATE person SET updated_at = now() WHERE id = %s",
+                (named_id,),
             )
             cur.execute("DELETE FROM person WHERE id = %s", (unnamed_id,))
         conn.commit()
@@ -899,7 +895,7 @@ def cmd_stats() -> None:
         cur.execute(
             """
             SELECT per.name, per.face_count
-            FROM person per
+            FROM person_v per
             WHERE per.name IS NOT NULL
             ORDER BY per.face_count DESC
             LIMIT 20
