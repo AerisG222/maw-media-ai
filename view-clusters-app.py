@@ -231,12 +231,12 @@ def fetch_persons_page(
 ) -> list:
     """Return a page of persons with one sample face for preview.
 
-    Each row: (id, name, cluster_label, face_count, sample_path, sample_score, sample_bbox, sample_face_id)
+    Each row: (id, name, face_count, sample_path, sample_score, sample_bbox, sample_face_id)
     """
     like = f"%{search}%" if search else None
     return execute_query(
         """
-        SELECT p.id, p.name, p.cluster_label, p.face_count,
+        SELECT p.id, p.name, p.face_count,
                ph.file_path AS sample_path, fd.detection_score AS sample_score,
                fd.bounding_box AS sample_bbox, fd.id AS sample_face_id
         FROM person p
@@ -336,7 +336,7 @@ def fetch_persons_by_ids(page_ids: list[str]) -> list:
         return []
     return execute_query(
         """
-        SELECT p.id, p.name, p.cluster_label, p.face_count,
+        SELECT p.id, p.name, p.face_count,
                ph.file_path AS sample_path, fd.detection_score AS sample_score,
                fd.bounding_box AS sample_bbox, fd.id AS sample_face_id
         FROM person p
@@ -357,9 +357,9 @@ def fetch_persons_by_ids(page_ids: list[str]) -> list:
 
 
 def fetch_person(person_id: str) -> tuple | None:
-    """Return person data: (id, name, cluster_label, face_count, preferred_face_id)."""
+    """Return person data: (id, name, face_count, preferred_face_id)."""
     return execute_single(
-        "SELECT id, name, cluster_label, face_count, preferred_face_id FROM person WHERE id = %s",
+        "SELECT id, name, face_count, preferred_face_id FROM person WHERE id = %s",
         (person_id,),
     )
 
@@ -1113,7 +1113,6 @@ def render_persons_step():
             (
                 person_id,
                 name,
-                _,
                 face_count,
                 sample_path,
                 sample_score,
@@ -1263,8 +1262,8 @@ def render_faces_step(person_id: str):
         st.error("Selected person not found in database.")
         navigate_to_persons()
 
-    _, current_name, _, face_count, preferred_face_id = (
-        person_row if person_row else (None, "Unknown", None, 0, None)
+    _, current_name, face_count, preferred_face_id = (
+        person_row if person_row else (None, "Unknown", 0, None)
     )
     preferred_face_id = str(preferred_face_id) if preferred_face_id else None
 

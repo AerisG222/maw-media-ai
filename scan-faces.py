@@ -515,23 +515,60 @@ def cmd_scan(photo_dir: str, workers: int = SCAN_LOADER_THREADS) -> None:
 # ---------------------------------------------------------------------------
 
 
-def cmd_cluster() -> None:
+def _count_named_assignments() -> int:
+    """Faces currently assigned to a NAMED person (i.e. manual labelling work)."""
+    conn = get_connection(DB_DSN)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM face_detection fd
+                JOIN person p ON p.id = fd.person_id
+                WHERE p.name IS NOT NULL
+                """
+            )
+            return cur.fetchone()["n"]
+    finally:
+        conn.close()
+
+
+def cmd_cluster(rebuild_all: bool = False) -> None:
     """
-    Load all embeddings from face_detection, run HDBSCAN, write persons rows,
-    and update face_detection.person_id.
+    Cluster face embeddings with HDBSCAN into person rows.
+
+    By default only *unsettled* faces are considered — those that are
+    unassigned, or sitting in an unnamed cluster.  Faces belonging to a NAMED
+    person are left completely alone, so re-running this never disturbs manual
+    labelling work.
+
+    Pass rebuild_all=True to cluster every face from scratch.  That DISCARDS
+    all manual person assignments and is intentionally hard to trigger.
     """
     log.info("Loading embeddings from database for clustering…")
     conn = get_connection(DB_DSN)
 
-    with conn.cursor() as cur:
-        cur.execute(
-            """
+    if rebuild_all:
+        log.warning("--rebuild-all: clustering ALL faces; manual assignments will be lost.")
+        candidate_sql = """
             SELECT id, embedding::text
             FROM face_detection
             WHERE embedding IS NOT NULL
             ORDER BY id
             """
-        )
+    else:
+        # Exclude faces already assigned to a named person: those are settled.
+        candidate_sql = """
+            SELECT fd.id, fd.embedding::text
+            FROM face_detection fd
+            LEFT JOIN person p ON p.id = fd.person_id
+            WHERE fd.embedding IS NOT NULL
+              AND (fd.person_id IS NULL OR p.name IS NULL)
+            ORDER BY fd.id
+            """
+
+    with conn.cursor() as cur:
+        cur.execute(candidate_sql)
         rows = cur.fetchall()
 
     if not rows:
@@ -590,9 +627,7 @@ def cmd_cluster() -> None:
     person_count = 0
     face_update_count = 0
 
-    for cluster_label, indices in tqdm(
-        cluster_to_indices.items(), desc="Writing clusters"
-    ):
+    for indices in tqdm(cluster_to_indices.values(), desc="Writing clusters"):
         cluster_embeddings = X[indices]
         centroid = cluster_embeddings.mean(axis=0)
         norm = np.linalg.norm(centroid)
@@ -605,11 +640,11 @@ def cmd_cluster() -> None:
             person_id = str(uuid.uuid7())
             cur.execute(
                 """
-                INSERT INTO person (id, cluster_label, representative_embedding, face_count)
-                VALUES (%s, %s, %s::vector, %s)
+                INSERT INTO person (id, representative_embedding, face_count)
+                VALUES (%s, %s::vector, %s)
                 RETURNING id
                 """,
-                (person_id, int(cluster_label), centroid_str, len(indices)),
+                (person_id, centroid_str, len(indices)),
             )
             person_id = cur.fetchone()["id"]
 
@@ -760,7 +795,6 @@ def cmd_merge_clusters(threshold: float, dry_run: bool) -> None:
             """
             SELECT
                 p_unnamed.id            AS unnamed_id,
-                p_unnamed.cluster_label AS cluster_label,
                 p_unnamed.face_count    AS face_count,
                 nearest.id              AS named_id,
                 nearest.name            AS name,
@@ -796,11 +830,7 @@ def cmd_merge_clusters(threshold: float, dry_run: bool) -> None:
         f"({total_faces:,} faces total):"
     )
     for row in candidates:
-        label = (
-            f"cluster_{row['cluster_label']}"
-            if row["cluster_label"] is not None
-            else str(row["unnamed_id"])[:8]
-        )
+        label = str(row["unnamed_id"])[:8]
         log.info(
             f"  {label:<20} ({row['face_count'] or 0:>5} faces)"
             f"  →  \"{row['name']}\"  distance={row['distance']:.4f}"
@@ -927,8 +957,16 @@ def main() -> None:
     )
 
     # cluster
-    sub.add_parser(
-        "cluster", help="Cluster stored embeddings into person using HDBSCAN."
+    p_cluster = sub.add_parser(
+        "cluster",
+        help="Cluster unassigned/unnamed-cluster faces into persons using HDBSCAN "
+             "(faces belonging to a named person are left untouched).",
+    )
+    p_cluster.add_argument(
+        "--rebuild-all",
+        action="store_true",
+        help="Cluster EVERY face from scratch, discarding all manual person "
+             "assignments. Prompts for confirmation.",
     )
 
     # suggest
@@ -970,7 +1008,16 @@ def main() -> None:
     if args.command == "scan":
         cmd_scan(args.photo_dir, args.workers)
     elif args.command == "cluster":
-        cmd_cluster()
+        if args.rebuild_all:
+            n = _count_named_assignments()
+            print(
+                f"\n  WARNING: --rebuild-all will discard {n:,} manual face "
+                f"assignment(s) across all named people.\n"
+            )
+            if input("  Type 'rebuild' to confirm: ").strip() != "rebuild":
+                print("  Aborted.")
+                return
+        cmd_cluster(args.rebuild_all)
     elif args.command == "suggest":
         cmd_suggest(args.threshold)
     elif args.command == "merge-clusters":

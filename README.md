@@ -166,7 +166,7 @@ suggestions. This is by far the most efficient workflow for large libraries.
 **Or SQL directly** (person `id` is a UUID):
 ```sql
 -- Find the biggest unnamed clusters
-SELECT per.id, per.face_count, per.cluster_label
+SELECT per.id, per.face_count
 FROM person per WHERE per.name IS NULL ORDER BY face_count DESC;
 
 -- Name a person

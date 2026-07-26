@@ -31,7 +31,6 @@ CREATE TABLE IF NOT EXISTS photo (
 CREATE TABLE IF NOT EXISTS person (
     id                          UUID PRIMARY KEY,
     name                        VARCHAR(255),            -- set by human operator
-    cluster_label               INT,                     -- HDBSCAN cluster id
     representative_embedding    vector(512),             -- centroid of all face embeddings
     face_count                  INT DEFAULT 0,
     created_at                  TIMESTAMPTZ DEFAULT now(),
