@@ -10,7 +10,7 @@ Usage:
     # Scan new/unscanned photos (already-scanned photos are skipped):
     python scan_faces.py scan --photo-dir /path/to/photos
 
-    # Cluster detected faces into persons:
+    # Cluster detected faces into person:
     python scan_faces.py cluster
 
     # Suggest person assignments for unassigned faces (writes suggested_person_id):
@@ -119,7 +119,7 @@ def get_connection(dsn: str) -> psycopg.Connection:
 
 def check_schema(conn: psycopg.Connection) -> bool:
     """Check if the required tables exist. Returns True if schema is present."""
-    required_tables = {"photos", "persons", "face_detections"}
+    required_tables = {"photo", "person", "face_detection"}
     with conn.cursor() as cur:
         cur.execute("""
             SELECT table_name FROM information_schema.tables
@@ -132,7 +132,7 @@ def check_schema(conn: psycopg.Connection) -> bool:
 def get_already_scanned_paths(conn: psycopg.Connection) -> set[str]:
     """Return file paths that already have a photos row (success or error)."""
     with conn.cursor() as cur:
-        cur.execute("SELECT file_path FROM photos")
+        cur.execute("SELECT file_path FROM photo")
         return {row["file_path"] for row in cur.fetchall()}
 
 
@@ -145,13 +145,13 @@ def upsert_photo(
     """Insert or update a photos row; return the photo id (UUID string)."""
     with conn.cursor() as cur:
         # Try to fetch existing photo id first
-        cur.execute("SELECT id FROM photos WHERE file_path = %s", (file_path,))
+        cur.execute("SELECT id FROM photo WHERE file_path = %s", (file_path,))
         row = cur.fetchone()
         if row:
             # Update scan_error if needed
             cur.execute(
                 """
-                UPDATE photos SET scanned_at = now(), scan_error = %s WHERE id = %s
+                UPDATE photo SET scanned_at = now(), scan_error = %s WHERE id = %s
                 """,
                 (error, row["id"]),
             )
@@ -160,7 +160,7 @@ def upsert_photo(
         photo_id = str(uuid.uuid7())
         cur.execute(
             """
-            INSERT INTO photos (id, file_path, file_name, scan_error)
+            INSERT INTO photo (id, file_path, file_name, scan_error)
             VALUES (%s, %s, %s, %s)
             RETURNING id
             """,
@@ -189,7 +189,7 @@ def insert_face(
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO face_detections
+            INSERT INTO face_detection
                 (id, photo_id, bounding_box, embedding, detection_score, face_width_px, face_height_px, person_id)
             VALUES (%s, %s, %s, %s::vector, %s, %s, %s, %s)
             RETURNING id
@@ -507,7 +507,7 @@ def cmd_scan(photo_dir: str, workers: int = SCAN_LOADER_THREADS) -> None:
         f"Scan complete. {len(images_to_scan):,} images processed, "
         f"{total_faces:,} faces detected, {errors:,} errors."
     )
-    log.info("Run 'cluster' command next to group faces into persons.")
+    log.info("Run 'cluster' command next to group faces into person.")
 
 
 # ---------------------------------------------------------------------------
@@ -517,8 +517,8 @@ def cmd_scan(photo_dir: str, workers: int = SCAN_LOADER_THREADS) -> None:
 
 def cmd_cluster() -> None:
     """
-    Load all embeddings from face_detections, run HDBSCAN, write persons rows,
-    and update face_detections.person_id.
+    Load all embeddings from face_detection, run HDBSCAN, write persons rows,
+    and update face_detection.person_id.
     """
     log.info("Loading embeddings from database for clustering…")
     conn = get_connection(DB_DSN)
@@ -527,7 +527,7 @@ def cmd_cluster() -> None:
         cur.execute(
             """
             SELECT id, embedding::text
-            FROM face_detections
+            FROM face_detection
             WHERE embedding IS NOT NULL
             ORDER BY id
             """
@@ -584,7 +584,7 @@ def cmd_cluster() -> None:
 
     # Clear existing auto-generated persons (keep manually named ones).
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM persons WHERE name IS NULL")
+        cur.execute("DELETE FROM person WHERE name IS NULL")
     conn.commit()
 
     person_count = 0
@@ -605,7 +605,7 @@ def cmd_cluster() -> None:
             person_id = str(uuid.uuid7())
             cur.execute(
                 """
-                INSERT INTO persons (id, cluster_label, representative_embedding, face_count)
+                INSERT INTO person (id, cluster_label, representative_embedding, face_count)
                 VALUES (%s, %s, %s::vector, %s)
                 RETURNING id
                 """,
@@ -617,7 +617,7 @@ def cmd_cluster() -> None:
         cluster_face_ids = [face_ids[i] for i in indices]
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE face_detections SET person_id = %s WHERE id = ANY(%s)",
+                "UPDATE face_detection SET person_id = %s WHERE id = ANY(%s)",
                 (person_id, cluster_face_ids),
             )
         face_update_count += len(cluster_face_ids)
@@ -660,8 +660,8 @@ def cmd_suggest(threshold: float) -> None:
         cur.execute(
             """
             SELECT COUNT(*)
-            FROM face_detections fd
-            LEFT JOIN persons p ON p.id = fd.person_id
+            FROM face_detection fd
+            LEFT JOIN person p ON p.id = fd.person_id
             WHERE (fd.person_id IS NULL OR p.name IS NULL)
               AND fd.embedding IS NOT NULL
             """
@@ -679,13 +679,13 @@ def cmd_suggest(threshold: float) -> None:
     with conn.cursor() as cur:
         cur.execute(
             """
-            UPDATE face_detections fd
+            UPDATE face_detection fd
             SET suggested_person_id = NULL,
                 suggestion_score    = NULL
             FROM (
                 SELECT fd2.id
-                FROM face_detections fd2
-                LEFT JOIN persons p ON p.id = fd2.person_id
+                FROM face_detection fd2
+                LEFT JOIN person p ON p.id = fd2.person_id
                 WHERE (fd2.person_id IS NULL OR p.name IS NULL)
             ) candidates
             WHERE fd.id = candidates.id
@@ -699,7 +699,7 @@ def cmd_suggest(threshold: float) -> None:
     with conn.cursor() as cur:
         cur.execute(
             """
-            UPDATE face_detections fd
+            UPDATE face_detection fd
             SET suggested_person_id = best.person_id,
                 suggestion_score    = best.distance
             FROM (
@@ -707,11 +707,11 @@ def cmd_suggest(threshold: float) -> None:
                     fd.id AS face_id,
                     nearest.id       AS person_id,
                     (fd.embedding <=> nearest.representative_embedding) AS distance
-                FROM face_detections fd
-                LEFT JOIN persons src_p ON src_p.id = fd.person_id
+                FROM face_detection fd
+                LEFT JOIN person src_p ON src_p.id = fd.person_id
                 CROSS JOIN LATERAL (
                     SELECT p.id, p.representative_embedding
-                    FROM persons p
+                    FROM person p
                     WHERE p.name IS NOT NULL
                       AND p.representative_embedding IS NOT NULL
                     ORDER BY p.representative_embedding <=> fd.embedding
@@ -766,10 +766,10 @@ def cmd_merge_clusters(threshold: float, dry_run: bool) -> None:
                 nearest.name            AS name,
                 (p_unnamed.representative_embedding <=> nearest.representative_embedding)
                                         AS distance
-            FROM persons p_unnamed
+            FROM person p_unnamed
             CROSS JOIN LATERAL (
                 SELECT p.id, p.name, p.representative_embedding
-                FROM persons p
+                FROM person p
                 WHERE p.name IS NOT NULL
                   AND p.representative_embedding IS NOT NULL
                 ORDER BY p.representative_embedding <=> p_unnamed.representative_embedding
@@ -816,19 +816,19 @@ def cmd_merge_clusters(threshold: float, dry_run: bool) -> None:
         named_id = row["named_id"]
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE face_detections SET person_id = %s WHERE person_id = %s",
+                "UPDATE face_detection SET person_id = %s WHERE person_id = %s",
                 (named_id, unnamed_id),
             )
             cur.execute(
                 """
-                UPDATE persons
-                SET face_count = (SELECT COUNT(*) FROM face_detections WHERE person_id = %s),
+                UPDATE person
+                SET face_count = (SELECT COUNT(*) FROM face_detection WHERE person_id = %s),
                     updated_at = now()
                 WHERE id = %s
                 """,
                 (named_id, named_id),
             )
-            cur.execute("DELETE FROM persons WHERE id = %s", (unnamed_id,))
+            cur.execute("DELETE FROM person WHERE id = %s", (unnamed_id,))
         conn.commit()
 
     log.info(
@@ -848,28 +848,28 @@ def cmd_stats() -> None:
     conn = get_connection(DB_DSN)
 
     with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) AS n FROM photos")
+        cur.execute("SELECT COUNT(*) AS n FROM photo")
         n_photos = cur.fetchone()["n"]
 
-        cur.execute("SELECT COUNT(*) AS n FROM photos WHERE scan_error IS NOT NULL")
+        cur.execute("SELECT COUNT(*) AS n FROM photo WHERE scan_error IS NOT NULL")
         n_errors = cur.fetchone()["n"]
 
-        cur.execute("SELECT COUNT(*) AS n FROM face_detections")
+        cur.execute("SELECT COUNT(*) AS n FROM face_detection")
         n_faces = cur.fetchone()["n"]
 
-        cur.execute("SELECT COUNT(*) AS n FROM face_detections WHERE person_id IS NULL")
+        cur.execute("SELECT COUNT(*) AS n FROM face_detection WHERE person_id IS NULL")
         n_unassigned = cur.fetchone()["n"]
 
-        cur.execute("SELECT COUNT(*) AS n FROM persons")
+        cur.execute("SELECT COUNT(*) AS n FROM person")
         n_persons = cur.fetchone()["n"]
 
-        cur.execute("SELECT COUNT(*) AS n FROM persons WHERE name IS NOT NULL")
+        cur.execute("SELECT COUNT(*) AS n FROM person WHERE name IS NOT NULL")
         n_named = cur.fetchone()["n"]
 
         cur.execute(
             """
             SELECT per.name, per.face_count
-            FROM persons per
+            FROM person per
             WHERE per.name IS NOT NULL
             ORDER BY per.face_count DESC
             LIMIT 20
@@ -928,7 +928,7 @@ def main() -> None:
 
     # cluster
     sub.add_parser(
-        "cluster", help="Cluster stored embeddings into persons using HDBSCAN."
+        "cluster", help="Cluster stored embeddings into person using HDBSCAN."
     )
 
     # suggest

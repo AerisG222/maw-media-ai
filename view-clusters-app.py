@@ -100,11 +100,11 @@ def remove_faces_from_person(person_id: str, face_ids: list[str]):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE face_detections SET person_id = NULL WHERE id = ANY(%s::uuid[])",
+                "UPDATE face_detection SET person_id = NULL WHERE id = ANY(%s::uuid[])",
                 (face_ids,),
             )
             cur.execute(
-                "UPDATE persons SET face_count = (SELECT COUNT(*) FROM face_detections WHERE person_id = %s) WHERE id = %s",
+                "UPDATE person SET face_count = (SELECT COUNT(*) FROM face_detection WHERE person_id = %s) WHERE id = %s",
                 (person_id, person_id),
             )
             conn.commit()
@@ -115,19 +115,19 @@ def assign_faces_to_person(person_id: str, face_ids: list[str]):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE face_detections SET person_id = %s WHERE id = ANY(%s::uuid[])",
+                "UPDATE face_detection SET person_id = %s WHERE id = ANY(%s::uuid[])",
                 (person_id, face_ids),
             )
             cur.execute(
-                "UPDATE persons SET face_count = (SELECT COUNT(*) FROM face_detections WHERE person_id = %s) WHERE id = %s",
+                "UPDATE person SET face_count = (SELECT COUNT(*) FROM face_detection WHERE person_id = %s) WHERE id = %s",
                 (person_id, person_id),
             )
             cur.execute(
                 """
-                UPDATE persons
+                UPDATE person
                 SET representative_embedding = (
                     SELECT avg(embedding)::vector
-                    FROM face_detections
+                    FROM face_detection
                     WHERE person_id = %s AND embedding IS NOT NULL
                 ),
                 updated_at = now()
@@ -146,7 +146,7 @@ def set_preferred_face(person_id: str, face_id: str | None):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE persons SET preferred_face_id = %s WHERE id = %s",
+                "UPDATE person SET preferred_face_id = %s WHERE id = %s",
                 (face_id, person_id),
             )
             conn.commit()
@@ -157,10 +157,10 @@ def clear_cluster(person_id: str):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE face_detections SET person_id = NULL WHERE person_id = %s",
+                "UPDATE face_detection SET person_id = NULL WHERE person_id = %s",
                 (person_id,),
             )
-            cur.execute("DELETE FROM persons WHERE id = %s", (person_id,))
+            cur.execute("DELETE FROM person WHERE id = %s", (person_id,))
             conn.commit()
 
 
@@ -169,19 +169,19 @@ def merge_persons_into(target_id: str, source_ids: list[str]):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE face_detections SET person_id = %s WHERE person_id = ANY(%s::uuid[])",
+                "UPDATE face_detection SET person_id = %s WHERE person_id = ANY(%s::uuid[])",
                 (target_id, source_ids),
             )
             cur.execute(
-                "UPDATE persons SET face_count = (SELECT COUNT(*) FROM face_detections WHERE person_id = %s) WHERE id = %s",
+                "UPDATE person SET face_count = (SELECT COUNT(*) FROM face_detection WHERE person_id = %s) WHERE id = %s",
                 (target_id, target_id),
             )
             cur.execute(
                 """
-                UPDATE persons
+                UPDATE person
                 SET representative_embedding = (
                     SELECT avg(embedding)::vector
-                    FROM face_detections
+                    FROM face_detection
                     WHERE person_id = %s AND embedding IS NOT NULL
                 ),
                 updated_at = now()
@@ -190,21 +190,21 @@ def merge_persons_into(target_id: str, source_ids: list[str]):
                 (target_id, target_id),
             )
             # If the target is unnamed, inherit the name from the first named source.
-            cur.execute("SELECT name FROM persons WHERE id = %s", (target_id,))
+            cur.execute("SELECT name FROM person WHERE id = %s", (target_id,))
             target_row = cur.fetchone()
             if target_row and target_row[0] is None:
                 cur.execute(
-                    "SELECT name FROM persons WHERE id = ANY(%s::uuid[]) AND name IS NOT NULL ORDER BY name LIMIT 1",
+                    "SELECT name FROM person WHERE id = ANY(%s::uuid[]) AND name IS NOT NULL ORDER BY name LIMIT 1",
                     (source_ids,),
                 )
                 name_row = cur.fetchone()
                 if name_row:
                     cur.execute(
-                        "UPDATE persons SET name = %s WHERE id = %s",
+                        "UPDATE person SET name = %s WHERE id = %s",
                         (name_row[0], target_id),
                     )
             cur.execute(
-                "DELETE FROM persons WHERE id = ANY(%s::uuid[])",
+                "DELETE FROM person WHERE id = ANY(%s::uuid[])",
                 (source_ids,),
             )
             conn.commit()
@@ -217,7 +217,7 @@ def fetch_persons_count(
 ) -> int:
     like = f"%{search}%" if search else None
     result = execute_single(
-        "SELECT COUNT(1) FROM persons WHERE (%s IS NULL OR name ILIKE %s OR id::text ILIKE %s) AND (NOT %s OR name IS NULL)",
+        "SELECT COUNT(1) FROM person WHERE (%s IS NULL OR name ILIKE %s OR id::text ILIKE %s) AND (NOT %s OR name IS NULL)",
         (search, like, like, unnamed_only),
     )
     return result[0] if result else 0
@@ -239,16 +239,16 @@ def fetch_persons_page(
         SELECT p.id, p.name, p.cluster_label, p.face_count,
                ph.file_path AS sample_path, fd.detection_score AS sample_score,
                fd.bounding_box AS sample_bbox, fd.id AS sample_face_id
-        FROM persons p
+        FROM person p
         LEFT JOIN LATERAL (
             SELECT fd.id, fd.photo_id, fd.detection_score, fd.bounding_box
-            FROM face_detections fd
+            FROM face_detection fd
             WHERE fd.person_id = p.id
             ORDER BY (fd.id = p.preferred_face_id) DESC NULLS LAST,
                      fd.detection_score DESC NULLS LAST, fd.id
             LIMIT 1
         ) fd ON true
-        LEFT JOIN photos ph ON ph.id = fd.photo_id
+        LEFT JOIN photo ph ON ph.id = fd.photo_id
         WHERE (%s IS NULL OR p.name ILIKE %s OR p.id::text ILIKE %s)
           AND (NOT %s OR p.name IS NULL)
         ORDER BY p.face_count DESC NULLS LAST, p.id
@@ -270,7 +270,7 @@ def fetch_all_persons_embeddings(
     rows = execute_query(
         """
         SELECT p.id, p.face_count, p.representative_embedding::text
-        FROM persons p
+        FROM person p
         WHERE (%s IS NULL OR p.name ILIKE %s OR p.id::text ILIKE %s)
           AND (NOT %s OR p.name IS NULL)
         ORDER BY p.face_count DESC NULLS LAST, p.id
@@ -339,16 +339,16 @@ def fetch_persons_by_ids(page_ids: list[str]) -> list:
         SELECT p.id, p.name, p.cluster_label, p.face_count,
                ph.file_path AS sample_path, fd.detection_score AS sample_score,
                fd.bounding_box AS sample_bbox, fd.id AS sample_face_id
-        FROM persons p
+        FROM person p
         LEFT JOIN LATERAL (
             SELECT fd.id, fd.photo_id, fd.detection_score, fd.bounding_box
-            FROM face_detections fd
+            FROM face_detection fd
             WHERE fd.person_id = p.id
             ORDER BY (fd.id = p.preferred_face_id) DESC NULLS LAST,
                      fd.detection_score DESC NULLS LAST, fd.id
             LIMIT 1
         ) fd ON true
-        LEFT JOIN photos ph ON ph.id = fd.photo_id
+        LEFT JOIN photo ph ON ph.id = fd.photo_id
         WHERE p.id = ANY(%s::uuid[])
         ORDER BY array_position(%s::uuid[], p.id)
         """,
@@ -359,7 +359,7 @@ def fetch_persons_by_ids(page_ids: list[str]) -> list:
 def fetch_person(person_id: str) -> tuple | None:
     """Return person data: (id, name, cluster_label, face_count, preferred_face_id)."""
     return execute_single(
-        "SELECT id, name, cluster_label, face_count, preferred_face_id FROM persons WHERE id = %s",
+        "SELECT id, name, cluster_label, face_count, preferred_face_id FROM person WHERE id = %s",
         (person_id,),
     )
 
@@ -367,7 +367,7 @@ def fetch_person(person_id: str) -> tuple | None:
 def fetch_face_count_for_person(person_id: str) -> int:
     """Return the number of faces for a person."""
     result = execute_single(
-        "SELECT COUNT(*) FROM face_detections WHERE person_id = %s",
+        "SELECT COUNT(*) FROM face_detection WHERE person_id = %s",
         (person_id,),
     )
     return result[0] if result else 0
@@ -385,8 +385,8 @@ def fetch_faces_for_person(
     return execute_query(
         """
         SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score
-        FROM face_detections fd
-        JOIN photos p ON fd.photo_id = p.id
+        FROM face_detection fd
+        JOIN photo p ON fd.photo_id = p.id
         WHERE fd.person_id = %s
         ORDER BY fd.detection_score DESC NULLS LAST, fd.id
         LIMIT %s OFFSET %s
@@ -398,7 +398,7 @@ def fetch_faces_for_person(
 def fetch_face_count_for_unknown() -> int:
     """Return the number of faces that are not associated with any person."""
     result = execute_single(
-        "SELECT COUNT(*) FROM face_detections WHERE person_id IS NULL",
+        "SELECT COUNT(*) FROM face_detection WHERE person_id IS NULL",
     )
     return result[0] if result else 0
 
@@ -414,8 +414,8 @@ def fetch_faces_for_unknown(
     return execute_query(
         """
         SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score
-        FROM face_detections fd
-        JOIN photos p ON fd.photo_id = p.id
+        FROM face_detection fd
+        JOIN photo p ON fd.photo_id = p.id
         WHERE fd.person_id IS NULL
         ORDER BY fd.detection_score DESC NULLS LAST, fd.id
         LIMIT %s OFFSET %s
@@ -436,12 +436,12 @@ def fetch_faces_for_unknown_by_similarity(
     return execute_query(
         """
         SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score
-        FROM face_detections fd
-        JOIN photos p ON fd.photo_id = p.id
+        FROM face_detection fd
+        JOIN photo p ON fd.photo_id = p.id
         WHERE fd.person_id IS NULL
           AND fd.embedding IS NOT NULL
         ORDER BY fd.embedding <=> (
-            SELECT representative_embedding FROM persons WHERE id = %s
+            SELECT representative_embedding FROM person WHERE id = %s
         ) ASC
         LIMIT %s OFFSET %s
         """,
@@ -460,16 +460,16 @@ def fetch_all_persons_for_merge(exclude_id: str) -> list:
                ph.file_path  AS sample_path,
                fd.bounding_box AS sample_bbox,
                fd.id AS sample_face_id
-        FROM persons p
+        FROM person p
         LEFT JOIN LATERAL (
             SELECT fd.id, fd.photo_id, fd.bounding_box
-            FROM face_detections fd
+            FROM face_detection fd
             WHERE fd.person_id = p.id
             ORDER BY (fd.id = p.preferred_face_id) DESC NULLS LAST,
                      fd.detection_score DESC NULLS LAST
             LIMIT 1
         ) fd ON true
-        LEFT JOIN photos ph ON ph.id = fd.photo_id
+        LEFT JOIN photo ph ON ph.id = fd.photo_id
         WHERE p.id != %s
           AND p.name IS NOT NULL
         ORDER BY p.name
@@ -486,7 +486,7 @@ def fetch_named_persons_for_assign() -> list:
     return execute_query(
         """
         SELECT id, name, face_count
-        FROM persons
+        FROM person
         WHERE name IS NOT NULL
         ORDER BY name
         """,
@@ -503,14 +503,14 @@ def cleanup_persons() -> tuple[int, int]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE persons
+                UPDATE person
                 SET face_count = (
-                    SELECT COUNT(*) FROM face_detections WHERE person_id = persons.id
+                    SELECT COUNT(*) FROM face_detection WHERE person_id = person.id
                 )
                 """
             )
             n_updated = cur.rowcount
-            cur.execute("DELETE FROM persons WHERE face_count = 0")
+            cur.execute("DELETE FROM person WHERE face_count = 0")
             n_deleted = cur.rowcount
             conn.commit()
     return n_updated, n_deleted
@@ -524,8 +524,8 @@ def fetch_suggested_persons() -> list:
     return execute_query(
         """
         SELECT per.id, per.name, COUNT(*) AS suggestion_count
-        FROM face_detections fd
-        JOIN persons per ON per.id = fd.suggested_person_id
+        FROM face_detection fd
+        JOIN person per ON per.id = fd.suggested_person_id
         WHERE fd.suggested_person_id IS NOT NULL
         GROUP BY per.id, per.name
         ORDER BY per.name
@@ -539,7 +539,7 @@ def fetch_suggestion_count(person_id: str | None = None) -> int:
         result = execute_single(
             """
             SELECT COUNT(*)
-            FROM face_detections
+            FROM face_detection
             WHERE suggested_person_id = %s
             """,
             (person_id,),
@@ -548,7 +548,7 @@ def fetch_suggestion_count(person_id: str | None = None) -> int:
         result = execute_single(
             """
             SELECT COUNT(*)
-            FROM face_detections
+            FROM face_detection
             WHERE suggested_person_id IS NOT NULL
             """
         )
@@ -580,9 +580,9 @@ def fetch_suggestions_page(
                fd.suggested_person_id,
                per.name  AS suggested_name,
                fd.suggestion_score
-        FROM face_detections fd
-        JOIN photos  ph  ON ph.id  = fd.photo_id
-        JOIN persons per ON per.id = fd.suggested_person_id
+        FROM face_detection fd
+        JOIN photo  ph  ON ph.id  = fd.photo_id
+        JOIN person per ON per.id = fd.suggested_person_id
         WHERE fd.suggested_person_id IS NOT NULL
           {where_extra}
         ORDER BY fd.suggestion_score ASC
@@ -598,7 +598,7 @@ def confirm_suggestions(face_ids: list[str]) -> None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE face_detections
+                UPDATE face_detection
                 SET person_id           = suggested_person_id,
                     suggested_person_id = NULL,
                     suggestion_score    = NULL
@@ -610,18 +610,18 @@ def confirm_suggestions(face_ids: list[str]) -> None:
             # Recompute face_count and centroid for every affected person
             cur.execute(
                 """
-                UPDATE persons p
+                UPDATE person p
                 SET face_count = (
-                    SELECT COUNT(*) FROM face_detections WHERE person_id = p.id
+                    SELECT COUNT(*) FROM face_detection WHERE person_id = p.id
                 ),
                 representative_embedding = (
                     SELECT avg(fd.embedding)::vector
-                    FROM face_detections fd
+                    FROM face_detection fd
                     WHERE fd.person_id = p.id AND fd.embedding IS NOT NULL
                 ),
                 updated_at = now()
                 WHERE p.id IN (
-                    SELECT DISTINCT person_id FROM face_detections
+                    SELECT DISTINCT person_id FROM face_detection
                     WHERE id = ANY(%s::uuid[]) AND person_id IS NOT NULL
                 )
                 """,
@@ -640,7 +640,7 @@ def reject_suggestions(face_ids: list[str]) -> None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE face_detections
+                UPDATE face_detection
                 SET suggested_person_id = NULL,
                     suggestion_score    = NULL
                 WHERE id = ANY(%s::uuid[])
@@ -1328,7 +1328,7 @@ def render_faces_step(person_id: str):
         if st.button("Save name", key=f"save_name_{person_id}"):
             try:
                 execute_update(
-                    "UPDATE persons SET name = %s WHERE id = %s",
+                    "UPDATE person SET name = %s WHERE id = %s",
                     (new_name if new_name else None, person_id),
                 )
                 st.rerun()

@@ -1,6 +1,6 @@
 -- identify cases where scan duplicated a face within an image
 SELECT ph.file_path, fd.bounding_box, count(*) AS copies
-FROM face_detections fd JOIN photos ph ON ph.id = fd.photo_id
+FROM face_detection fd JOIN photo ph ON ph.id = fd.photo_id
 GROUP BY ph.file_path, fd.bounding_box
 HAVING count(*) > 1
 ORDER BY copies DESC;
@@ -17,14 +17,14 @@ WITH ranked AS (
                     (suggested_person_id IS NOT NULL) DESC,
                     id ASC
          ) AS rn
-  FROM face_detections
+  FROM face_detection
 )
 SELECT id, person_id FROM ranked WHERE rn > 1;
 
-DELETE FROM face_detections WHERE id IN (SELECT id FROM to_del);
+DELETE FROM face_detection WHERE id IN (SELECT id FROM to_del);
 
-UPDATE persons p
-SET face_count = (SELECT count(*) FROM face_detections fd WHERE fd.person_id = p.id),
+UPDATE person p
+SET face_count = (SELECT count(*) FROM face_detection fd WHERE fd.person_id = p.id),
     updated_at = now()
 WHERE p.id IN (SELECT DISTINCT person_id FROM to_del WHERE person_id IS NOT NULL);
 COMMIT;

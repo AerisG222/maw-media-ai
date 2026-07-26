@@ -154,7 +154,7 @@ python scan-faces.py stats
 
 ## Labelling persons
 
-After clustering, each person has a row in the `persons` table with
+After clustering, each person has a row in the `person` table with
 `name = NULL`. You label them once, then let `suggest` / `merge-clusters`
 fold the remaining unassigned faces into the named people.
 
@@ -167,10 +167,10 @@ suggestions. This is by far the most efficient workflow for large libraries.
 ```sql
 -- Find the biggest unnamed clusters
 SELECT per.id, per.face_count, per.cluster_label
-FROM persons per WHERE per.name IS NULL ORDER BY face_count DESC;
+FROM person per WHERE per.name IS NULL ORDER BY face_count DESC;
 
 -- Name a person
-UPDATE persons SET name = 'Jane Smith'
+UPDATE person SET name = 'Jane Smith'
 WHERE id = '00000000-0000-0000-0000-000000000000';
 ```
 
@@ -220,17 +220,17 @@ dotnet add package Pgvector
 **All photos containing a named person:**
 ```sql
 SELECT DISTINCT p.file_path
-FROM photos p
-JOIN face_detections fd ON fd.photo_id = p.id
-JOIN persons per        ON per.id = fd.person_id
+FROM photo p
+JOIN face_detection fd ON fd.photo_id = p.id
+JOIN person per        ON per.id = fd.person_id
 WHERE per.name = 'Jane Smith';
 ```
 
 **Everyone in a specific photo:**
 ```sql
 SELECT per.name, fd.bounding_box, fd.detection_score
-FROM face_detections fd
-JOIN persons per ON per.id = fd.person_id
+FROM face_detection fd
+JOIN person per ON per.id = fd.person_id
 WHERE fd.photo_id = $1
 ORDER BY fd.detection_score DESC;
 ```
@@ -238,11 +238,11 @@ ORDER BY fd.detection_score DESC;
 **Photos with multiple specific people (AND logic):**
 ```sql
 SELECT p.file_path
-FROM photos p
+FROM photo p
 WHERE (
     SELECT COUNT(DISTINCT per.name)
-    FROM face_detections fd
-    JOIN persons per ON per.id = fd.person_id
+    FROM face_detection fd
+    JOIN person per ON per.id = fd.person_id
     WHERE fd.photo_id = p.id
       AND per.name IN ('Jane Smith', 'John Smith')
 ) = 2;
@@ -252,8 +252,8 @@ WHERE (
 ```sql
 SELECT p.file_path, fd.detection_score,
        fd.embedding <=> $1::vector AS distance
-FROM face_detections fd
-JOIN photos p ON p.id = fd.photo_id
+FROM face_detection fd
+JOIN photo p ON p.id = fd.photo_id
 ORDER BY fd.embedding <=> $1::vector
 LIMIT 20;
 ```
