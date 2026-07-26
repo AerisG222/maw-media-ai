@@ -13,9 +13,9 @@ WITH ranked AS (
   SELECT id, person_id,
          ROW_NUMBER() OVER (
            PARTITION BY photo_id, bounding_box
-           ORDER BY is_validated DESC, (person_id IS NOT NULL) DESC,
+           ORDER BY (person_id IS NOT NULL) DESC,
                     (suggested_person_id IS NOT NULL) DESC,
-                    (blur_score IS NOT NULL) DESC, id ASC
+                    id ASC
          ) AS rn
   FROM face_detections
 )

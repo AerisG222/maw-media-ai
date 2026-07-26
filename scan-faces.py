@@ -13,7 +13,7 @@ Usage:
     # Cluster detected faces into persons:
     python scan_faces.py cluster
 
-    # Suggest person assignments for unvalidated faces (writes suggested_person_id):
+    # Suggest person assignments for unassigned faces (writes suggested_person_id):
     python scan_faces.py suggest
 
     # Show stats about current database state:
@@ -648,9 +648,9 @@ def cmd_suggest(threshold: float) -> None:
       - person_id IS NULL (completely unassigned), OR
       - person_id points to a person with name IS NULL (assigned to an unnamed cluster)
 
-    Already-suggested faces are re-evaluated so that re-running after labelling
-    more clusters can improve or replace earlier suggestions.  Validated faces
-    (is_validated = TRUE) in NAMED clusters are never touched.
+    Faces belonging to a NAMED person are considered settled and are never
+    touched.  Already-suggested candidates are re-evaluated so that re-running
+    after labelling more clusters can improve or replace earlier suggestions.
     """
     log.info(f"Running suggest with distance threshold {threshold:.3f}…")
     conn = get_connection(DB_DSN)
@@ -663,7 +663,6 @@ def cmd_suggest(threshold: float) -> None:
             FROM face_detections fd
             LEFT JOIN persons p ON p.id = fd.person_id
             WHERE (fd.person_id IS NULL OR p.name IS NULL)
-              AND fd.is_validated = FALSE
               AND fd.embedding IS NOT NULL
             """
         )
@@ -676,7 +675,7 @@ def cmd_suggest(threshold: float) -> None:
 
     log.info(f"{n_candidates:,} candidate face(s) to evaluate.")
 
-    # Reset any previous unvalidated suggestions so stale ones don't linger.
+    # Reset any previous suggestions on candidates so stale ones don't linger.
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -688,13 +687,12 @@ def cmd_suggest(threshold: float) -> None:
                 FROM face_detections fd2
                 LEFT JOIN persons p ON p.id = fd2.person_id
                 WHERE (fd2.person_id IS NULL OR p.name IS NULL)
-                  AND fd2.is_validated = FALSE
             ) candidates
             WHERE fd.id = candidates.id
             """
         )
     conn.commit()
-    log.info("Cleared previous unvalidated suggestions.")
+    log.info("Cleared previous suggestions on candidate faces.")
 
     # For each candidate, find the single closest named-person centroid and
     # write a suggestion if within the threshold.
@@ -720,7 +718,6 @@ def cmd_suggest(threshold: float) -> None:
                     LIMIT 1
                 ) nearest
                 WHERE (fd.person_id IS NULL OR src_p.name IS NULL)
-                  AND fd.is_validated = FALSE
                   AND fd.embedding   IS NOT NULL
                   AND (fd.embedding <=> nearest.representative_embedding) < %(threshold)s
             ) best

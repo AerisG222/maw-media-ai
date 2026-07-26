@@ -3,7 +3,6 @@
 -- Run this once against your Postgres 18 database before the first scan.
 -- Requires the pgvector extension: https://github.com/pgvector/pgvector
 -- =============================================================================
-
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ---------------------------------------------------------------------------
@@ -17,7 +16,7 @@ CREATE TABLE IF NOT EXISTS photos (
     file_path       TEXT NOT NULL UNIQUE,
     file_name       TEXT NOT NULL,
     scanned_at      TIMESTAMPTZ DEFAULT now(),
-    scan_error      TEXT                     -- NULL = scanned OK
+    scan_error      TEXT
 );
 
 -- ---------------------------------------------------------------------------
@@ -32,7 +31,9 @@ CREATE TABLE IF NOT EXISTS persons (
     representative_embedding    vector(512),             -- centroid of all face embeddings
     face_count                  INT DEFAULT 0,
     created_at                  TIMESTAMPTZ DEFAULT now(),
-    updated_at                  TIMESTAMPTZ DEFAULT now()
+    updated_at                  TIMESTAMPTZ DEFAULT now(),
+    preferred_face_id           UUID
+        REFERENCES face_detections(id) ON DELETE SET NULL
 );
 
 -- ---------------------------------------------------------------------------
@@ -50,7 +51,9 @@ CREATE TABLE IF NOT EXISTS face_detections (
     detection_score FLOAT NOT NULL,
     face_width_px   INT NOT NULL,
     face_height_px  INT NOT NULL,
-    created_at      TIMESTAMPTZ DEFAULT now()
+    created_at      TIMESTAMPTZ DEFAULT now(),
+    suggestion_score     FLOAT,
+    suggested_person_id  UUID REFERENCES persons(id) ON DELETE SET NULL
 );
 
 -- ---------------------------------------------------------------------------
@@ -76,6 +79,15 @@ CREATE INDEX IF NOT EXISTS face_detections_person_id_idx
 CREATE INDEX IF NOT EXISTS persons_name_idx
     ON persons(name)
     WHERE name IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS face_detections_suggested_person_idx
+    ON face_detections(suggested_person_id)
+    WHERE suggested_person_id IS NOT NULL;
+
+-- Candidate lookups (suggest, cluster) filter on "not yet assigned".
+CREATE INDEX IF NOT EXISTS face_detections_unassigned_idx
+    ON face_detections(person_id)
+    WHERE person_id IS NULL;
 
 
 -- ---------------------------------------------------------------------------
@@ -109,41 +121,3 @@ JOIN face_detections fd ON fd.photo_id = p.id
 JOIN persons per        ON per.id = fd.person_id
 WHERE per.name IS NOT NULL
 GROUP BY p.id, p.file_path, p.file_name;
-
-
--- ---------------------------------------------------------------------------
--- New columns on face_detections
--- ---------------------------------------------------------------------------
-
-ALTER TABLE face_detections
-    ADD COLUMN IF NOT EXISTS suggested_person_id  UUID    REFERENCES persons(id) ON DELETE SET NULL,
-    ADD COLUMN IF NOT EXISTS suggestion_score     FLOAT,
-    ADD COLUMN IF NOT EXISTS is_validated         BOOLEAN NOT NULL DEFAULT FALSE;
-
--- Blur scoring was removed; drop the column if an earlier schema created it.
-ALTER TABLE face_detections
-    DROP COLUMN IF EXISTS blur_score;
-
-
--- ---------------------------------------------------------------------------
--- New columns on persons
--- ---------------------------------------------------------------------------
-
--- UI-only: the face a human picked to represent the cluster in listings.
--- Purely presentational — it never feeds the matching/clustering logic.
-ALTER TABLE persons
-    ADD COLUMN IF NOT EXISTS preferred_face_id UUID
-        REFERENCES face_detections(id) ON DELETE SET NULL;
-
-
--- ---------------------------------------------------------------------------
--- Index to make the review query fast (pending suggestions for review)
--- ---------------------------------------------------------------------------
-
-CREATE INDEX IF NOT EXISTS face_detections_suggested_person_idx
-    ON face_detections(suggested_person_id)
-    WHERE suggested_person_id IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS face_detections_is_validated_idx
-    ON face_detections(is_validated)
-    WHERE is_validated = FALSE;

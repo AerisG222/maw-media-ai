@@ -157,7 +157,7 @@ def clear_cluster(person_id: str):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE face_detections SET person_id = NULL, is_validated = FALSE WHERE person_id = %s",
+                "UPDATE face_detections SET person_id = NULL WHERE person_id = %s",
                 (person_id,),
             )
             cur.execute("DELETE FROM persons WHERE id = %s", (person_id,))
@@ -527,7 +527,6 @@ def fetch_suggested_persons() -> list:
         FROM face_detections fd
         JOIN persons per ON per.id = fd.suggested_person_id
         WHERE fd.suggested_person_id IS NOT NULL
-          AND fd.is_validated = FALSE
         GROUP BY per.id, per.name
         ORDER BY per.name
         """,
@@ -542,7 +541,6 @@ def fetch_suggestion_count(person_id: str | None = None) -> int:
             SELECT COUNT(*)
             FROM face_detections
             WHERE suggested_person_id = %s
-              AND is_validated = FALSE
             """,
             (person_id,),
         )
@@ -552,7 +550,6 @@ def fetch_suggestion_count(person_id: str | None = None) -> int:
             SELECT COUNT(*)
             FROM face_detections
             WHERE suggested_person_id IS NOT NULL
-              AND is_validated = FALSE
             """
         )
     return result[0] if result else 0
@@ -587,7 +584,6 @@ def fetch_suggestions_page(
         JOIN photos  ph  ON ph.id  = fd.photo_id
         JOIN persons per ON per.id = fd.suggested_person_id
         WHERE fd.suggested_person_id IS NOT NULL
-          AND fd.is_validated = FALSE
           {where_extra}
         ORDER BY fd.suggestion_score ASC
         LIMIT %s OFFSET %s
@@ -597,7 +593,7 @@ def fetch_suggestions_page(
 
 
 def confirm_suggestions(face_ids: list[str]) -> None:
-    """Accept suggestions: move suggested_person_id → person_id and mark validated."""
+    """Accept suggestions: move suggested_person_id → person_id."""
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -605,8 +601,7 @@ def confirm_suggestions(face_ids: list[str]) -> None:
                 UPDATE face_detections
                 SET person_id           = suggested_person_id,
                     suggested_person_id = NULL,
-                    suggestion_score    = NULL,
-                    is_validated        = TRUE
+                    suggestion_score    = NULL
                 WHERE id = ANY(%s::uuid[])
                   AND suggested_person_id IS NOT NULL
                 """,
@@ -636,15 +631,18 @@ def confirm_suggestions(face_ids: list[str]) -> None:
 
 
 def reject_suggestions(face_ids: list[str]) -> None:
-    """Reject suggestions: clear them and mark validated so they won't reappear."""
+    """Reject suggestions: clear the pending suggestion.
+
+    NOTE: with is_validated gone there is no "rejected" marker, so a rejected
+    face stays a candidate and `suggest` may propose it again on the next run.
+    """
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE face_detections
                 SET suggested_person_id = NULL,
-                    suggestion_score    = NULL,
-                    is_validated        = TRUE
+                    suggestion_score    = NULL
                 WHERE id = ANY(%s::uuid[])
                 """,
                 (face_ids,),
