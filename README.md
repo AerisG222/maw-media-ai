@@ -177,6 +177,24 @@ WHERE id = '00000000-0000-0000-0000-000000000000';
 Once some clusters are named, run `suggest` and/or `merge-clusters` (above) to
 propagate those labels to the rest of the faces.
 
+### Clusters you don't intend to name
+
+Not every cluster is someone you want to label. Mark those in the web UI as
+**Unknown** (a real person you're not naming) or **Not a person** (a bad
+detection). The cluster is *kept*, so the faces stay grouped in case you
+recognise them later — they are not merged into one big bucket.
+
+A marked cluster is excluded from `cluster`, `suggest` and `merge-clusters`, so
+it stops reappearing in your triage queue. Two consequences worth knowing:
+
+- `cluster` will not delete or regroup a marked cluster, so re-running it is
+  safe once you've started triaging.
+- `suggest --include-unknown` re-evaluates them anyway, which is worth doing
+  occasionally as the classifier improves.
+
+The states live in the `person_status` table, so adding one is an `INSERT`
+rather than a schema change, and the UI picks it up automatically.
+
 ---
 
 ## Viewing Clusters and Faces (Web UI)

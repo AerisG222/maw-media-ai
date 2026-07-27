@@ -202,14 +202,43 @@ def merge_persons_into(target_id: str, source_ids: list[str]):
 
 
 # --- Data Fetching ---
+@st.cache_data(ttl=300)
+def fetch_person_statuses() -> list[tuple[str, str]]:
+    """(code, label) for the triage states, straight from the lookup table."""
+    return [(r[0], r[1]) for r in execute_query(
+        "SELECT code, label FROM person_status ORDER BY sort_order, code"
+    )]
+
+
+def set_person_status(person_id: str, status_code: str | None):
+    """Mark (or un-mark) a cluster's triage state. Presentation of intent only --
+    it never changes which faces belong to the cluster."""
+    execute_update(
+        "UPDATE person SET status_code = %s, updated_at = now() WHERE id = %s",
+        (status_code, person_id),
+    )
+
+
+def _triage_clause(triage: str) -> str:
+    """SQL fragment implementing the triage filter (alias-free, uses bare cols)."""
+    return {
+        "all": "",
+        "needs": " AND name IS NULL AND status_code IS NULL",
+        "named": " AND name IS NOT NULL",
+    }.get(triage, " AND status_code = %(tcode)s")
+
+
 def fetch_persons_count(
     search: str | None = None,
     unnamed_only: bool = False,
+    triage: str = "all",
 ) -> int:
     like = f"%{search}%" if search else None
     result = execute_single(
-        "SELECT COUNT(1) FROM person WHERE (%s IS NULL OR name ILIKE %s OR id::text ILIKE %s) AND (NOT %s OR name IS NULL)",
-        (search, like, like, unnamed_only),
+        "SELECT COUNT(1) FROM person WHERE (%(s)s IS NULL OR name ILIKE %(l)s "
+        "OR id::text ILIKE %(l)s) AND (NOT %(u)s OR name IS NULL)"
+        + _triage_clause(triage),
+        {"s": search, "l": like, "u": unnamed_only, "tcode": triage},
     )
     return result[0] if result else 0
 
@@ -219,6 +248,7 @@ def fetch_persons_page(
     limit: int = PERSONS_PAGE_SIZE,
     offset: int = 0,
     unnamed_only: bool = False,
+    triage: str = "all",
 ) -> list:
     """Return a page of persons with one sample face for preview.
 
@@ -240,18 +270,22 @@ def fetch_persons_page(
             LIMIT 1
         ) fd ON true
         LEFT JOIN photo ph ON ph.id = fd.photo_id
-        WHERE (%s IS NULL OR p.name ILIKE %s OR p.id::text ILIKE %s)
-          AND (NOT %s OR p.name IS NULL)
+        WHERE (%(s)s IS NULL OR p.name ILIKE %(l)s OR p.id::text ILIKE %(l)s)
+          AND (NOT %(u)s OR p.name IS NULL)
+          """ + _triage_clause(triage).replace(" AND name", " AND p.name")
+                                      .replace(" AND status_code", " AND p.status_code") + """
         ORDER BY p.face_count DESC NULLS LAST, p.id
-        LIMIT %s OFFSET %s
+        LIMIT %(lim)s OFFSET %(off)s
         """,
-        (search, like, like, unnamed_only, limit, offset),
+        {"s": search, "l": like, "u": unnamed_only, "tcode": triage,
+         "lim": limit, "off": offset},
     )
 
 
 def fetch_all_persons_embeddings(
     search: str | None = None,
     unnamed_only: bool = False,
+    triage: str = "all",
 ) -> list[tuple]:
     """Fetch all matching persons with centroids for similarity-order computation.
 
@@ -262,11 +296,13 @@ def fetch_all_persons_embeddings(
         """
         SELECT p.id, p.face_count, p.representative_embedding::text
         FROM person_v p
-        WHERE (%s IS NULL OR p.name ILIKE %s OR p.id::text ILIKE %s)
-          AND (NOT %s OR p.name IS NULL)
+        WHERE (%(s)s IS NULL OR p.name ILIKE %(l)s OR p.id::text ILIKE %(l)s)
+          AND (NOT %(u)s OR p.name IS NULL)
+          """ + _triage_clause(triage).replace(" AND name", " AND p.name")
+                                      .replace(" AND status_code", " AND p.status_code") + """
         ORDER BY p.face_count DESC NULLS LAST, p.id
         """,
-        (search, like, like, unnamed_only),
+        {"s": search, "l": like, "u": unnamed_only, "tcode": triage},
     )
     result = []
     for pid, face_count, emb_text in rows:
@@ -348,9 +384,10 @@ def fetch_persons_by_ids(page_ids: list[str]) -> list:
 
 
 def fetch_person(person_id: str) -> tuple | None:
-    """Return person data: (id, name, face_count, preferred_face_id)."""
+    """Return person data: (id, name, face_count, preferred_face_id, status_code)."""
     return execute_single(
-        "SELECT id, name, face_count, preferred_face_id FROM person_v WHERE id = %s",
+        "SELECT id, name, face_count, preferred_face_id, status_code "
+        "FROM person_v WHERE id = %s",
         (person_id,),
     )
 
@@ -935,6 +972,7 @@ def main():
     for _k in (
         "choose_search",
         "choose_unnamed_only",
+        "choose_triage",
         "choose_sim_sort",
     ):
         if _k in st.session_state:
@@ -967,7 +1005,22 @@ def render_persons_step():
         )
 
     with control_col3:
-        st.checkbox("Unnamed", key="choose_unnamed_only")
+        # Data-driven: options come from the person_status lookup table, so a new
+        # state added in SQL shows up here without a code change.
+        statuses = fetch_person_statuses()
+        triage_opts = ["all", "needs", "named"] + [c for c, _ in statuses]
+        triage_labels = {
+            "all": "All",
+            "needs": "Needs triage",
+            "named": "Named",
+            **{c: lbl for c, lbl in statuses},
+        }
+        st.selectbox(
+            "Show",
+            options=triage_opts,
+            format_func=lambda c: triage_labels.get(c, c),
+            key="choose_triage",
+        )
 
     with control_col_sim:
         st.checkbox("Sort by similarity", key="choose_sim_sort")
@@ -1003,18 +1056,19 @@ def render_persons_step():
                 st.error(f"Cleanup failed: {e}")
 
     unnamed_only = st.session_state.get("choose_unnamed_only", False)
+    triage = st.session_state.get("choose_triage", "all")
     sim_sort = st.session_state.get("choose_sim_sort", False)
 
     # Cache key uniquely identifies the current filter combination.
     # When it changes, the similarity order must be recomputed and the page reset.
-    sim_cache_key = f"{search or ''}:{unnamed_only}"
+    sim_cache_key = f"{search or ''}:{unnamed_only}:{triage}"
 
     if sim_sort:
         prev_key = st.session_state.get("sim_order_key")
         if prev_key != sim_cache_key or "sim_order" not in st.session_state:
             with st.spinner("Computing similarity order…"):
                 persons_data = fetch_all_persons_embeddings(
-                    search if search else None, unnamed_only
+                    search if search else None, unnamed_only, triage=triage
                 )
                 st.session_state["sim_order"] = _compute_similarity_order(persons_data)
                 # Reset to page 1 only when the user actually changed the filter,
@@ -1032,6 +1086,7 @@ def render_persons_step():
         total = fetch_persons_count(
             search if search else None,
             unnamed_only=unnamed_only,
+            triage=triage,
         )
 
     page_count = max(1, math.ceil(total / PERSONS_PAGE_SIZE))
@@ -1077,6 +1132,7 @@ def render_persons_step():
             limit=PERSONS_PAGE_SIZE,
             offset=offset,
             unnamed_only=unnamed_only,
+            triage=triage,
         )
 
     for row_start in range(0, len(persons), GRID_COLS):
@@ -1213,8 +1269,8 @@ def render_faces_step(person_id: str):
         st.error("Selected person not found in database.")
         navigate_to_persons()
 
-    _, current_name, face_count, preferred_face_id = (
-        person_row if person_row else (None, "Unknown", 0, None)
+    _, current_name, face_count, preferred_face_id, status_code = (
+        person_row if person_row else (None, "Unknown", 0, None, None)
     )
     preferred_face_id = str(preferred_face_id) if preferred_face_id else None
 
@@ -1284,6 +1340,35 @@ def render_faces_step(person_id: str):
                 st.rerun()
             except Exception as e:
                 st.error(f"Failed to save name: {e}")
+
+    # --- triage -------------------------------------------------------------
+    # Naming and triage are mutually exclusive (enforced by a CHECK), so only
+    # offer this while the cluster is unnamed.
+    if not current_name:
+        statuses = fetch_person_statuses()
+        labels = {c: lbl for c, lbl in statuses}
+        if status_code:
+            info_col, clear_col = st.columns([5, 1])
+            with info_col:
+                st.info(
+                    f"Marked **{labels.get(status_code, status_code)}** — excluded "
+                    "from clustering, suggestions and merges. Faces stay grouped."
+                )
+            with clear_col:
+                if st.button("Un-mark", key=f"unmark_{person_id}"):
+                    set_person_status(person_id, None)
+                    st.rerun()
+        else:
+            cols = st.columns(len(statuses) + 1)
+            for i, (code, label) in enumerate(statuses):
+                with cols[i]:
+                    if st.button(
+                        f"Mark {label}",
+                        key=f"mark_{code}_{person_id}",
+                        use_container_width=True,
+                    ):
+                        set_person_status(person_id, code)
+                        st.rerun()
 
     with st.expander("Merge this cluster into another person"):
         other_persons = fetch_all_persons_for_merge(person_id)

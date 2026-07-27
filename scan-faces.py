@@ -585,13 +585,17 @@ def cmd_cluster(rebuild_all: bool = False) -> None:
             ORDER BY id
             """
     else:
-        # Exclude faces already assigned to a named person: those are settled.
+        # Exclude faces that are already settled: assigned to a named person,
+        # or sitting in a cluster you have triaged (unknown / not_a_person).
         candidate_sql = """
             SELECT fd.id, fd.embedding::text
             FROM face_detection fd
             LEFT JOIN person p ON p.id = fd.person_id
             WHERE fd.embedding IS NOT NULL
-              AND (fd.person_id IS NULL OR p.name IS NULL)
+              AND (
+                    fd.person_id IS NULL
+                 OR (p.name IS NULL AND p.status_code IS NULL)
+              )
             ORDER BY fd.id
             """
 
@@ -647,9 +651,14 @@ def cmd_cluster(rebuild_all: bool = False) -> None:
 
     log.info("Writing persons and updating face_detections…")
 
-    # Clear existing auto-generated persons (keep manually named ones).
+    # Clear auto-generated clusters only.  Named people are kept, and so are
+    # clusters you have triaged -- deleting those would silently discard the
+    # "unknown" / "not_a_person" decisions and regroup their faces.
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM person WHERE name IS NULL")
+        cur.execute(
+            "DELETE FROM person WHERE name IS NULL AND status_code IS NULL"
+        )
+        log.info(f"Removed {cur.rowcount:,} untriaged auto-generated cluster(s).")
     conn.commit()
 
     person_count = 0
@@ -762,8 +771,10 @@ def _fit_suggester(X: np.ndarray, y: np.ndarray, rng: np.random.Generator):
     return clf, classes, centroids
 
 
-def _iter_candidate_batches(conn: psycopg.Connection, batch: int = 20000):
-    """Yield (ids, embeddings) for unassigned / unnamed-cluster faces."""
+def _iter_candidate_batches(
+    conn: psycopg.Connection, batch: int = 20000, include_unknown: bool = False
+):
+    """Yield (ids, embeddings) for untriaged unassigned / unnamed-cluster faces."""
     with conn.cursor(name="cand_cur") as cur:   # server-side cursor: bounded memory
         cur.itersize = batch
         cur.execute(
@@ -771,9 +782,11 @@ def _iter_candidate_batches(conn: psycopg.Connection, batch: int = 20000):
             SELECT fd.id::text AS fid, fd.embedding::text AS emb
             FROM face_detection fd
             LEFT JOIN person p ON p.id = fd.person_id
-            WHERE (fd.person_id IS NULL OR p.name IS NULL)
+            WHERE (fd.person_id IS NULL
+                   OR (p.name IS NULL AND (p.status_code IS NULL OR %(incl)s)))
               AND fd.embedding IS NOT NULL
-            """
+            """,
+            {"incl": include_unknown},
         )
         ids, vecs = [], []
         for row in cur:
@@ -787,7 +800,10 @@ def _iter_candidate_batches(conn: psycopg.Connection, batch: int = 20000):
 
 
 def _suggest_with_classifier(
-    conn: psycopg.Connection, threshold: float, min_confidence: float
+    conn: psycopg.Connection,
+    threshold: float,
+    min_confidence: float,
+    include_unknown: bool = False,
 ) -> int:
     """Score candidates with the classifier, gated by centroid distance.
 
@@ -806,7 +822,7 @@ def _suggest_with_classifier(
             f"({CLASSIFIER_MIN_FACES:,} faces / {CLASSIFIER_MIN_CLASSES} people). "
             "Falling back to nearest-centroid."
         )
-        return _suggest_with_centroid(conn, threshold)
+        return _suggest_with_centroid(conn, threshold, include_unknown)
 
     log.info(f"Loaded {len(y):,} labelled face(s) across {n_classes:,} people.")
     t0 = time.time()
@@ -827,7 +843,7 @@ def _suggest_with_classifier(
         )
 
     n_seen = n_accept = 0
-    for ids, Xc in _iter_candidate_batches(conn):
+    for ids, Xc in _iter_candidate_batches(conn, include_unknown=include_unknown):
         n_seen += len(ids)
         proba = clf.predict_proba(Xc)
         best = proba.argmax(axis=1)
@@ -869,7 +885,9 @@ def _suggest_with_classifier(
     return n_written
 
 
-def _suggest_with_centroid(conn: psycopg.Connection, threshold: float) -> int:
+def _suggest_with_centroid(
+    conn: psycopg.Connection, threshold: float, include_unknown: bool = False
+) -> int:
     """Original behaviour: nearest named-person centroid via pgvector."""
     with conn.cursor() as cur:
         cur.execute(
@@ -892,13 +910,15 @@ def _suggest_with_centroid(conn: psycopg.Connection, threshold: float) -> int:
                     ORDER BY p.representative_embedding <=> fd.embedding
                     LIMIT 1
                 ) nearest
-                WHERE (fd.person_id IS NULL OR src_p.name IS NULL)
+                WHERE (fd.person_id IS NULL
+                       OR (src_p.name IS NULL
+                           AND (src_p.status_code IS NULL OR %(incl)s)))
                   AND fd.embedding   IS NOT NULL
                   AND (fd.embedding <=> nearest.representative_embedding) < %(threshold)s
             ) best
             WHERE fd.id = best.face_id
             """,
-            {"threshold": threshold},
+            {"threshold": threshold, "incl": include_unknown},
         )
         n = cur.rowcount
     conn.commit()
@@ -910,6 +930,7 @@ def cmd_suggest(
     min_confidence: float = SUGGEST_MIN_CONFIDENCE,
     method: str = "classifier",
     max_distance: float = SUGGEST_MAX_DISTANCE,
+    include_unknown: bool = False,
 ) -> None:
     """
     For every unassigned or unnamed-cluster face with an embedding, predict the
@@ -949,9 +970,11 @@ def cmd_suggest(
             SELECT COUNT(*)
             FROM face_detection fd
             LEFT JOIN person p ON p.id = fd.person_id
-            WHERE (fd.person_id IS NULL OR p.name IS NULL)
+            WHERE (fd.person_id IS NULL
+                   OR (p.name IS NULL AND (p.status_code IS NULL OR %(incl)s)))
               AND fd.embedding IS NOT NULL
-            """
+            """,
+            {"incl": include_unknown},
         )
         n_candidates = cur.fetchone()["count"]
 
@@ -973,18 +996,22 @@ def cmd_suggest(
                 SELECT fd2.id
                 FROM face_detection fd2
                 LEFT JOIN person p ON p.id = fd2.person_id
-                WHERE (fd2.person_id IS NULL OR p.name IS NULL)
+                WHERE (fd2.person_id IS NULL
+                       OR (p.name IS NULL AND (p.status_code IS NULL OR %(incl)s)))
             ) candidates
             WHERE fd.id = candidates.id
-            """
+            """,
+            {"incl": include_unknown},
         )
     conn.commit()
     log.info("Cleared previous suggestions on candidate faces.")
 
     if method == "classifier":
-        n_suggested = _suggest_with_classifier(conn, max_distance, min_confidence)
+        n_suggested = _suggest_with_classifier(
+            conn, max_distance, min_confidence, include_unknown
+        )
     else:
-        n_suggested = _suggest_with_centroid(conn, threshold)
+        n_suggested = _suggest_with_centroid(conn, threshold, include_unknown)
 
     n_skipped = n_candidates - n_suggested
     log.info(
@@ -1033,6 +1060,7 @@ def cmd_merge_clusters(threshold: float, dry_run: bool) -> None:
                 LIMIT 1
             ) nearest
             WHERE p_unnamed.name IS NULL
+              AND p_unnamed.status_code IS NULL
               AND p_unnamed.representative_embedding IS NOT NULL
               AND (p_unnamed.representative_embedding <=> nearest.representative_embedding)
                   < %(threshold)s
@@ -1126,6 +1154,20 @@ def cmd_stats() -> None:
         )
         named_persons = cur.fetchall()
 
+        cur.execute(
+            """
+            SELECT coalesce(ps.label, 'Needs triage') AS bucket,
+                   count(*) AS n,
+                   min(coalesce(ps.sort_order, -1)) AS ord
+            FROM person p
+            LEFT JOIN person_status ps ON ps.code = p.status_code
+            WHERE p.name IS NULL
+            GROUP BY ps.label
+            ORDER BY ord
+            """
+        )
+        triage = cur.fetchall()
+
     conn.close()
 
     print("\n=== Face Scanner Stats ===")
@@ -1136,6 +1178,11 @@ def cmd_stats() -> None:
     print(f"  Faces unassigned:    {n_unassigned:>8,}")
     print(f"  Persons (clusters):  {n_persons:>8,}")
     print(f"  Named persons:       {n_named:>8,}")
+
+    if triage:
+        print("\n  Unnamed clusters by triage state:")
+        for row in triage:
+            print(f"    {row['bucket']:<20} {row['n']:>8,}")
 
     if named_persons:
         print("\n  Top named persons:")
@@ -1217,6 +1264,13 @@ def main() -> None:
              "predicted person's centroid. Ignored by --method centroid.",
     )
     p_suggest.add_argument(
+        "--include-unknown",
+        action="store_true",
+        help="Also evaluate faces in clusters you marked 'unknown'. Off by "
+             "default -- you already triaged those. Useful occasionally as the "
+             "classifier improves.",
+    )
+    p_suggest.add_argument(
         "--method",
         choices=("classifier", "centroid"),
         default="classifier",
@@ -1262,7 +1316,8 @@ def main() -> None:
         cmd_cluster(args.rebuild_all)
     elif args.command == "suggest":
         cmd_suggest(
-            args.threshold, args.min_confidence, args.method, args.max_distance
+            args.threshold, args.min_confidence, args.method,
+            args.max_distance, args.include_unknown,
         )
     elif args.command == "merge-clusters":
         cmd_merge_clusters(args.threshold, args.dry_run)

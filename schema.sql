@@ -33,8 +33,31 @@ CREATE TABLE IF NOT EXISTS person (
     name                        VARCHAR(255),            -- set by human operator
     representative_embedding    vector(512),             -- centroid of all face embeddings
     created_at                  TIMESTAMPTZ DEFAULT now(),
-    updated_at                  TIMESTAMPTZ DEFAULT now()
+    updated_at                  TIMESTAMPTZ DEFAULT now(),
+    preferred_face_id           UUID REFERENCES face_detection(id) ON DELETE SET NULL,
+    status_code                 TEXT REFERENCES person_status(code)
 );
+
+-- ---------------------------------------------------------------------------
+-- person_status
+-- Triage states for clusters you do not intend to name.  A lookup table rather
+-- than a CHECK so new states are an INSERT, the UI can build its selector from
+-- the data, and a .NET consumer can discover the valid values.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS person_status (
+    code        TEXT PRIMARY KEY,
+    label       TEXT NOT NULL,
+    description TEXT,
+    sort_order  INT NOT NULL DEFAULT 0
+);
+
+INSERT INTO person_status (code, label, description, sort_order) VALUES
+    ('unknown',      'Unknown',
+     'A real person you have decided not to name. Kept grouped so it can be '
+     'named later if you recognise them.', 1),
+    ('not_a_person', 'Not a person',
+     'Bad detection: not a face, or not a person worth tracking.', 2)
+ON CONFLICT (code) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- face_detection
@@ -56,9 +79,9 @@ CREATE TABLE IF NOT EXISTS face_detection (
     suggested_person_id  UUID REFERENCES person(id) ON DELETE SET NULL
 );
 
-ALTER TABLE person
-    ADD COLUMN IF NOT EXISTS preferred_face_id UUID
-        REFERENCES face_detection(id) ON DELETE SET NULL;
+ALTER TABLE person DROP CONSTRAINT IF EXISTS person_name_status_excl;
+ALTER TABLE person ADD CONSTRAINT person_name_status_excl
+    CHECK (name IS NULL OR status_code IS NULL);
 
 
 -- ---------------------------------------------------------------------------
@@ -94,6 +117,13 @@ CREATE INDEX IF NOT EXISTS face_detection_unassigned_idx
     ON face_detection(person_id)
     WHERE person_id IS NULL;
 
+-- Triage queues filter on this constantly.
+CREATE INDEX IF NOT EXISTS person_status_code_idx
+    ON person(status_code);
+
+-- Untriaged clusters are the hot lookup for cluster/suggest/merge-clusters.
+CREATE INDEX IF NOT EXISTS person_untriaged_idx
+    ON person(id) WHERE name IS NULL AND status_code IS NULL;
 
 -- ---------------------------------------------------------------------------
 -- Views
@@ -104,6 +134,8 @@ CREATE INDEX IF NOT EXISTS face_detection_unassigned_idx
 -- bypassed the application paths that maintained it), and Postgres generated
 -- columns cannot aggregate over another table.  Write to `person`; read from
 -- `person_v` whenever you need the count.
+-- person_v predates status_code; refresh it so the UI can read triage state
+-- without a second query.  (New columns may be appended to a view in place.)
 CREATE OR REPLACE VIEW person_v AS
 SELECT p.id,
        p.name,
@@ -111,7 +143,8 @@ SELECT p.id,
        p.created_at,
        p.updated_at,
        p.preferred_face_id,
-       coalesce(c.n, 0)::int AS face_count
+       coalesce(c.n, 0)::int AS face_count,
+       p.status_code
 FROM person p
 LEFT JOIN (
     SELECT person_id, count(*) AS n
