@@ -1,25 +1,46 @@
-# Core face detection & recognition
-insightface>=0.7.3
-onnxruntime-gpu>=1.17.0
-nvidia-cudnn-cu12
+# Loose declaration of what this project needs.  To reproduce a known-good
+# environment exactly, use the lockfile instead:
+#     pip install -r requirements.lock
 
-# Clustering
-hdbscan>=0.8.33
-scikit-learn>=1.4.0
+# --- Core face detection & recognition ---------------------------------------
+# PINNED EXACTLY, deliberately.  insightface produces the 512-dim embeddings that
+# every stored vector, person centroid and classifier decision is built on.  Those
+# embeddings are only comparable to each other if the model AND its preprocessing
+# (detection, alignment, normalisation) stay identical.  A version that changed
+# any of that would not raise an error -- it would silently produce vectors that
+# no longer line up with the ones already in the database, degrading clustering,
+# suggestions and centroids without any visible failure.
+# 1.0.1 exists; treat adopting it as a migration rather than a bump: re-embed a
+# sample, compare against stored vectors, and expect to re-scan the library.
+insightface==0.7.3
 
-# Image loading
-opencv-python-headless>=4.9.0
-Pillow>=10.0.0
+# Held back alongside insightface.  ONNX Runtime and cuDNN choose the kernels that
+# execute the model, so changing them can shift embedding values slightly -- and
+# this project's CUDA setup is version-sensitive (see the CUDA section of
+# README.md).  Upgrade these deliberately, not incidentally.
+onnxruntime-gpu>=1.17.0,<1.26
+nvidia-cudnn-cu12<9.24
 
-# Database
-psycopg[binary]>=3.1.0       # psycopg3 — modern async-capable Postgres driver
+# --- Clustering ---------------------------------------------------------------
+hdbscan>=0.8.42
+scikit-learn>=1.9.0          # also used by `suggest`'s logistic-regression path
 
-# Progress bar
-tqdm>=4.66.0
+# --- Image loading ------------------------------------------------------------
+# Capped below 5.x: OpenCV 5 is a major release and insightface 0.7.3 predates it
+# by three years, so compatibility is unverified.  Usage here is small and stable
+# (imread / resize / imwrite), so lifting the cap should be easy once tested.
+opencv-python-headless>=4.13.0,<5
+Pillow>=12.3.0
 
-# Numerical
-numpy>=1.26.0
+# --- Database -----------------------------------------------------------------
+psycopg[binary]>=3.3.4       # psycopg3 — used by the scanner
+psycopg2-binary>=2.9.12      # used by the Streamlit app
 
-# streamlit web app to view results
-streamlit>=1.56.0
-psycopg2-binary
+# --- Progress bar -------------------------------------------------------------
+tqdm>=4.70.0
+
+# --- Numerical ----------------------------------------------------------------
+numpy>=2.5.0
+
+# --- Streamlit web app to view results ----------------------------------------
+streamlit>=1.60.0
