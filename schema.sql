@@ -3,9 +3,10 @@
 -- Run this once against your Postgres 18 database before the first scan.
 -- Requires the pgvector extension: https://github.com/pgvector/pgvector
 --
--- Table names are singular nouns (photo, person, face_detection).
--- Upgrading an existing database created with the old plural names?
--- Run migrations/001-singular-table-names.sql instead of this file.
+-- Table names are singular nouns (photo, person, face_detection).  This file
+-- builds a fresh database; it is idempotent, so re-running it is safe.  It does
+-- NOT migrate an older database in place -- notably it will not rename plural
+-- tables or drop columns that have since been removed.
 -- =============================================================================
 CREATE EXTENSION IF NOT EXISTS vector;
 
