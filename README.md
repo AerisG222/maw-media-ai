@@ -29,8 +29,12 @@ source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-> **GPU users:** replace `onnxruntime` with `onnxruntime-gpu` in requirements.txt
-> for significantly faster scanning.
+> **GPU users:** `requirements.txt` already specifies `onnxruntime-gpu` and
+> `opencv-python-headless`. Note that installing `insightface` pulls in the
+> plain `onnxruntime` and `opencv-python` packages as dependencies, and those
+> **shadow** the ones above — silently disabling CUDA. See the install-trap note
+> in `requirements.txt`, or install from `requirements.lock` to get the resolved,
+> working set.
 
 ---
 
@@ -323,6 +327,13 @@ On my fedora system, CUDA 13 was installed, but ONNX seems to want 12.2.  This i
 sudo sh /home/mmorano/cuda/cuda_12.2.2_535.104.05_linux.run --override --toolkit --installpath=/usr/local/cuda-12.2
 ```
 3. add the CUDA bin directory to your `PATH` and `LD_LIBRARY_PATH`:
+
+> **Note:** `LD_LIBRARY_PATH` must be exported *before* Python starts — the
+> dynamic loader reads it once at process start, so nothing the script does at
+> runtime can substitute for it. `scan-faces.py` logs which provider it actually
+> used; if you see "running on CPU", it prints the exact `export` line for this
+> environment.
+
 ```bash
 export CUDA_HOME=/usr/local/cuda-12.2
 export PATH=/usr/local/cuda-12.2/bin:$PATH

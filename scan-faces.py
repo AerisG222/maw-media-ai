@@ -21,11 +21,13 @@ Usage:
 """
 
 import argparse
+import glob
 import itertools
 import json
 import logging
 import os
 import sys
+import sysconfig
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -243,6 +245,46 @@ def insert_face(
 _face_app: FaceAnalysis | None = None
 
 
+def _bundled_nvidia_lib_dirs() -> list[str]:
+    """Directories of the NVIDIA libraries shipped inside this environment."""
+    # realpath collapses lib/ vs lib64/ (the same directory on many distros),
+    # which would otherwise list every path twice.
+    dirs = set()
+    for site in {sysconfig.get_paths()["purelib"], sysconfig.get_paths()["platlib"]}:
+        for so in glob.glob(os.path.join(site, "nvidia", "*", "lib", "lib*.so*")):
+            dirs.add(os.path.realpath(os.path.dirname(so)))
+    return sorted(dirs)
+
+
+def _warn_cpu_fallback(active: list[str]) -> None:
+    """Explain a CPU fallback and, when we can, print the fix.
+
+    ONNX Runtime's CUDA provider links against cuDNN and friends.  Those ship in
+    the venv, but the dynamic loader only searches LD_LIBRARY_PATH, which it
+    reads once at process start -- so the variable has to be exported before
+    Python runs; nothing this script does at runtime can substitute for it.
+    """
+    log.warning(
+        f"InsightFace is running on CPU ({', '.join(active) or 'unknown'}). "
+        "Scanning will be far slower than on GPU."
+    )
+    lib_dirs = _bundled_nvidia_lib_dirs()
+    if lib_dirs:
+        log.warning(
+            "NVIDIA libraries are present in this environment but not on the "
+            "loader path. Export this, then re-run:"
+        )
+        log.warning(
+            '    export LD_LIBRARY_PATH="%s:$LD_LIBRARY_PATH"',
+            os.pathsep.join(lib_dirs).replace(os.pathsep, ":"),
+        )
+    else:
+        log.warning(
+            "No bundled NVIDIA libraries found — install onnxruntime-gpu and "
+            "nvidia-cudnn-cu12 if this machine has a GPU."
+        )
+
+
 def get_face_app() -> FaceAnalysis:
     global _face_app
     if _face_app is None:
@@ -254,8 +296,22 @@ def get_face_app() -> FaceAnalysis:
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
         )
         # det_size: larger = more accurate but slower. 640 is a good balance.
+        # Passing it explicitly also pins detection to a single scale; insightface
+        # >=1.0 would otherwise default to multi-scale, which changes what gets
+        # detected and would make new scans inconsistent with existing rows.
         _face_app.prepare(ctx_id=0, det_size=(640, 640))
-        log.info("InsightFace model loaded.")
+
+        # Report the provider actually in use.  A CPU fallback is otherwise
+        # silent -- you would only notice from throughput an hour into a scan --
+        # and for a full library it is the difference between hours and days.
+        try:
+            active = _face_app.models["recognition"].session.get_providers()
+        except Exception:
+            active = []
+        if any("CUDA" in p or "Tensorrt" in p for p in active):
+            log.info(f"InsightFace model loaded on GPU ({active[0]}).")
+        else:
+            _warn_cpu_fallback(active)
     return _face_app
 
 

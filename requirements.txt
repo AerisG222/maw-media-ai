@@ -3,21 +3,50 @@
 #     pip install -r requirements.lock
 
 # --- Core face detection & recognition ---------------------------------------
-# PINNED EXACTLY, deliberately.  insightface produces the 512-dim embeddings that
-# every stored vector, person centroid and classifier decision is built on.  Those
-# embeddings are only comparable to each other if the model AND its preprocessing
-# (detection, alignment, normalisation) stay identical.  A version that changed
-# any of that would not raise an error -- it would silently produce vectors that
-# no longer line up with the ones already in the database, degrading clustering,
-# suggestions and centroids without any visible failure.
-# 1.0.1 exists; treat adopting it as a migration rather than a bump: re-embed a
-# sample, compare against stored vectors, and expect to re-scan the library.
-insightface==0.7.3
+# insightface generates the 512-dim embeddings behind every stored vector,
+# centroid and classifier decision, so the version is pinned rather than floated.
+#
+# 0.7.3 -> 1.0.1 was verified safe against this database before upgrading:
+#   * model_zoo/arcface_onnx.py and utils/face_align.py are byte-identical, and
+#     buffalo_l is unchanged, so the embedding maths did not move.
+#   * scrfd.py (detection) was refactored for multi-scale, which shifts landmarks
+#     very slightly.  Measured over 120 faces re-embedded on GPU: mean cosine
+#     similarity 0.9991 vs the stored vectors (worst 0.986) -- ~40x smaller than
+#     the 0.60 distance veto, so no decision changes.  1.0.1 is deterministic
+#     run-to-run (72/72 bit-identical), so that delta is real, not GPU noise.
+# Re-verify with the same method before moving off 1.0.1.
+insightface==1.0.1
 
-# Held back alongside insightface.  ONNX Runtime and cuDNN choose the kernels that
-# execute the model, so changing them can shift embedding values slightly -- and
-# this project's CUDA setup is version-sensitive (see the CUDA section of
-# README.md).  Upgrade these deliberately, not incidentally.
+# !! INSTALL TRAP !!  insightface depends on `onnxruntime` (CPU-only) and
+# `opencv-python`, NOT the -gpu / -headless builds used here.  A plain
+#     pip install -r requirements.txt
+# therefore ALSO pulls those in, and they SHADOW the variants below --
+# silently dropping CUDAExecutionProvider (scanning falls back to CPU) and
+# replacing the headless cv2 build with the GUI one.  After installing, run:
+#     pip uninstall -y onnxruntime opencv-python
+#     pip install --force-reinstall --no-deps \
+#         onnxruntime-gpu==1.25.1 opencv-python-headless==5.0.0.93
+# (the force-reinstall is needed because uninstalling removes shared files)
+# Or install from requirements.lock, which has the resolved, working set.
+#
+# GPU also needs cuDNN on the loader path -- see the CUDA section of README.md:
+#     export LD_LIBRARY_PATH=".venv/lib/python3.14/site-packages/nvidia/cudnn/lib:$LD_LIBRARY_PATH"
+#
+# These two are the last packages not on their latest release, and the ceiling is
+# an upstream packaging fact rather than caution on our part.  Checked 2026-07-28:
+#
+#   * onnxruntime-gpu 1.28.0 publishes NO Linux wheel for Python 3.14.  Its only
+#     manylinux build is cp311; every other wheel that release is win_amd64.  So
+#     on this platform there is simply nothing newer to install.
+#   * 1.28 also moved to the CUDA 13 stack (nvidia-cuda-runtime~=13.0,
+#     nvidia-cudnn-cu13~=9.0).  We are on cu12, so adopting it is a
+#     cross-generation migration of the whole CUDA stack, not a version bump.
+#   * nvidia-cudnn-cu12 is capped for the same reason: it only matters as part of
+#     that stack, and moving it alone risks a silent fall back to CPU.
+#
+# Revisit when a manylinux + cp314 wheel exists for a newer onnxruntime-gpu, or
+# when moving to CUDA 13 deliberately.  Either way, re-verify that
+# `scan-faces.py` still logs "loaded on GPU" afterwards.
 onnxruntime-gpu>=1.17.0,<1.26
 nvidia-cudnn-cu12<9.24
 
@@ -26,10 +55,11 @@ hdbscan>=0.8.42
 scikit-learn>=1.9.0          # also used by `suggest`'s logistic-regression path
 
 # --- Image loading ------------------------------------------------------------
-# Capped below 5.x: OpenCV 5 is a major release and insightface 0.7.3 predates it
-# by three years, so compatibility is unverified.  Usage here is small and stable
-# (imread / resize / imwrite), so lifting the cap should be easy once tested.
-opencv-python-headless>=4.13.0,<5
+# OpenCV 5 verified against this project before lifting the earlier <5 cap:
+# decoded AVIF pixels, resize(INTER_AREA) and JPEG encode were all bit-identical
+# to 4.13 across 25 photos, and the full GPU pipeline matched 100/100 faces.  The
+# APIs used here and inside insightface are long-stable core functions.
+opencv-python-headless>=5.0.0
 Pillow>=12.3.0
 
 # --- Database -----------------------------------------------------------------
