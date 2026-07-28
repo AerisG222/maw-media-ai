@@ -230,15 +230,14 @@ def _triage_clause(triage: str) -> str:
 
 def fetch_persons_count(
     search: str | None = None,
-    unnamed_only: bool = False,
     triage: str = "all",
 ) -> int:
     like = f"%{search}%" if search else None
     result = execute_single(
         "SELECT COUNT(1) FROM person WHERE (%(s)s IS NULL OR name ILIKE %(l)s "
-        "OR id::text ILIKE %(l)s) AND (NOT %(u)s OR name IS NULL)"
+        "OR id::text ILIKE %(l)s)"
         + _triage_clause(triage),
-        {"s": search, "l": like, "u": unnamed_only, "tcode": triage},
+        {"s": search, "l": like, "tcode": triage},
     )
     return result[0] if result else 0
 
@@ -247,7 +246,6 @@ def fetch_persons_page(
     search: str | None = None,
     limit: int = PERSONS_PAGE_SIZE,
     offset: int = 0,
-    unnamed_only: bool = False,
     triage: str = "all",
 ) -> list:
     """Return a page of persons with one sample face for preview.
@@ -271,20 +269,18 @@ def fetch_persons_page(
         ) fd ON true
         LEFT JOIN photo ph ON ph.id = fd.photo_id
         WHERE (%(s)s IS NULL OR p.name ILIKE %(l)s OR p.id::text ILIKE %(l)s)
-          AND (NOT %(u)s OR p.name IS NULL)
           """ + _triage_clause(triage).replace(" AND name", " AND p.name")
                                       .replace(" AND status_code", " AND p.status_code") + """
         ORDER BY p.face_count DESC NULLS LAST, p.id
         LIMIT %(lim)s OFFSET %(off)s
         """,
-        {"s": search, "l": like, "u": unnamed_only, "tcode": triage,
+        {"s": search, "l": like, "tcode": triage,
          "lim": limit, "off": offset},
     )
 
 
 def fetch_all_persons_embeddings(
     search: str | None = None,
-    unnamed_only: bool = False,
     triage: str = "all",
 ) -> list[tuple]:
     """Fetch all matching persons with centroids for similarity-order computation.
@@ -297,12 +293,11 @@ def fetch_all_persons_embeddings(
         SELECT p.id, p.face_count, p.representative_embedding::text
         FROM person_v p
         WHERE (%(s)s IS NULL OR p.name ILIKE %(l)s OR p.id::text ILIKE %(l)s)
-          AND (NOT %(u)s OR p.name IS NULL)
           """ + _triage_clause(triage).replace(" AND name", " AND p.name")
                                       .replace(" AND status_code", " AND p.status_code") + """
         ORDER BY p.face_count DESC NULLS LAST, p.id
         """,
-        {"s": search, "l": like, "u": unnamed_only, "tcode": triage},
+        {"s": search, "l": like, "tcode": triage},
     )
     result = []
     for pid, face_count, emb_text in rows:
@@ -917,13 +912,14 @@ def render_face_grid_cell_html(
 
 
 # --- UI Helper Functions ---
+# (state key, label, Material Symbols icon)
 _PAGINATION_BUTTONS = (
-    ("first", "<< First"),
-    ("prev10", "◀ -10"),
-    ("prev", "◀ Prev"),
-    ("next", "Next ▶"),
-    ("next10", "+10 ▶"),
-    ("last", "Last >>"),
+    ("first", "First", ":material/first_page:"),
+    ("prev10", "-10", ":material/keyboard_double_arrow_left:"),
+    ("prev", "Prev", ":material/chevron_left:"),
+    ("next", "Next", ":material/chevron_right:"),
+    ("next10", "+10", ":material/keyboard_double_arrow_right:"),
+    ("last", "Last", ":material/last_page:"),
 )
 
 
@@ -935,11 +931,12 @@ def render_pagination_controls(
 
     *key_prefix* namespaces the widget keys so multiple pagers can coexist.
     """
-    cols = st.columns(len(_PAGINATION_BUTTONS))
     clicks = []
-    for col, (name, label) in zip(cols, _PAGINATION_BUTTONS):
-        with col:
-            clicks.append(st.button(label, key=f"{key_prefix}_{name}"))
+    with st.container(horizontal=True):
+        for name, label, icon in _PAGINATION_BUTTONS:
+            clicks.append(
+                st.button(label, icon=icon, key=f"{key_prefix}_{name}")
+            )
     return tuple(clicks)
 
 
@@ -966,18 +963,6 @@ def main():
     st.set_page_config(page_title="Face Clusters Viewer", layout="wide")
     st.title("Face Cluster Explorer")
 
-    # Streamlit drops widget-keyed state when the widget isn't rendered in a run
-    # (e.g. the persons-list filters while viewing a cluster). Re-assigning each
-    # value to itself keeps it alive so the filters survive navigating in and out.
-    for _k in (
-        "choose_search",
-        "choose_unnamed_only",
-        "choose_triage",
-        "choose_sim_sort",
-    ):
-        if _k in st.session_state:
-            st.session_state[_k] = st.session_state[_k]
-
     view = st.session_state.get(VIEW_KEY, "persons")
     person_id = st.session_state.get(VIEW_PERSON_KEY)
 
@@ -1002,6 +987,9 @@ def render_persons_step():
         search = st.text_input(
             "Search by name or id",
             key="choose_search",
+            # Survives navigating into a cluster and back, where this widget
+            # isn't rendered.  Replaces a manual re-assignment workaround.
+            persist_state="session",
         )
 
     with control_col3:
@@ -1020,10 +1008,15 @@ def render_persons_step():
             options=triage_opts,
             format_func=lambda c: triage_labels.get(c, c),
             key="choose_triage",
+            persist_state="session",
         )
 
     with control_col_sim:
-        st.checkbox("Sort by similarity", key="choose_sim_sort")
+        st.checkbox(
+            "Sort by similarity",
+            key="choose_sim_sort",
+            persist_state="session",
+        )
 
     with control_col4:
         first, prev10, prev, next, next10, last = render_pagination_controls(
@@ -1055,20 +1048,19 @@ def render_persons_step():
             except Exception as e:
                 st.error(f"Cleanup failed: {e}")
 
-    unnamed_only = st.session_state.get("choose_unnamed_only", False)
     triage = st.session_state.get("choose_triage", "all")
     sim_sort = st.session_state.get("choose_sim_sort", False)
 
     # Cache key uniquely identifies the current filter combination.
     # When it changes, the similarity order must be recomputed and the page reset.
-    sim_cache_key = f"{search or ''}:{unnamed_only}:{triage}"
+    sim_cache_key = f"{search or ''}:{triage}"
 
     if sim_sort:
         prev_key = st.session_state.get("sim_order_key")
         if prev_key != sim_cache_key or "sim_order" not in st.session_state:
             with st.spinner("Computing similarity order…"):
                 persons_data = fetch_all_persons_embeddings(
-                    search if search else None, unnamed_only, triage=triage
+                    search if search else None, triage=triage
                 )
                 st.session_state["sim_order"] = _compute_similarity_order(persons_data)
                 # Reset to page 1 only when the user actually changed the filter,
@@ -1085,7 +1077,6 @@ def render_persons_step():
         st.session_state.pop("sim_order_key", None)
         total = fetch_persons_count(
             search if search else None,
-            unnamed_only=unnamed_only,
             triage=triage,
         )
 
@@ -1131,7 +1122,6 @@ def render_persons_step():
             search if search else None,
             limit=PERSONS_PAGE_SIZE,
             offset=offset,
-            unnamed_only=unnamed_only,
             triage=triage,
         )
 
@@ -1176,21 +1166,19 @@ def render_persons_step():
                     if st.button(
                         name,
                         key=f"open_person_{person_id}",
-                        use_container_width=True,
+                        width="stretch",
                     ):
                         navigate_to_faces(str(person_id))
                 else:
                     confirm_key = f"confirm_clear_list_{person_id}"
                     st.session_state.setdefault(confirm_key, False)
                     if st.session_state[confirm_key]:
-                        # Confirm state replaces the row with ✓ / ✗.
-                        yes_col, no_col = st.columns(2)
-                        with yes_col:
+                        # Confirm state replaces the row with check / close.
+                        with st.container(horizontal=True):
                             if st.button(
-                                "✓",
+                                "", icon=":material/check:",
                                 key=f"clear_list_yes_{person_id}",
                                 type="primary",
-                                use_container_width=True,
                                 help="Confirm delete",
                             ):
                                 try:
@@ -1203,11 +1191,9 @@ def render_persons_step():
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Failed to clear: {e}")
-                        with no_col:
                             if st.button(
-                                "✗",
+                                "", icon=":material/close:",
                                 key=f"clear_list_no_{person_id}",
-                                use_container_width=True,
                                 help="Cancel",
                             ):
                                 st.session_state[confirm_key] = False
@@ -1218,14 +1204,14 @@ def render_persons_step():
                             if st.button(
                                 "Unnamed",
                                 key=f"open_person_{person_id}",
-                                use_container_width=True,
+                                width="stretch",
                             ):
                                 navigate_to_faces(str(person_id))
                         with trash_col:
                             if st.button(
-                                "🗑️",
+                                "", icon=":material/delete:",
                                 key=f"clear_list_{person_id}",
-                                use_container_width=True,
+                                width="stretch",
                                 help="Clear this cluster",
                             ):
                                 st.session_state[confirm_key] = True
@@ -1254,7 +1240,7 @@ def _show_original_photo(file_path: str):
     """Modal showing the full original image so a face can be seen in context."""
     st.caption(file_path)
     if os.path.exists(file_path):
-        st.image(file_path, use_container_width=True)
+        st.image(file_path, width="stretch")
     else:
         st.error("Original file not found.")
 
@@ -1365,7 +1351,7 @@ def render_faces_step(person_id: str):
                     if st.button(
                         f"Mark {label}",
                         key=f"mark_{code}_{person_id}",
-                        use_container_width=True,
+                        width="stretch",
                     ):
                         set_person_status(person_id, code)
                         st.rerun()
@@ -1497,24 +1483,20 @@ def render_faces_step(person_id: str):
                     ),
                     unsafe_allow_html=True,
                 )
-                view_col, star_col = st.columns(2)
-                with view_col:
+                with st.container(horizontal=True):
                     if st.button(
-                        "🔍",
+                        "", icon=":material/zoom_in:",
                         key=f"view_orig_{person_id}_{face_id}",
                         help="Open the original photo to see this face in context",
-                        use_container_width=True,
                     ):
                         _show_original_photo(file_path)
-                with star_col:
                     is_pref = preferred_face_id == str(face_id)
                     if st.button(
-                        "⭐" if is_pref else "☆",
+                        "", icon=":material/star:" if is_pref else ":material/star_outline:",
                         key=f"pref_face_{person_id}_{face_id}",
                         help="Current cluster preview — click to clear"
                         if is_pref
                         else "Use this face as the cluster preview",
-                        use_container_width=True,
                     ):
                         set_preferred_face(
                             person_id, None if is_pref else str(face_id)
@@ -1714,17 +1696,17 @@ def render_unknown_step():
                     view_col, assign_col = st.columns(2)
                     with view_col:
                         if st.button(
-                            "🔍",
+                            "", icon=":material/zoom_in:",
                             key=f"unknown_view_orig_{face_id_str}",
                             help="Open the original photo to see this face in context",
-                            use_container_width=True,
+                            width="stretch",
                         ):
                             _show_original_photo(file_path)
                     with assign_col:
                         if st.button(
                             "Assign",
                             key=f"quick_assign_{face_id_str}",
-                            use_container_width=True,
+                            width="stretch",
                         ):
                             try:
                                 assign_faces_to_person(
@@ -1736,10 +1718,10 @@ def render_unknown_step():
                                 st.error(f"Assignment failed: {e}")
                 else:
                     if st.button(
-                        "🔍",
+                        "", icon=":material/zoom_in:",
                         key=f"unknown_view_orig_{face_id_str}",
                         help="Open the original photo to see this face in context",
-                        use_container_width=True,
+                        width="stretch",
                     ):
                         _show_original_photo(file_path)
 
@@ -1869,33 +1851,21 @@ def render_review_step():
         1, min(st.session_state[view_page_key], total_pages)
     )
 
-    pg_cols = st.columns(6)
-    with pg_cols[0]:
-        if st.button("<< First", key="review_first"):
-            st.session_state[view_page_key] = 1
-    with pg_cols[1]:
-        if st.button("◀ -10", key="review_prev10"):
-            st.session_state[view_page_key] = max(
-                1, st.session_state[view_page_key] - 10
-            )
-    with pg_cols[2]:
-        if st.button("◀ Prev", key="review_prev"):
-            st.session_state[view_page_key] = max(
-                1, st.session_state[view_page_key] - 1
-            )
-    with pg_cols[3]:
-        if st.button("Next ▶", key="review_next"):
-            st.session_state[view_page_key] = min(
-                total_pages, st.session_state[view_page_key] + 1
-            )
-    with pg_cols[4]:
-        if st.button("+10 ▶", key="review_next10"):
-            st.session_state[view_page_key] = min(
-                total_pages, st.session_state[view_page_key] + 10
-            )
-    with pg_cols[5]:
-        if st.button("Last >>", key="review_last"):
-            st.session_state[view_page_key] = total_pages
+    # Reuse the shared pagination controls rather than duplicating them.
+    first, prev10, prev, nxt, next10, last = render_pagination_controls("review")
+    cur = st.session_state[view_page_key]
+    if first:
+        st.session_state[view_page_key] = 1
+    elif prev10:
+        st.session_state[view_page_key] = max(1, cur - 10)
+    elif prev:
+        st.session_state[view_page_key] = max(1, cur - 1)
+    elif nxt:
+        st.session_state[view_page_key] = min(total_pages, cur + 1)
+    elif next10:
+        st.session_state[view_page_key] = min(total_pages, cur + 10)
+    elif last:
+        st.session_state[view_page_key] = total_pages
 
     page = st.session_state[view_page_key]
     offset = (page - 1) * FACES_PAGE_SIZE
@@ -1978,10 +1948,10 @@ def render_review_step():
                     unsafe_allow_html=True,
                 )
                 if st.button(
-                    "🔍",
+                    "", icon=":material/zoom_in:",
                     key=f"review_view_orig_{face_id_str}",
                     help="Open the original photo to see this face in context",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     _show_original_photo(file_path)
 

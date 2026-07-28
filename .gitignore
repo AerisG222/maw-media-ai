@@ -220,3 +220,6 @@ __marimo__/
 
 image-cache
 backups
+
+.agents
+.claude
