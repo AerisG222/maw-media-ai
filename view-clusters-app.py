@@ -47,6 +47,36 @@ PERSONS_PAGE_SIZE = 24
 VIEW_KEY = "view"  # "persons" | "faces" | "unknown" | "review"
 VIEW_PERSON_KEY = "view_person_id"
 
+# Session-state keys with a fixed name, seeded together in _init_session_state()
+# so there is one place to look.  Keys scoped to a specific cluster (e.g.
+# "view_page_<person_id>") are necessarily created where they are used, since
+# their names depend on runtime values.
+PERSONS_PAGE_KEY = "choose_page"
+UNKNOWN_SEL_KEY = "unknown_selected_set"
+UNKNOWN_ASSIGN_MODE_KEY = "assign_mode_unknown"
+UNKNOWN_TARGET_KEY = "unknown_target_pid"
+UNKNOWN_PAGE_KEY = "view_page_unknown"
+UNKNOWN_SIM_SORT_KEY = "sort_by_similarity"
+REVIEW_SEL_KEY = "review_selected_set"
+REVIEW_FILTER_KEY = "review_filter_pid"
+REVIEW_PAGE_KEY = "review_page"
+
+
+def _init_session_state() -> None:
+    """Seed every fixed-name session-state key, once, at app entry."""
+    for key, value in {
+        PERSONS_PAGE_KEY: 1,
+        UNKNOWN_SEL_KEY: set(),
+        UNKNOWN_ASSIGN_MODE_KEY: False,
+        UNKNOWN_TARGET_KEY: "",
+        UNKNOWN_PAGE_KEY: 1,
+        UNKNOWN_SIM_SORT_KEY: True,
+        REVIEW_SEL_KEY: set(),
+        REVIEW_FILTER_KEY: "",
+        REVIEW_PAGE_KEY: 1,
+    }.items():
+        st.session_state.setdefault(key, value)
+
 
 # --- Database Connection ---
 @st.cache_resource
@@ -960,8 +990,10 @@ def _get_selected_face_ids(person_id: str) -> list[str]:
 
 
 def main():
-    st.set_page_config(page_title="Face Clusters Viewer", layout="wide")
-    st.title("Face Cluster Explorer")
+    st.set_page_config(page_title="Face cluster explorer", layout="wide")
+    st.title("Face cluster explorer")
+
+    _init_session_state()
 
     view = st.session_state.get(VIEW_KEY, "persons")
     person_id = st.session_state.get(VIEW_PERSON_KEY)
@@ -1356,46 +1388,51 @@ def render_faces_step(person_id: str):
                         set_person_status(person_id, code)
                         st.rerun()
 
-    with st.expander("Merge this cluster into another person"):
-        other_persons = fetch_all_persons_for_merge(person_id)
-        if not other_persons:
-            st.info("No other named clusters found.")
-        else:
-            merge_target = st.selectbox(
-                "Select the person to merge this cluster into (this cluster will be deleted):",
-                options=other_persons,
-                format_func=lambda x: (
-                    f"{x[1] or 'Unnamed'} — {x[2]} faces  [{str(x[0])[:8]}…]"
-                ),
-                index=None,
-                key=f"merge_select_{person_id}",
-            )
-            if merge_target:
-                preview_col, btn_col = st.columns([1, 4])
-                with preview_col:
-                    sample_path, sample_bbox = merge_target[3], merge_target[4]
-                    if sample_path:
-                        data_url = face_thumb_url(
-                            sample_path, merge_target[5], sample_bbox
-                        )
-                        if data_url:
-                            st.markdown(
-                                f'<img src="{data_url}" style="width:80px;height:80px;'
-                                f'object-fit:contain;border-radius:6px;" />',
-                                unsafe_allow_html=True,
+    # Gated with on_change="rerun": a collapsed expander still executes its body,
+    # so fetch_all_persons_for_merge (~330ms) was running on every rerun of this
+    # page even though the dropdown was hidden.
+    merge_exp = st.expander("Merge this cluster into another person", on_change="rerun")
+    if merge_exp.open:
+        with merge_exp:
+            other_persons = fetch_all_persons_for_merge(person_id)
+            if not other_persons:
+                st.info("No other named clusters found.")
+            else:
+                merge_target = st.selectbox(
+                    "Merge this cluster into (this cluster will be deleted)",
+                    options=other_persons,
+                    format_func=lambda x: (
+                        f"{x[1] or 'Unnamed'} — {x[2]} faces  [{str(x[0])[:8]}…]"
+                    ),
+                    index=None,
+                    key=f"merge_select_{person_id}",
+                )
+                if merge_target:
+                    preview_col, btn_col = st.columns([1, 4])
+                    with preview_col:
+                        sample_path, sample_bbox = merge_target[3], merge_target[4]
+                        if sample_path:
+                            data_url = face_thumb_url(
+                                sample_path, merge_target[5], sample_bbox
                             )
-                with btn_col:
-                    if st.button(
-                        f"Merge this cluster into {merge_target[1]}",
-                        key=f"merge_btn_{person_id}",
-                        type="primary",
-                    ):
-                        try:
-                            merge_persons_into(str(merge_target[0]), [person_id])
-                            st.success(f"Merged into {merge_target[1]}.")
-                            navigate_to_persons()
-                        except Exception as e:
-                            st.error(f"Merge failed: {e}")
+                            if data_url:
+                                st.markdown(
+                                    f'<img src="{data_url}" style="width:80px;height:80px;'
+                                    f'object-fit:contain;border-radius:6px;" />',
+                                    unsafe_allow_html=True,
+                                )
+                    with btn_col:
+                        if st.button(
+                            f"Merge this cluster into {merge_target[1]}",
+                            key=f"merge_btn_{person_id}",
+                            type="primary",
+                        ):
+                            try:
+                                merge_persons_into(str(merge_target[0]), [person_id])
+                                st.success(f"Merged into {merge_target[1]}.")
+                                navigate_to_persons()
+                            except Exception as e:
+                                st.error(f"Merge failed: {e}")
 
     # Faces pagination
     view_page_key = f"view_page_{person_id}"
@@ -1514,16 +1551,14 @@ def render_unknown_step():
     # Use an explicit set to track selections rather than individual widget keys.
     # Pre-populating many checkbox session-state keys at once (old approach) was
     # disrupting sort_by_similarity / target_person state on the following rerun.
-    SEL_KEY = "unknown_selected_set"
-    st.session_state.setdefault(SEL_KEY, set())
+    SEL_KEY = UNKNOWN_SEL_KEY
 
-    assign_mode_key = "assign_mode_unknown"
-    st.session_state.setdefault(assign_mode_key, False)
+    assign_mode_key = UNKNOWN_ASSIGN_MODE_KEY
     in_assign_mode = st.session_state[assign_mode_key]
 
     header_col, select_col, back_col = st.columns([6, 2, 1])
     with header_col:
-        st.markdown("## Uncategorized Faces")
+        st.header("Uncategorized faces")
     with select_col:
         toggle_label = "Cancel selection" if in_assign_mode else "Select multiple"
         if st.button(toggle_label, key="toggle_assign_unknown"):
@@ -1540,8 +1575,7 @@ def render_unknown_step():
     # doesn't require entering bulk-select mode first.
     # Manual state management (no key= on selectbox) avoids the widget-state
     # reset that occurs when st.rerun() is called from inside a column context.
-    TARGET_KEY = "unknown_target_pid"
-    st.session_state.setdefault(TARGET_KEY, "")
+    TARGET_KEY = UNKNOWN_TARGET_KEY
 
     named_persons = fetch_named_persons_for_assign()
     target_person = None
@@ -1573,7 +1607,6 @@ def render_unknown_step():
         target_person = person_map.get(st.session_state[TARGET_KEY])
 
         with ctrl_col2:
-            st.session_state.setdefault("sort_by_similarity", True)
             sort_by_similarity = st.checkbox(
                 "Sort by similarity",
                 key="sort_by_similarity",
@@ -1583,8 +1616,7 @@ def render_unknown_step():
         st.warning("No named persons found. Label some clusters first.")
 
     # Pagination
-    view_page_key = "view_page_unknown"
-    st.session_state.setdefault(view_page_key, 1)
+    view_page_key = UNKNOWN_PAGE_KEY
 
     total_faces = fetch_face_count_for_unknown()
     total_pages = max(1, math.ceil(total_faces / FACES_PAGE_SIZE))
@@ -1790,12 +1822,11 @@ def render_review_face_cell(
 
 
 def render_review_step():
-    SEL_KEY = "review_selected_set"
-    st.session_state.setdefault(SEL_KEY, set())
+    SEL_KEY = REVIEW_SEL_KEY
 
     header_col, back_col = st.columns([8, 1])
     with header_col:
-        st.markdown("## Review Suggestions")
+        st.header("Review suggestions")
     with back_col:
         if st.button("Back to list", key="review_back"):
             navigate_to_persons()
@@ -1804,8 +1835,7 @@ def render_review_step():
     # never accidentally clear the filter.  We store the chosen person_id under
     # FILTER_KEY and pass index= explicitly; the widget has no key= binding so
     # Streamlit cannot overwrite our state on its own.
-    FILTER_KEY = "review_filter_pid"
-    st.session_state.setdefault(FILTER_KEY, "")
+    FILTER_KEY = REVIEW_FILTER_KEY
 
     suggested_persons = fetch_suggested_persons()
     person_map = {str(p[0]): (p[1], p[2]) for p in suggested_persons}
@@ -1844,8 +1874,7 @@ def render_review_step():
         return
 
     # Pagination
-    view_page_key = "review_page"
-    st.session_state.setdefault(view_page_key, 1)
+    view_page_key = REVIEW_PAGE_KEY
     total_pages = max(1, math.ceil(total / FACES_PAGE_SIZE))
     st.session_state[view_page_key] = max(
         1, min(st.session_state[view_page_key], total_pages)
