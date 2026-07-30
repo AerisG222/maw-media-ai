@@ -1528,8 +1528,17 @@ def render_faces_step(person_id: str):
                     ):
                         _show_original_photo(file_path)
                     is_pref = preferred_face_id == str(face_id)
+                    # State is carried by the button style, not the icon.
+                    # Streamlit renders Material Symbols with the variable font's
+                    # FILL axis at 0, so ":material/star:" and
+                    # ":material/star_outline:" both draw an *outlined* star --
+                    # swapping the name changes nothing visually.  type="primary"
+                    # tints the whole button with the theme accent instead, which
+                    # is unambiguous regardless of the icon font.
                     if st.button(
-                        "", icon=":material/star:" if is_pref else ":material/star_outline:",
+                        "",
+                        icon=":material/star:",
+                        type="primary" if is_pref else "secondary",
                         key=f"pref_face_{person_id}_{face_id}",
                         help="Current cluster preview — click to clear"
                         if is_pref
