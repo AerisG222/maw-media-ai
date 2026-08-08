@@ -117,11 +117,23 @@ Image decoding is overlapped with inference on background threads. Tune with
 
 ### Cluster into persons
 
-Groups all stored embeddings into person clusters using HDBSCAN.
-Run this after a scan, or after adding many new photos.
+Groups unsettled faces into person clusters using HDBSCAN. Faces belonging to a
+named person, or to a cluster you have marked Unknown / Not a person, are left
+completely alone — so re-running this never disturbs labelling or triage work.
 
 ```bash
 python scan-faces.py cluster
+```
+
+Embeddings are reduced to 60 dimensions (PCA) before clustering. HDBSCAN falls
+back to brute-force pairwise distances above 60 dimensions, which makes raw
+512-dim clustering O(n²) — measured at n^2.01, roughly 35 minutes for 62k faces
+versus about a minute reduced. Scored against already-labelled faces, the
+reduced version is also *more* accurate (ARI 0.961 vs 0.908).
+
+```bash
+python scan-faces.py cluster --no-pca              # raw 512-dim (slow, for comparison)
+python scan-faces.py cluster --pca-components 96   # different reduction
 ```
 
 ### Suggest assignments

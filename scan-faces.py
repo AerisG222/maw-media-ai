@@ -69,6 +69,29 @@ HDBSCAN_MIN_CLUSTER_SIZE = int(os.getenv("HDBSCAN_MIN_CLUSTER_SIZE", "5"))
 HDBSCAN_MIN_SAMPLES = int(os.getenv("HDBSCAN_MIN_SAMPLES", "3"))
 HDBSCAN_CLUSTER_THRESHOLD = float(os.getenv("HDBSCAN_CLUSTER_THRESHOLD", "0.4"))
 
+# Dimensions to reduce embeddings to (via PCA) before running HDBSCAN.
+#
+# HDBSCAN switches to brute-force pairwise distances above 60 dimensions
+# (`if X.shape[1] > 60` in hdbscan/hdbscan_.py), so raw 512-dim embeddings make
+# clustering O(n^2): measured at n^2.01 on this data, ~35 min for 62k faces.
+# Reducing to 60 lets it use a KD-tree instead.
+#
+# Measured against 20k already-labelled faces across 260 named people, scoring
+# each result against those known identities:
+#     512 dims   215s   ARI 0.908
+#     PCA 60      33s   ARI 0.961    <- faster AND more accurate
+#     PCA 96      33s   ARI 0.928
+#     PCA 128     46s   ARI 0.916
+# 60 is the sweet spot because it is exactly the tree threshold; below it (50)
+# accuracy falls off sharply as distinct people start merging.
+#
+# PCA affects ONLY which faces get grouped together.  Centroids are still
+# computed from the original 512-dim vectors, since representative_embedding is
+# vector(512) and is compared against raw face embeddings by pgvector.
+#
+# Set to 0 (or pass --no-pca) to cluster on the raw embeddings.
+CLUSTER_PCA_COMPONENTS = int(os.getenv("CLUSTER_PCA_COMPONENTS", "60"))
+
 # Cosine distance threshold for incremental recognition (0 = identical, 2 = opposite).
 # Faces with nearest-neighbor distance below this are assigned to the existing person.
 RECOGNITION_DISTANCE_THRESHOLD = float(
@@ -617,9 +640,15 @@ def _count_named_assignments() -> int:
         conn.close()
 
 
-def cmd_cluster(rebuild_all: bool = False) -> None:
+def cmd_cluster(
+    rebuild_all: bool = False, pca_components: int = CLUSTER_PCA_COMPONENTS
+) -> None:
     """
     Cluster face embeddings with HDBSCAN into person rows.
+
+    Embeddings are reduced to *pca_components* dimensions before clustering so
+    HDBSCAN can use a KD-tree rather than brute force -- see the note on
+    CLUSTER_PCA_COMPONENTS.  Pass 0 to cluster on the raw 512-dim vectors.
 
     By default only *unsettled* faces are considered — those that are
     unassigned, or sitting in an unnamed cluster.  Faces belonging to a NAMED
@@ -675,6 +704,27 @@ def cmd_cluster(rebuild_all: bool = False) -> None:
 
     X = np.array(embeddings, dtype=np.float32)
 
+    # Reduce dimensionality for the clustering step only.  X itself is left at
+    # 512 dims because the centroids written below must stay in that space.
+    X_cluster = X
+    n_comp = min(pca_components, X.shape[0], X.shape[1]) if pca_components else 0
+    if n_comp:
+        from sklearn.decomposition import PCA
+
+        t_pca = time.time()
+        pca = PCA(n_components=n_comp, random_state=0)
+        X_cluster = pca.fit_transform(X).astype(np.float32)
+        log.info(
+            f"Reduced {X.shape[1]} -> {n_comp} dims for clustering in "
+            f"{time.time() - t_pca:.1f}s "
+            f"({100 * pca.explained_variance_ratio_.sum():.0f}% variance kept)."
+        )
+    else:
+        log.warning(
+            f"Clustering on raw {X.shape[1]} dims -- HDBSCAN uses brute force "
+            "above 60, so this is O(n^2) and much slower."
+        )
+
     log.info(
         f"Running HDBSCAN (min_cluster_size={HDBSCAN_MIN_CLUSTER_SIZE}, "
         f"min_samples={HDBSCAN_MIN_SAMPLES})…"
@@ -687,7 +737,7 @@ def cmd_cluster(rebuild_all: bool = False) -> None:
         cluster_selection_epsilon=HDBSCAN_CLUSTER_THRESHOLD,
         core_dist_n_jobs=-1,
     )
-    labels = clusterer.fit_predict(X)
+    labels = clusterer.fit_predict(X_cluster)
     elapsed = time.time() - t0
 
     unique_labels = set(labels)
@@ -721,6 +771,9 @@ def cmd_cluster(rebuild_all: bool = False) -> None:
     face_update_count = 0
 
     for indices in tqdm(cluster_to_indices.values(), desc="Writing clusters"):
+        # Deliberately X, not X_cluster: representative_embedding is vector(512)
+        # and is compared against raw face embeddings, so the centroid has to
+        # live in the original space even when clustering used PCA.
         cluster_embeddings = X[indices]
         centroid = cluster_embeddings.mean(axis=0)
         norm = np.linalg.norm(centroid)
@@ -1285,6 +1338,22 @@ def main() -> None:
              "(faces belonging to a named person are left untouched).",
     )
     p_cluster.add_argument(
+        "--no-pca",
+        action="store_true",
+        help=f"Cluster on the raw 512-dim embeddings instead of reducing to "
+             f"{CLUSTER_PCA_COMPONENTS} dims first. HDBSCAN uses brute force above "
+             "60 dimensions, so this is O(n^2) and dramatically slower on large "
+             "pools (~35 min vs ~1 min for 62k faces). Measured to be less "
+             "accurate too; kept for comparison.",
+    )
+    p_cluster.add_argument(
+        "--pca-components",
+        type=int,
+        default=CLUSTER_PCA_COMPONENTS,
+        help=f"Dimensions to reduce to before clustering (default: "
+             f"{CLUSTER_PCA_COMPONENTS}). Values above 60 lose the tree speedup.",
+    )
+    p_cluster.add_argument(
         "--rebuild-all",
         action="store_true",
         help="Cluster EVERY face from scratch, discarding all manual person "
@@ -1369,7 +1438,10 @@ def main() -> None:
             if input("  Type 'rebuild' to confirm: ").strip() != "rebuild":
                 print("  Aborted.")
                 return
-        cmd_cluster(args.rebuild_all)
+        cmd_cluster(
+            args.rebuild_all,
+            pca_components=0 if args.no_pca else args.pca_components,
+        )
     elif args.command == "suggest":
         cmd_suggest(
             args.threshold, args.min_confidence, args.method,
