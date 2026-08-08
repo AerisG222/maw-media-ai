@@ -52,6 +52,12 @@ VIEW_PERSON_KEY = "view_person_id"
 # "view_page_<person_id>") are necessarily created where they are used, since
 # their names depend on runtime values.
 PERSONS_PAGE_KEY = "choose_page"
+# Faces-page selection is a single set rather than one key per cluster: it is
+# cleared on entering a cluster (navigate_to_faces), so it only ever holds ids
+# from the cluster on screen. The move target deliberately survives navigation —
+# working through several clusters feeding the same person is the common case.
+FACES_SEL_KEY = "faces_selected_set"
+FACES_MOVE_TARGET_KEY = "faces_move_target_pid"
 UNKNOWN_SEL_KEY = "unknown_selected_set"
 UNKNOWN_ASSIGN_MODE_KEY = "assign_mode_unknown"
 UNKNOWN_TARGET_KEY = "unknown_target_pid"
@@ -66,6 +72,8 @@ def _init_session_state() -> None:
     """Seed every fixed-name session-state key, once, at app entry."""
     for key, value in {
         PERSONS_PAGE_KEY: 1,
+        FACES_SEL_KEY: set(),
+        FACES_MOVE_TARGET_KEY: "",
         UNKNOWN_SEL_KEY: set(),
         UNKNOWN_ASSIGN_MODE_KEY: False,
         UNKNOWN_TARGET_KEY: "",
@@ -125,6 +133,22 @@ def execute_update(query: str, params: tuple = ()):
             cur.execute(query, params)
 
 
+# Recomputes a person's centroid from its current faces. Takes the person id
+# twice (subquery, then WHERE). Whenever faces move between clusters, EVERY
+# affected cluster needs this — a stale centroid quietly skews `suggest` and
+# `merge-clusters`, with nothing in the UI to show for it.
+_REFRESH_CENTROID_SQL = """
+    UPDATE person
+    SET representative_embedding = (
+        SELECT avg(embedding)::vector
+        FROM face_detection
+        WHERE person_id = %s AND embedding IS NOT NULL
+    ),
+    updated_at = now()
+    WHERE id = %s
+"""
+
+
 def remove_faces_from_person(person_id: str, face_ids: list[str]):
     """Unassign the given faces from a person (face_count comes from the person_v view)."""
     with get_connection() as conn:
@@ -133,6 +157,7 @@ def remove_faces_from_person(person_id: str, face_ids: list[str]):
                 "UPDATE face_detection SET person_id = NULL WHERE id = ANY(%s::uuid[])",
                 (face_ids,),
             )
+            cur.execute(_REFRESH_CENTROID_SQL, (person_id, person_id))
             conn.commit()
 
 
@@ -144,20 +169,37 @@ def assign_faces_to_person(person_id: str, face_ids: list[str]):
                 "UPDATE face_detection SET person_id = %s WHERE id = ANY(%s::uuid[])",
                 (person_id, face_ids),
             )
+            cur.execute(_REFRESH_CENTROID_SQL, (person_id, person_id))
+            conn.commit()
+
+
+def move_faces_to_person(
+    source_id: str, target_id: str, face_ids: list[str]
+) -> int:
+    """Reassign specific faces from one cluster to another; return the count moved.
+
+    Unlike merge_persons_into, the source cluster survives — this is for pulling
+    the few faces that don't belong out of an otherwise-good cluster. If that
+    empties the source, it is left in place for the "Cleanup empty" button.
+
+    The `person_id = source` guard makes the move idempotent: a selection that
+    went stale (someone else moved those faces, or a double-submit) reassigns
+    nothing rather than yanking faces out of whichever cluster now owns them.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE person
-                SET representative_embedding = (
-                    SELECT avg(embedding)::vector
-                    FROM face_detection
-                    WHERE person_id = %s AND embedding IS NOT NULL
-                ),
-                updated_at = now()
-                WHERE id = %s
+                UPDATE face_detection SET person_id = %s
+                WHERE id = ANY(%s::uuid[]) AND person_id = %s
                 """,
-                (person_id, person_id),
+                (target_id, face_ids, source_id),
             )
+            moved = cur.rowcount
+            cur.execute(_REFRESH_CENTROID_SQL, (target_id, target_id))
+            cur.execute(_REFRESH_CENTROID_SQL, (source_id, source_id))
             conn.commit()
+    return moved
 
 
 def set_preferred_face(person_id: str, face_id: str | None):
@@ -197,19 +239,7 @@ def merge_persons_into(target_id: str, source_ids: list[str]):
                 "UPDATE face_detection SET person_id = %s WHERE person_id = ANY(%s::uuid[])",
                 (target_id, source_ids),
             )
-            cur.execute(
-                """
-                UPDATE person
-                SET representative_embedding = (
-                    SELECT avg(embedding)::vector
-                    FROM face_detection
-                    WHERE person_id = %s AND embedding IS NOT NULL
-                ),
-                updated_at = now()
-                WHERE id = %s
-                """,
-                (target_id, target_id),
-            )
+            cur.execute(_REFRESH_CENTROID_SQL, (target_id, target_id))
             # If the target is unnamed, inherit the name from the first named source.
             cur.execute("SELECT name FROM person WHERE id = %s", (target_id,))
             target_row = cur.fetchone()
@@ -970,23 +1000,24 @@ def render_pagination_controls(
     return tuple(clicks)
 
 
-def _face_selection_key(person_id: str, face_id) -> str:
-    return f"remove_face_{person_id}_{face_id}"
+def render_selection_checkbox(key: str, face_id: str, sel_key: str) -> None:
+    """Checkbox that toggles *face_id* in the session-state set at *sel_key*.
 
+    Selections live in an explicit set, not in the checkbox widget keys. Writing
+    many widget keys at once (what "select all on page" does) resets unrelated
+    widgets on the next rerun — that is what previously broke the target-person
+    dropdown on the uncategorized page.
+    """
 
-def _clear_face_selections(person_id: str):
-    prefix = f"remove_face_{person_id}_"
-    for k in [k for k in st.session_state if k.startswith(prefix)]:
-        del st.session_state[k]
+    def _toggle(fid=face_id):
+        s = st.session_state[sel_key]
+        if fid in s:
+            s.discard(fid)
+        else:
+            s.add(fid)
 
-
-def _get_selected_face_ids(person_id: str) -> list[str]:
-    prefix = f"remove_face_{person_id}_"
-    return [
-        k[len(prefix) :]
-        for k, v in st.session_state.items()
-        if k.startswith(prefix) and v
-    ]
+    st.session_state[key] = face_id in st.session_state[sel_key]
+    st.checkbox("Select", key=key, on_change=_toggle, label_visibility="collapsed")
 
 
 def main():
@@ -1259,6 +1290,8 @@ def navigate_to_persons():
 def navigate_to_faces(person_id: str):
     st.session_state[VIEW_KEY] = "faces"
     st.session_state[VIEW_PERSON_KEY] = person_id
+    # Face ids are only meaningful for the cluster they came from.
+    st.session_state[FACES_SEL_KEY] = set()
     st.rerun()
 
 
@@ -1306,12 +1339,12 @@ def render_faces_step(person_id: str):
         st.markdown(f"ID: `{html.escape(str(person_id))}` — Faces: {face_count}")
 
     with select_col:
-        toggle_label = "Cancel selection" if in_select_mode else "Select to remove"
+        toggle_label = "Cancel selection" if in_select_mode else "Select faces"
         if st.button(toggle_label, key=f"toggle_select_{person_id}"):
             new_mode = not in_select_mode
             st.session_state[select_mode_key] = new_mode
             if not new_mode:
-                _clear_face_selections(person_id)
+                st.session_state[FACES_SEL_KEY] = set()
             st.rerun()
 
     with clear_col:
@@ -1471,30 +1504,101 @@ def render_faces_step(person_id: str):
         person_id, limit=FACES_PAGE_SIZE, offset=offset
     )
 
-    # Summary + remove action row
     start_idx = offset + 1 if total_faces > 0 else 0
     end_idx = offset + len(faces)
-    summary_col, remove_col = st.columns([6, 4])
-    with summary_col:
-        st.markdown(
-            f"**Showing {start_idx}-{end_idx} of {total_faces} (page {page}/{total_pages})**"
-        )
+    st.markdown(
+        f"**Showing {start_idx}-{end_idx} of {total_faces} (page {page}/{total_pages})**"
+    )
+
+    # Bulk actions for the selected subset: move them to another person, or drop
+    # them out of this cluster entirely.  Moving beats "remove, then re-find them
+    # under Uncategorized" whenever you already know who they are.
     if in_select_mode:
-        selected_ids = _get_selected_face_ids(person_id)
+        page_face_ids = [str(f[0]) for f in faces]
+        move_targets = [
+            p
+            for p in fetch_named_persons_for_assign()
+            if str(p[0]) != str(person_id)
+        ]
+        target_map = {str(p[0]): p for p in move_targets}
+        target_options = [""] + list(target_map)
+
+        stored_target = st.session_state[FACES_MOVE_TARGET_KEY]
+        if stored_target not in target_options:
+            stored_target = ""
+            st.session_state[FACES_MOVE_TARGET_KEY] = ""
+
+        pick_col, all_col, move_col, remove_col = st.columns([4, 2, 2, 2])
+        with pick_col:
+            chosen_target = st.selectbox(
+                "Move selected faces to",
+                options=target_options,
+                format_func=lambda pid: (
+                    "— move selected to —"
+                    if pid == ""
+                    else f"{target_map[pid][1]}  ({target_map[pid][2]} faces)"
+                ),
+                index=target_options.index(stored_target),
+                label_visibility="collapsed",
+            )  # No key= — see the note in render_unknown_step
+        if chosen_target != stored_target:
+            st.session_state[FACES_MOVE_TARGET_KEY] = chosen_target
+        target = target_map.get(chosen_target)
+
+        with all_col:
+            if st.button(
+                "Select all on page",
+                key=f"select_all_faces_{person_id}",
+                width="stretch",
+            ):
+                st.session_state[FACES_SEL_KEY].update(page_face_ids)
+
+        # Read AFTER the select-all button may have updated the set in this same
+        # render pass — a copy taken earlier would be stale and would leave the
+        # action buttons disabled until the next interaction.
+        selected_ids = list(st.session_state[FACES_SEL_KEY])
+
+        with move_col:
+            if st.button(
+                f"Move {len(selected_ids)} face(s)" if selected_ids else "Move faces",
+                key=f"do_move_{person_id}",
+                type="primary",
+                disabled=not (selected_ids and target),
+                width="stretch",
+                help=(
+                    "Reassign only the selected faces; this cluster keeps the rest"
+                    if target
+                    else "Pick a person on the left first"
+                ),
+            ):
+                try:
+                    moved = move_faces_to_person(
+                        person_id, str(target[0]), selected_ids
+                    )
+                    st.session_state[FACES_SEL_KEY] = set()
+                    st.session_state[select_mode_key] = False
+                    st.toast(f"Moved {moved} face(s) to {target[1]}.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Move failed: {e}")
+
         with remove_col:
-            if selected_ids:
-                if st.button(
-                    f"Remove {len(selected_ids)} selected face(s)",
-                    key=f"do_remove_{person_id}",
-                    type="primary",
-                ):
-                    try:
-                        remove_faces_from_person(person_id, selected_ids)
-                        st.session_state[select_mode_key] = False
-                        _clear_face_selections(person_id)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed to remove faces: {e}")
+            if st.button(
+                f"Remove {len(selected_ids)} face(s)"
+                if selected_ids
+                else "Remove faces",
+                key=f"do_remove_{person_id}",
+                disabled=not selected_ids,
+                width="stretch",
+                help="Unassign the selected faces — they go back to Uncategorized",
+            ):
+                try:
+                    remove_faces_from_person(person_id, selected_ids)
+                    st.session_state[FACES_SEL_KEY] = set()
+                    st.session_state[select_mode_key] = False
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to remove faces: {e}")
 
     # Render face grid — one column per face so each can carry a "view original"
     # button (and, in select mode, a selection checkbox).
@@ -1549,10 +1653,10 @@ def render_faces_step(person_id: str):
                         )
                         st.rerun()
                 if in_select_mode:
-                    st.checkbox(
-                        "Select",
-                        key=_face_selection_key(person_id, face_id),
-                        label_visibility="collapsed",
+                    render_selection_checkbox(
+                        f"face_cb_{person_id}_{face_id}",
+                        str(face_id),
+                        FACES_SEL_KEY,
                     )
 
 
@@ -1707,7 +1811,6 @@ def render_unknown_step():
 
     # One column per face so each can carry a "view original" button. The
     # quick-assign button and selection checkbox are shown only when relevant.
-    selected_set = st.session_state[SEL_KEY]
     show_checkbox = target_person is not None or in_assign_mode
     for row_start in range(0, len(faces), GRID_COLS):
         row_faces = faces[row_start : row_start + GRID_COLS]
@@ -1767,21 +1870,8 @@ def render_unknown_step():
                         _show_original_photo(file_path)
 
                 if show_checkbox:
-                    cb_key = f"unknown_face_cb_{face_id_str}"
-
-                    def _toggle(fid=face_id_str):
-                        s = st.session_state[SEL_KEY]
-                        if fid in s:
-                            s.discard(fid)
-                        else:
-                            s.add(fid)
-
-                    st.session_state[cb_key] = face_id_str in selected_set
-                    st.checkbox(
-                        "Select",
-                        key=cb_key,
-                        on_change=_toggle,
-                        label_visibility="collapsed",
+                    render_selection_checkbox(
+                        f"unknown_face_cb_{face_id_str}", face_id_str, SEL_KEY
                     )
 
 
@@ -1962,7 +2052,6 @@ def render_review_step():
                 except Exception as e:
                     st.error(f"Failed: {e}")
 
-    selected_set = st.session_state[SEL_KEY]
     for row_start in range(0, len(faces), GRID_COLS):
         row_faces = faces[row_start : row_start + GRID_COLS]
         cols = st.columns(GRID_COLS)
@@ -1993,20 +2082,7 @@ def render_review_step():
                 ):
                     _show_original_photo(file_path)
 
-                def _toggle(fid=face_id_str):
-                    s = st.session_state[SEL_KEY]
-                    if fid in s:
-                        s.discard(fid)
-                    else:
-                        s.add(fid)
-
-                st.session_state[cb_key] = face_id_str in selected_set
-                st.checkbox(
-                    "Select",
-                    key=cb_key,
-                    on_change=_toggle,
-                    label_visibility="collapsed",
-                )
+                render_selection_checkbox(cb_key, face_id_str, SEL_KEY)
 
 
 if __name__ == "__main__":

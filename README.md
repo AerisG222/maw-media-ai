@@ -221,6 +221,13 @@ uncategorised faces (optionally sorted by similarity to a target person),
 merging similar clusters, reviewing `suggest` results, and clearing unwanted
 clusters.
 
+Inside a cluster, **Select faces** turns on a checkbox per face (plus *Select
+all on page*) and offers two bulk actions for that subset: **Move** them to
+another named person, or **Remove** them so they return to Uncategorized. Use
+Move for a cluster that is mostly one person with a few intruders — merging
+would move the whole cluster instead. Both actions recompute the centroids of
+every cluster involved, so `suggest` and `merge-clusters` stay accurate.
+
 ### 1. Install Streamlit (if not already done)
 
 ```bash
