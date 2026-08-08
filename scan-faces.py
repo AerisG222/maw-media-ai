@@ -2,13 +2,13 @@
 """
 Face Detection & Recognition Scanner
 =====================================
-Scans a photo directory tree, detects faces using InsightFace (buffalo_l),
+Scans a media directory tree, detects faces using InsightFace (buffalo_l),
 generates 512-dim embeddings, clusters them with HDBSCAN, and writes
 everything to Postgres (with pgvector) for querying from your .NET app.
 
 Usage:
-    # Scan new/unscanned photos (already-scanned photos are skipped):
-    python scan_faces.py scan --photo-dir /path/to/photos
+    # Scan new/unscanned media (already-scanned files are skipped):
+    python scan_faces.py scan --media-dir /path/to/media
 
     # Cluster detected faces into person:
     python scan_faces.py cluster
@@ -149,7 +149,7 @@ def get_connection(dsn: str) -> psycopg.Connection:
 
 def check_schema(conn: psycopg.Connection) -> bool:
     """Check if the required tables exist. Returns True if schema is present."""
-    required_tables = {"photo", "person", "face_detection"}
+    required_tables = {"media", "person", "face_detection"}
     with conn.cursor() as cur:
         cur.execute("""
             SELECT table_name FROM information_schema.tables
@@ -160,48 +160,48 @@ def check_schema(conn: psycopg.Connection) -> bool:
 
 
 def get_already_scanned_paths(conn: psycopg.Connection) -> set[str]:
-    """Return file paths that already have a photos row (success or error)."""
+    """Return file paths that already have a media row (success or error)."""
     with conn.cursor() as cur:
-        cur.execute("SELECT file_path FROM photo")
+        cur.execute("SELECT file_path FROM media")
         return {row["file_path"] for row in cur.fetchall()}
 
 
 import uuid
 
 
-def upsert_photo(
+def upsert_media(
     conn: psycopg.Connection, file_path: str, error: str | None = None
 ) -> str:
-    """Insert or update a photos row; return the photo id (UUID string)."""
+    """Insert or update a media row; return the media id (UUID string)."""
     with conn.cursor() as cur:
-        # Try to fetch existing photo id first
-        cur.execute("SELECT id FROM photo WHERE file_path = %s", (file_path,))
+        # Try to fetch the existing media id first
+        cur.execute("SELECT id FROM media WHERE file_path = %s", (file_path,))
         row = cur.fetchone()
         if row:
             # Update scan_error if needed
             cur.execute(
                 """
-                UPDATE photo SET scanned_at = now(), scan_error = %s WHERE id = %s
+                UPDATE media SET scanned_at = now(), scan_error = %s WHERE id = %s
                 """,
                 (error, row["id"]),
             )
             return row["id"]
-        # Insert new photo with generated UUIDv7
-        photo_id = str(uuid.uuid7())
+        # Insert new media row with generated UUIDv7
+        media_id = str(uuid.uuid7())
         cur.execute(
             """
-            INSERT INTO photo (id, file_path, file_name, scan_error)
+            INSERT INTO media (id, file_path, file_name, scan_error)
             VALUES (%s, %s, %s, %s)
             RETURNING id
             """,
-            (photo_id, file_path, Path(file_path).name, error),
+            (media_id, file_path, Path(file_path).name, error),
         )
         return cur.fetchone()["id"]
 
 
 def insert_face(
     conn: psycopg.Connection,
-    photo_id: str,
+    media_id: str,
     face_id: str,
     bbox: dict,
     embedding: np.ndarray,
@@ -220,13 +220,13 @@ def insert_face(
         cur.execute(
             """
             INSERT INTO face_detection
-                (id, photo_id, bounding_box, embedding, detection_score, face_width_px, face_height_px, person_id)
+                (id, media_id, bounding_box, embedding, detection_score, face_width_px, face_height_px, person_id)
             VALUES (%s, %s, %s, %s::vector, %s, %s, %s, %s)
             RETURNING id
             """,
             (
                 face_id,
-                photo_id,
+                media_id,
                 json.dumps(bbox),
                 vec_str,
                 det_score,
@@ -404,7 +404,7 @@ def _crop_region(img_bgr: np.ndarray, bbox: dict) -> np.ndarray | None:
     Uses the normalized (0–1) coordinates scaled to the actual image size, so
     the crop is correct regardless of whether the image was downscaled since
     detection.  The stored ``*_px`` values assume the resolution detection ran
-    at and would mis-crop a full-resolution re-read of a large photo.
+    at and would mis-crop a full-resolution re-read of a large media file.
     """
     img_h, img_w = img_bgr.shape[:2]
     x = bbox.get("x")
@@ -466,10 +466,10 @@ def write_face_crop(img_bgr: np.ndarray, bbox: dict, crop_path: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def iter_images(photo_dir: str) -> list[Path]:
-    root = Path(photo_dir)
+def iter_images(media_dir: str) -> list[Path]:
+    root = Path(media_dir)
     if not root.exists():
-        log.error(f"Photo directory does not exist: {photo_dir}")
+        log.error(f"Media directory does not exist: {media_dir}")
         sys.exit(1)
     paths = [
         p
@@ -513,8 +513,8 @@ def _iter_prefetched_images(paths: list[str | Path], n_workers: int):
             yield path_str, img
 
 
-def cmd_scan(photo_dir: str, workers: int = SCAN_LOADER_THREADS) -> None:
-    log.info(f"Scanning photos in: {photo_dir}")
+def cmd_scan(media_dir: str, workers: int = SCAN_LOADER_THREADS) -> None:
+    log.info(f"Scanning media in: {media_dir}")
 
     conn = get_connection(DB_DSN)
     if not check_schema(conn):
@@ -523,10 +523,10 @@ def cmd_scan(photo_dir: str, workers: int = SCAN_LOADER_THREADS) -> None:
         )
         sys.exit(1)
 
-    all_images = iter_images(photo_dir)
+    all_images = iter_images(media_dir)
     log.info(f"Found {len(all_images):,} image(s) in directory tree.")
 
-    # Skip images that already have a photos row.
+    # Skip images that already have a media row.
     already_scanned = get_already_scanned_paths(conn)
     images_to_scan = [p for p in all_images if str(p) not in already_scanned]
     log.info(
@@ -553,12 +553,12 @@ def cmd_scan(photo_dir: str, workers: int = SCAN_LOADER_THREADS) -> None:
             pbar.set_postfix(faces=total_faces, errors=errors)
 
             if img is None:
-                photo_id = upsert_photo(conn, path_str, error="Failed to load image")
+                media_id = upsert_media(conn, path_str, error="Failed to load image")
                 errors += 1
                 batch_count += 1
             else:
                 faces = detect_faces(img)
-                photo_id = upsert_photo(conn, path_str)
+                media_id = upsert_media(conn, path_str)
 
                 for face in faces:
                     face_id = str(uuid.uuid7())
@@ -568,7 +568,7 @@ def cmd_scan(photo_dir: str, workers: int = SCAN_LOADER_THREADS) -> None:
                     write_face_crop(img, bbox, face_crop_path(path_str, face_id))
                     insert_face(
                         conn,
-                        photo_id,
+                        media_id,
                         face_id,
                         bbox,
                         face["embedding"],
@@ -1181,10 +1181,10 @@ def cmd_stats() -> None:
     conn = get_connection(DB_DSN)
 
     with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) AS n FROM photo")
-        n_photos = cur.fetchone()["n"]
+        cur.execute("SELECT COUNT(*) AS n FROM media")
+        n_media = cur.fetchone()["n"]
 
-        cur.execute("SELECT COUNT(*) AS n FROM photo WHERE scan_error IS NOT NULL")
+        cur.execute("SELECT COUNT(*) AS n FROM media WHERE scan_error IS NOT NULL")
         n_errors = cur.fetchone()["n"]
 
         cur.execute("SELECT COUNT(*) AS n FROM face_detection")
@@ -1227,8 +1227,8 @@ def cmd_stats() -> None:
     conn.close()
 
     print("\n=== Face Scanner Stats ===")
-    print(f"  Photos scanned:      {n_photos:>8,}")
-    print(f"  Photos with errors:  {n_errors:>8,}")
+    print(f"  Media scanned:       {n_media:>8,}")
+    print(f"  Media with errors:   {n_errors:>8,}")
     print(f"  Faces detected:      {n_faces:>8,}")
     print(f"  Faces assigned:      {n_faces - n_unassigned:>8,}")
     print(f"  Faces unassigned:    {n_unassigned:>8,}")
@@ -1254,7 +1254,7 @@ def cmd_stats() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Face detection & recognition scanner for local photo libraries.",
+        description="Face detection & recognition scanner for local media libraries.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -1263,12 +1263,12 @@ def main() -> None:
     # scan
     p_scan = sub.add_parser(
         "scan",
-        help="Detect faces in new photos and store embeddings (skips already-scanned).",
+        help="Detect faces in new media and store embeddings (skips already-scanned).",
     )
     p_scan.add_argument(
-        "--photo-dir",
+        "--media-dir",
         required=True,
-        help="Root directory of your photo library.",
+        help="Root directory of your media library.",
     )
     p_scan.add_argument(
         "--workers",
@@ -1358,7 +1358,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "scan":
-        cmd_scan(args.photo_dir, args.workers)
+        cmd_scan(args.media_dir, args.workers)
     elif args.command == "cluster":
         if args.rebuild_all:
             n = _count_named_assignments()

@@ -3,20 +3,23 @@
 -- Run this once against your Postgres 18 database before the first scan.
 -- Requires the pgvector extension: https://github.com/pgvector/pgvector
 --
--- Table names are singular nouns (photo, person, face_detection).  This file
+-- Table names are singular nouns (media, person, face_detection).  This file
 -- builds a fresh database; it is idempotent, so re-running it is safe.  It does
--- NOT migrate an older database in place -- notably it will not rename plural
--- tables or drop columns that have since been removed.
+-- NOT migrate an older database in place -- notably it will not rename tables or
+-- columns, nor drop columns that have since been removed.  Use the scripts in
+-- migrations/ for that.
 -- =============================================================================
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ---------------------------------------------------------------------------
--- photo
--- One row per image file that has been scanned (or attempted).
--- You may already have a photo table — if so, add the scanner columns to it
+-- media
+-- One row per media file that has been scanned (or attempted).  Named `media`
+-- rather than `photo` because the pipeline is intended to cover videos too, and
+-- to match maw-media's vocabulary (see docs/face-sync.md §4.1).
+-- You may already have a media table — if so, add the scanner columns to it
 -- and remove the REFERENCES below that point here.
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS photo (
+CREATE TABLE IF NOT EXISTS media (
     id              UUID PRIMARY KEY,
     file_path       TEXT NOT NULL UNIQUE,
     file_name       TEXT NOT NULL,
@@ -35,8 +38,11 @@ CREATE TABLE IF NOT EXISTS person (
     representative_embedding    vector(512),             -- centroid of all face embeddings
     created_at                  TIMESTAMPTZ DEFAULT now(),
     updated_at                  TIMESTAMPTZ DEFAULT now(),
-    preferred_face_id           UUID REFERENCES face_detection(id) ON DELETE SET NULL,
-    status_code                 TEXT REFERENCES person_status(code)
+    -- preferred_face_id and status_code are added below, once the tables they
+    -- reference exist.  Declaring the FKs inline here would make this file fail
+    -- on a genuinely fresh database, since person is created first.
+    preferred_face_id           UUID,
+    status_code                 TEXT
 );
 
 -- ---------------------------------------------------------------------------
@@ -62,13 +68,13 @@ ON CONFLICT (code) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- face_detection
--- One row per detected face in a photo.
+-- One row per detected face in a media file.
 -- bounding_box stores normalised coordinates (0–1) so they survive resizes,
 -- plus raw pixel values for convenience.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS face_detection (
     id                   UUID PRIMARY KEY,
-    photo_id             UUID NOT NULL REFERENCES photo(id) ON DELETE CASCADE,
+    media_id             UUID NOT NULL REFERENCES media(id) ON DELETE CASCADE,
     person_id            UUID REFERENCES person(id) ON DELETE SET NULL,
     bounding_box         JSONB NOT NULL,
     embedding            vector(512),
@@ -80,6 +86,17 @@ CREATE TABLE IF NOT EXISTS face_detection (
     suggested_person_id  UUID REFERENCES person(id) ON DELETE SET NULL
 );
 
+-- Deferred foreign keys: both targets are created above this point, so these
+-- can only be attached now (see the note in the person table).
+ALTER TABLE person DROP CONSTRAINT IF EXISTS person_preferred_face_id_fkey;
+ALTER TABLE person ADD CONSTRAINT person_preferred_face_id_fkey
+    FOREIGN KEY (preferred_face_id) REFERENCES face_detection(id) ON DELETE SET NULL;
+
+ALTER TABLE person DROP CONSTRAINT IF EXISTS person_status_code_fkey;
+ALTER TABLE person ADD CONSTRAINT person_status_code_fkey
+    FOREIGN KEY (status_code) REFERENCES person_status(code);
+
+-- A named person is triaged by definition, so the two are mutually exclusive.
 ALTER TABLE person DROP CONSTRAINT IF EXISTS person_name_status_excl;
 ALTER TABLE person ADD CONSTRAINT person_name_status_excl
     CHECK (name IS NULL OR status_code IS NULL);
@@ -99,8 +116,8 @@ CREATE INDEX IF NOT EXISTS face_detection_embedding_idx
     ON face_detection USING ivfflat (embedding vector_cosine_ops)
     WITH (lists = 100);
 
-CREATE INDEX IF NOT EXISTS face_detection_photo_id_idx
-    ON face_detection(photo_id);
+CREATE INDEX IF NOT EXISTS face_detection_media_id_idx
+    ON face_detection(media_id);
 
 CREATE INDEX IF NOT EXISTS face_detection_person_id_idx
     ON face_detection(person_id);
@@ -154,30 +171,30 @@ LEFT JOIN (
     GROUP BY person_id
 ) c ON c.person_id = p.id;
 
--- All photos that contain at least one recognised (named) person.
-CREATE OR REPLACE VIEW photos_with_named_persons AS
+-- All media that contain at least one recognised (named) person.
+CREATE OR REPLACE VIEW media_with_named_persons AS
 SELECT
-    p.id            AS photo_id,
-    p.file_path,
-    p.file_name,
+    m.id            AS media_id,
+    m.file_path,
+    m.file_name,
     per.id          AS person_id,
     per.name        AS person_name,
     fd.detection_score,
     fd.bounding_box
-FROM photo p
-JOIN face_detection fd ON fd.photo_id = p.id
+FROM media m
+JOIN face_detection fd ON fd.media_id = m.id
 JOIN person per        ON per.id = fd.person_id
 WHERE per.name IS NOT NULL;
 
--- Aggregate: photos with a JSON array of the named people in them.
-CREATE OR REPLACE VIEW photo_person_summary AS
+-- Aggregate: media with a JSON array of the named people in them.
+CREATE OR REPLACE VIEW media_person_summary AS
 SELECT
-    p.id        AS photo_id,
-    p.file_path,
-    p.file_name,
+    m.id        AS media_id,
+    m.file_path,
+    m.file_name,
     jsonb_agg(DISTINCT per.name ORDER BY per.name) AS people
-FROM photo p
-JOIN face_detection fd ON fd.photo_id = p.id
+FROM media m
+JOIN face_detection fd ON fd.media_id = m.id
 JOIN person per        ON per.id = fd.person_id
 WHERE per.name IS NOT NULL
-GROUP BY p.id, p.file_path, p.file_name;
+GROUP BY m.id, m.file_path, m.file_name;

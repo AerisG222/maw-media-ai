@@ -79,7 +79,7 @@ Rationale:
 The cost — an extra lookup per publish — is negligible when done set-based
 (see §5).
 
-> **Naming trap.** After the rename in §4, `face_detection.media_id` refers to
+> **Naming trap.** `face_detection.media_id` here refers to
 > *this* database's local `media.id`. maw-media's `media.face.media_id` refers
 > to *its* media id. Same column name, different values. They never meet,
 > because the wire format carries `file_path` and never `media_id`.
@@ -243,30 +243,7 @@ circular. Add the `preferred_face_id` foreign key in a `DO $$` block in
 
 ## 4. maw-media-ai schema changes
 
-### 4.1 Rename `photo` → `media`
-
-The vocabulary should match across both systems, and the pipeline is intended
-to cover videos as well as photos. Four things change:
-
-- `photo` → `media` (table)
-- `face_detection.photo_id` → `media_id` (column, and `face_detection_photo_id_idx`)
-- `photos_with_named_persons` → `media_with_named_persons`
-- `photo_person_summary` → `media_person_summary`
-
-Roughly 60 references across `scan-faces.py`, `view-clusters-app.py`,
-`schema.sql`, `face_cache.py` and `queries.sql`.
-
-`schema.sql` states that it builds fresh and does not migrate in place, so this
-needs a separate migration script for the existing database. `ALTER TABLE ...
-RENAME` preserves rows; views must be dropped and recreated.
-
-**Fix in the same pass:** `schema.sql` creates `person` with
-`REFERENCES face_detection(id)` and `REFERENCES person_status(code)`, but both
-of those tables are created later in the file. That file will fail on a
-genuinely fresh database; it works today only because the existing database
-predates those columns.
-
-### 4.2 Publish queue (outbox)
+### 4.1 Publish queue (outbox)
 
 ```sql
 CREATE SEQUENCE IF NOT EXISTS revision_seq;
@@ -290,7 +267,7 @@ changes — `name`, `person_id`, `status_code`, `bounding_box`. Deliberately
 **not** `embedding`, so a re-scan producing identical assignments does not
 cause a republish.
 
-### 4.3 Tombstones
+### 4.2 Tombstones
 
 `cluster` deletes and merges persons, and absence from a batch cannot express
 that. Deletions must be explicit:
@@ -308,7 +285,7 @@ CREATE TABLE IF NOT EXISTS deleted_entity (
 );
 ```
 
-### 4.4 Publish diagnostics
+### 4.3 Publish diagnostics
 
 Deliberately *not* a cached media id — these are never read as truth, only for
 observability:
@@ -318,7 +295,7 @@ ALTER TABLE media ADD COLUMN IF NOT EXISTS last_published_at TIMESTAMPTZ;
 ALTER TABLE media ADD COLUMN IF NOT EXISTS publish_error TEXT;  -- e.g. 'path not found'
 ```
 
-### 4.5 Inbound suggestions
+### 4.4 Inbound suggestions
 
 ```sql
 CREATE TABLE IF NOT EXISTS inbound_suggestion (
@@ -338,7 +315,7 @@ CREATE TABLE IF NOT EXISTS inbound_suggestion (
 );
 ```
 
-### 4.6 Confirmed labels
+### 4.5 Confirmed labels
 
 Applied suggestions must become **durable constraints**, not one-time edits —
 otherwise the next `cluster` run discards the human's correction.
@@ -433,7 +410,7 @@ cheap mitigations:
 
 1. `/face/sync` returns per-item results including an `unresolved` list, so a
    broken link is a number in the publisher's output rather than a gap.
-2. `media.publish_error` (§4.4) records it locally for later inspection.
+2. `media.publish_error` (§4.3) records it locally for later inspection.
 
 ### Drift reconciliation
 
@@ -539,18 +516,13 @@ one row per published detection either way.
 
 ## 8. Phasing
 
-1. **Rename** `photo` → `media` here, plus the `schema.sql` ordering fix.
-   Self-contained and blocks nothing else.
-2. **maw-media tables** — `media.person`, `media.face`, `media.face_suggestion`
+1. **maw-media tables** — `media.person`, `media.face`, `media.face_suggestion`
    and lookups, plus `media.sync_faces` with path resolution.
-3. **Publish path** — outbox columns and triggers here, `POST /face/sync`, a
+2. **Publish path** — outbox columns and triggers here, `POST /face/sync`, a
    publisher CLI subcommand. Read-only in maw-media, no UI yet.
-4. **Read APIs and UI** — faces on media detail, person browse, person search.
-5. **Suggestion loop** — suggestion tables, submit/pull/resolve, and the
+3. **Read APIs and UI** — faces on media detail, person browse, person search.
+4. **Suggestion loop** — suggestion tables, submit/pull/resolve, and the
    `face_label` constraint table that makes corrections stick.
-
-The rename does not gate the maw-media work, since nothing crosses the wire but
-file paths.
 
 ---
 

@@ -1,6 +1,6 @@
 # Face Scanner
 
-Detects and recognises faces in a local photo library, storing results in
+Detects and recognises faces in a local media library, storing results in
 Postgres (with pgvector) for querying from a .NET web application.
 
 ## Stack
@@ -103,13 +103,13 @@ scan → cluster → (label some clusters in the UI) → suggest → merge-clust
 
 ### Scan for faces
 
-Detects faces in the photo library, stores embeddings, and caches a
-display-sized crop of each face on disk for the web UI. Photos already in the
-database are skipped automatically, so this is safe to re-run as new photos
-arrive — no separate "incremental" flag is needed.
+Detects faces in the media library, stores embeddings, and caches a
+display-sized crop of each face on disk for the web UI. Files already in the
+database are skipped automatically, so this is safe to re-run as new media
+arrives — no separate "incremental" flag is needed.
 
 ```bash
-python scan-faces.py scan --photo-dir /path/to/photos
+python scan-faces.py scan --media-dir /path/to/media
 ```
 
 Image decoding is overlapped with inference on background threads. Tune with
@@ -241,9 +241,9 @@ dotnet add package Pgvector
 
 **All photos containing a named person:**
 ```sql
-SELECT DISTINCT p.file_path
-FROM photo p
-JOIN face_detection fd ON fd.photo_id = p.id
+SELECT DISTINCT m.file_path
+FROM media m
+JOIN face_detection fd ON fd.media_id = m.id
 JOIN person per        ON per.id = fd.person_id
 WHERE per.name = 'Jane Smith';
 ```
@@ -253,36 +253,36 @@ WHERE per.name = 'Jane Smith';
 SELECT per.name, fd.bounding_box, fd.detection_score
 FROM face_detection fd
 JOIN person per ON per.id = fd.person_id
-WHERE fd.photo_id = $1
+WHERE fd.media_id = $1
 ORDER BY fd.detection_score DESC;
 ```
 
 **Photos with multiple specific people (AND logic):**
 ```sql
-SELECT p.file_path
-FROM photo p
+SELECT m.file_path
+FROM media m
 WHERE (
     SELECT COUNT(DISTINCT per.name)
     FROM face_detection fd
     JOIN person per ON per.id = fd.person_id
-    WHERE fd.photo_id = p.id
+    WHERE fd.media_id = m.id
       AND per.name IN ('Jane Smith', 'John Smith')
 ) = 2;
 ```
 
 **Similarity search — find photos with a face similar to a given embedding:**
 ```sql
-SELECT p.file_path, fd.detection_score,
+SELECT m.file_path, fd.detection_score,
        fd.embedding <=> $1::vector AS distance
 FROM face_detection fd
-JOIN photo p ON p.id = fd.photo_id
+JOIN media m ON m.id = fd.media_id
 ORDER BY fd.embedding <=> $1::vector
 LIMIT 20;
 ```
 
 **Use the convenience view:**
 ```sql
-SELECT * FROM photo_person_summary
+SELECT * FROM media_person_summary
 WHERE people ? 'Jane Smith';
 ```
 

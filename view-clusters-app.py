@@ -290,14 +290,14 @@ def fetch_persons_page(
                fd.bounding_box AS sample_bbox, fd.id AS sample_face_id
         FROM person_v p
         LEFT JOIN LATERAL (
-            SELECT fd.id, fd.photo_id, fd.detection_score, fd.bounding_box
+            SELECT fd.id, fd.media_id, fd.detection_score, fd.bounding_box
             FROM face_detection fd
             WHERE fd.person_id = p.id
             ORDER BY (fd.id = p.preferred_face_id) DESC NULLS LAST,
                      fd.detection_score DESC NULLS LAST, fd.id
             LIMIT 1
         ) fd ON true
-        LEFT JOIN photo ph ON ph.id = fd.photo_id
+        LEFT JOIN media ph ON ph.id = fd.media_id
         WHERE (%(s)s IS NULL OR p.name ILIKE %(l)s OR p.id::text ILIKE %(l)s)
           """ + _triage_clause(triage).replace(" AND name", " AND p.name")
                                       .replace(" AND status_code", " AND p.status_code") + """
@@ -393,14 +393,14 @@ def fetch_persons_by_ids(page_ids: list[str]) -> list:
                fd.bounding_box AS sample_bbox, fd.id AS sample_face_id
         FROM person_v p
         LEFT JOIN LATERAL (
-            SELECT fd.id, fd.photo_id, fd.detection_score, fd.bounding_box
+            SELECT fd.id, fd.media_id, fd.detection_score, fd.bounding_box
             FROM face_detection fd
             WHERE fd.person_id = p.id
             ORDER BY (fd.id = p.preferred_face_id) DESC NULLS LAST,
                      fd.detection_score DESC NULLS LAST, fd.id
             LIMIT 1
         ) fd ON true
-        LEFT JOIN photo ph ON ph.id = fd.photo_id
+        LEFT JOIN media ph ON ph.id = fd.media_id
         WHERE p.id = ANY(%s::uuid[])
         ORDER BY array_position(%s::uuid[], p.id)
         """,
@@ -439,7 +439,7 @@ def fetch_faces_for_person(
         """
         SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score
         FROM face_detection fd
-        JOIN photo p ON fd.photo_id = p.id
+        JOIN media p ON fd.media_id = p.id
         WHERE fd.person_id = %s
         ORDER BY fd.detection_score DESC NULLS LAST, fd.id
         LIMIT %s OFFSET %s
@@ -468,7 +468,7 @@ def fetch_faces_for_unknown(
         """
         SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score
         FROM face_detection fd
-        JOIN photo p ON fd.photo_id = p.id
+        JOIN media p ON fd.media_id = p.id
         WHERE fd.person_id IS NULL
         ORDER BY fd.detection_score DESC NULLS LAST, fd.id
         LIMIT %s OFFSET %s
@@ -490,7 +490,7 @@ def fetch_faces_for_unknown_by_similarity(
         """
         SELECT fd.id, p.file_path, fd.bounding_box, fd.detection_score
         FROM face_detection fd
-        JOIN photo p ON fd.photo_id = p.id
+        JOIN media p ON fd.media_id = p.id
         WHERE fd.person_id IS NULL
           AND fd.embedding IS NOT NULL
         ORDER BY fd.embedding <=> (
@@ -515,14 +515,14 @@ def fetch_all_persons_for_merge(exclude_id: str) -> list:
                fd.id AS sample_face_id
         FROM person_v p
         LEFT JOIN LATERAL (
-            SELECT fd.id, fd.photo_id, fd.bounding_box
+            SELECT fd.id, fd.media_id, fd.bounding_box
             FROM face_detection fd
             WHERE fd.person_id = p.id
             ORDER BY (fd.id = p.preferred_face_id) DESC NULLS LAST,
                      fd.detection_score DESC NULLS LAST
             LIMIT 1
         ) fd ON true
-        LEFT JOIN photo ph ON ph.id = fd.photo_id
+        LEFT JOIN media ph ON ph.id = fd.media_id
         WHERE p.id != %s
           AND p.name IS NOT NULL
         ORDER BY p.name
@@ -632,7 +632,7 @@ def fetch_suggestions_page(
                per.name  AS suggested_name,
                fd.suggestion_score
         FROM face_detection fd
-        JOIN photo  ph  ON ph.id  = fd.photo_id
+        JOIN media  ph  ON ph.id  = fd.media_id
         JOIN person per ON per.id = fd.suggested_person_id
         WHERE fd.suggested_person_id IS NOT NULL
           {where_extra}

@@ -1,6 +1,6 @@
 -- identify cases where scan duplicated a face within an image
 SELECT ph.file_path, fd.bounding_box, count(*) AS copies
-FROM face_detection fd JOIN photo ph ON ph.id = fd.photo_id
+FROM face_detection fd JOIN media ph ON ph.id = fd.media_id
 GROUP BY ph.file_path, fd.bounding_box
 HAVING count(*) > 1
 ORDER BY copies DESC;
@@ -12,7 +12,7 @@ CREATE TEMP TABLE to_del ON COMMIT DROP AS
 WITH ranked AS (
   SELECT id, person_id,
          ROW_NUMBER() OVER (
-           PARTITION BY photo_id, bounding_box
+           PARTITION BY media_id, bounding_box
            ORDER BY (person_id IS NOT NULL) DESC,
                     (suggested_person_id IS NOT NULL) DESC,
                     id ASC
