@@ -134,8 +134,17 @@ constraints, `GRANT ... TO maw_media`).
 ### media.person_status
 
 Mirrors this project's `person_status` lookup, same codes (`unknown`,
-`not_a_person`). A lookup table rather than a `CHECK` so new states are an
-`INSERT` and the API can expose the valid values.
+`not_a_person`). A lookup table rather than a `CHECK` so a new state costs an
+upsert rather than a migration, and the API can expose the valid values.
+
+**Not seeded on the maw-media side.** This project owns the codes, so they ride
+along with a publish like everything else and the table starts empty. That keeps
+a single source of truth — adding a status here needs no matching deploy over
+there — at the cost of an ordering requirement on the sync: `media.person`
+`status_code` is a foreign key, so statuses must be upserted **before** the
+persons referencing them, in the same transaction. `POST /face/sync` should
+therefore accept statuses as a third collection alongside `persons` and `faces`,
+and apply them first.
 
 ### media.person
 
@@ -152,23 +161,22 @@ CREATE TABLE IF NOT EXISTS media.person (
     published TIMESTAMPTZ NOT NULL,    -- when the publish was accepted
     deleted TIMESTAMPTZ,               -- soft delete, keeps suggestions valid
     merged_into_id UUID,               -- set when a cluster is merged away
-    created TIMESTAMPTZ NOT NULL,
-    created_by UUID NOT NULL,
-    modified TIMESTAMPTZ NOT NULL,
-    modified_by UUID NOT NULL,
 
     CONSTRAINT pk_media_person PRIMARY KEY (id),
     CONSTRAINT uq_media_person$slug UNIQUE (slug),
     CONSTRAINT fk_media_person$media_person_status
         FOREIGN KEY (status_code) REFERENCES media.person_status(code),
     CONSTRAINT fk_media_person$media_person$merged
-        FOREIGN KEY (merged_into_id) REFERENCES media.person(id),
-    CONSTRAINT fk_media_person$media_user$created
-        FOREIGN KEY (created_by) REFERENCES media.user(id),
-    CONSTRAINT fk_media_person$media_user$modified
-        FOREIGN KEY (modified_by) REFERENCES media.user(id)
+        FOREIGN KEY (merged_into_id) REFERENCES media.person(id)
 );
 ```
+
+Neither `media.person` nor `media.face` carries `created` / `modified` audit
+columns, unlike most tables in that schema. Nothing in either is user authored —
+every row is written by the same publisher service account, so `created_by` /
+`modified_by` would record a constant. `published` (last accepted here) and
+`source_modified` (last changed upstream) are the pair that actually matters
+when reconciling the two systems.
 
 ### media.face
 
@@ -428,7 +436,7 @@ plus machine-to-machine Auth0 identity per `docs/machine-to-machine-auth.sql`).
 
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /face/sync` | One transactional batch: `{ persons, faces, deletions }` |
+| `POST /face/sync` | One transactional batch: `{ statuses, persons, faces, deletions }`, applied in that order |
 | `GET /face/suggestions?status=pending&limit=n` | Pull the review queue |
 | `POST /face/suggestions/resolve` | Report `applied` / `rejected` |
 | `GET /face/sync/state` | Counts and max revision, for reconciliation |
