@@ -82,7 +82,8 @@ The cost — an extra lookup per publish — is negligible when done set-based
 > **Naming trap.** `face_detection.media_id` here refers to
 > *this* database's local `media.id`. maw-media's `media.face.media_id` refers
 > to *its* media id. Same column name, different values. They never meet,
-> because the wire format carries `file_path` and never `media_id`.
+> because a published face carries the file path (`filePath` on the wire) and
+> never a media id.
 
 ### The path contract
 
@@ -141,10 +142,8 @@ upsert rather than a migration, and the API can expose the valid values.
 along with a publish like everything else and the table starts empty. That keeps
 a single source of truth — adding a status here needs no matching deploy over
 there — at the cost of an ordering requirement on the sync: `media.person`
-`status_code` is a foreign key, so statuses must be upserted **before** the
-persons referencing them, in the same transaction. `POST /face/sync` should
-therefore accept statuses as a third collection alongside `persons` and `faces`,
-and apply them first.
+`status_code` is a foreign key, so `POST /config/person-statuses/sync` must be
+called **before** `POST /persons/sync` (see §6).
 
 ### media.person
 
@@ -154,22 +153,30 @@ CREATE TABLE IF NOT EXISTS media.person (
     name TEXT,                         -- null until the operator labels the cluster
     slug TEXT,                         -- for /person/{slug} urls
     status_code TEXT,
-    preferred_face_id UUID,            -- fk added after media.face exists
+    preferred_face_id UUID,            -- display hint; no fk, see §6
     face_count INTEGER NOT NULL DEFAULT 0,
     source_revision BIGINT NOT NULL,   -- monotonic revision from this project
     source_modified TIMESTAMPTZ,       -- our clock, informational only
     published TIMESTAMPTZ NOT NULL,    -- when the publish was accepted
-    deleted TIMESTAMPTZ,               -- soft delete, keeps suggestions valid
-    merged_into_id UUID,               -- set when a cluster is merged away
 
     CONSTRAINT pk_media_person PRIMARY KEY (id),
     CONSTRAINT uq_media_person$slug UNIQUE (slug),
     CONSTRAINT fk_media_person$media_person_status
-        FOREIGN KEY (status_code) REFERENCES media.person_status(code),
-    CONSTRAINT fk_media_person$media_person$merged
-        FOREIGN KEY (merged_into_id) REFERENCES media.person(id)
+        FOREIGN KEY (status_code) REFERENCES media.person_status(code)
 );
 ```
+
+Deletions are **hard deletes**, and neither table carries a soft-delete or
+merge-pointer column. maw-media-ai is the system of record, so a row removed
+there has no history worth keeping in a projection — a later publish simply
+recreates it. Dropping a person leaves its faces in place but unassigned, via
+`ON DELETE SET NULL` on `media.face.person_id`, mirroring the same rule on
+`face_detection.person_id` upstream.
+
+The cost is that a merged-away person's URL 404s rather than redirecting to the
+surviving person. That was judged acceptable: `merge-clusters` consumes
+*unnamed* clusters, which have no slug and therefore no URL, so only a manual
+merge of two named people could strand a link.
 
 Neither `media.person` nor `media.face` carries `created` / `modified` audit
 columns, unlike most tables in that schema. Nothing in either is user authored —
@@ -193,7 +200,6 @@ CREATE TABLE IF NOT EXISTS media.face (
     detection_score REAL NOT NULL,
     source_revision BIGINT NOT NULL,
     published TIMESTAMPTZ NOT NULL,
-    deleted TIMESTAMPTZ,
 
     CONSTRAINT pk_media_face PRIMARY KEY (id),
     CONSTRAINT fk_media_face$media_media
@@ -242,10 +248,13 @@ tables, following the `person_status` precedent.
 
 ### Ordering note
 
-`person.preferred_face_id → face.id` and `face.person_id → person.id` are
-circular. Add the `preferred_face_id` foreign key in a `DO $$` block in
-`tables/media.face.sql` after both tables exist, the way maw-media handles the
-`media.location` unique constraint.
+`media.face.person_id → media.person(id)` is the only foreign key between the
+two, and it is `ON DELETE SET NULL`, so dropping a cluster unassigns its faces
+rather than deleting them.
+
+There is no reciprocal constraint on `preferred_face_id`, so the tables are not
+circular and can be created in either order. See §6 for why that constraint
+cannot exist.
 
 ---
 
@@ -284,7 +293,6 @@ that. Deletions must be explicit:
 CREATE TABLE IF NOT EXISTS deleted_entity (
     entity_type TEXT NOT NULL,     -- 'person' | 'face'
     entity_id   UUID NOT NULL,
-    merged_into UUID,              -- for cluster merges
     revision    BIGINT NOT NULL DEFAULT nextval('revision_seq'),
     published_revision BIGINT,
     deleted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -416,13 +424,13 @@ into several rows.
 A path key means a rename or recategorisation silently breaks the link. Two
 cheap mitigations:
 
-1. `/face/sync` returns per-item results including an `unresolved` list, so a
-   broken link is a number in the publisher's output rather than a gap.
+1. `POST /faces/sync` returns a per-item outcome, so a broken link shows
+   up as `unresolved_path` in the publisher's output rather than as a gap.
 2. `media.publish_error` (§4.3) records it locally for later inspection.
 
 ### Drift reconciliation
 
-A periodic `GET /face/sync/state` returns counts and max revision per entity,
+A periodic `GET /persons/sync/state` returns counts and max revision per entity,
 so divergence is detectable without a full republish.
 
 ---
@@ -436,19 +444,107 @@ plus machine-to-machine Auth0 identity per `docs/machine-to-machine-auth.sql`).
 
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /face/sync` | One transactional batch: `{ statuses, persons, faces, deletions }`, applied in that order |
+| `POST /config/person-statuses/sync` | `PersonStatusSync[]` |
+| `POST /persons/sync` | `PersonSync[]` |
+| `POST /persons/deletions` | `Guid[]` |
+| `POST /faces/sync` | `FaceSync[]` |
+| `POST /faces/deletions` | `Guid[]` |
 | `GET /face/suggestions?status=pending&limit=n` | Pull the review queue |
 | `POST /face/suggestions/resolve` | Report `applied` / `rejected` |
-| `GET /face/sync/state` | Counts and max revision, for reconciliation |
+| `GET /persons/sync/state` | Counts and max revision, for reconciliation |
 
-`POST /face/sync` is implemented as a plpgsql function taking `_payload JSONB`
-and using `jsonb_to_recordset`, consistent with maw-media's existing use of
-jsonb.
+Endpoints live in the resource group they belong to rather than a separate
+feature namespace, following the precedent already set by `/locations`, which
+hosts the reverse-geocode worker's machine-to-machine pair alongside its reader
+endpoints. `/config` already serves `GET /scales`, so a person-status lookup
+belongs there too.
+
+Each endpoint takes a **bare JSON array** and maps to one plpgsql function
+(`media.sync_person_statuses`, `media.sync_persons`, `media.sync_faces`,
+`media.delete_persons`, `media.delete_faces`), each running in its own
+transaction and all returning the same `(entity, entity_id, outcome, detail)`
+shape.
+
+Deletions are split per resource rather than carrying an entity discriminator:
+each endpoint already knows what it deletes, so the payload is a plain array of
+ids and there is no `unknown_entity` case to report.
+
+### Ordering and batch size
+
+One collection per call keeps payloads small and makes chunking trivial, which
+matters: the largest cluster has ~40,000 faces, and a face serialises to roughly
+260 bytes — about 10MB if sent in one go, before the server deserialises it and
+re-serialises it as jsonb.
+
+**The caller is responsible for ordering**, since each call is a separate
+transaction:
+
+1. `POST /config/person-statuses/sync` — `media.person.status_code` is a foreign key to these
+2. `POST /persons/sync` — `media.face.person_id` is a foreign key to these
+3. `POST /faces/sync`
+4. the two deletion endpoints — any time, in either order, since
+   `ON DELETE SET NULL` means dropping a person only unassigns its faces
+
+Per-endpoint limits (configurable, defaults):
+
+| Endpoint | Max items |
+|----------|-----------|
+| `/config/person-statuses/sync` | 100 |
+| `/persons/sync` | 500 |
+| `/faces/sync` | 1,000 |
+| `/persons/deletions`, `/faces/deletions` | 1,000 |
+
+At 1,000 faces per call a 40,000-face cluster is 40 requests of ~260KB each, and
+no single failure costs more than one small retry.
+
+Getting the order wrong is reported, not fatal: a face whose person has not been
+published yet comes back as `unknown_person` for that row while the rest of the
+batch applies, rather than raising a foreign key violation over all 1,000.
+
+`preferred_face_id` therefore carries **no foreign key**. A person is always
+written in an earlier transaction than the faces it names, so no constraint —
+deferred or otherwise — could ever be satisfied. It is a display hint, resolved
+with a `LEFT JOIN` at read time and simply absent if the face is gone.
+
+### Wire format — camelCase
+
+**The publisher posts camelCase**, the same convention as every other maw-media
+endpoint. Do not send snake_case; it will not bind.
+
+```jsonc
+{
+  "statuses":  [ { "code": "unknown", "label": "Unknown", "description": null, "sortOrder": 1 } ],
+  "persons":   [ { "id": "...", "name": null, "slug": null, "statusCode": "unknown",
+                   "preferredFaceId": null, "faceCount": 3,
+                   "sourceRevision": 12, "sourceModified": "2026-08-01T00:00:00Z" } ],
+  "faces":     [ { "id": "...", "filePath": "/assets/2026/trip/full/a.jpg", "personId": "...",
+                   "boxX": 0.1, "boxY": 0.2, "boxWidth": 0.3, "boxHeight": 0.4,
+                   "detectionScore": 0.99, "sourceRevision": 13 } ],
+}
+```
+
+Deletion endpoints take a bare id array: `[ "018f...", "018f..." ]`.
+
+There are two serialization boundaries and they are deliberately different:
+
+| Boundary | Naming | Set by |
+|----------|--------|--------|
+| HTTP request | camelCase | the API's global JSON options, shared with every other endpoint |
+| `media.sync_faces` payload | snake_case | `FaceRepository`, matching the `jsonb_to_recordset` column names |
+
+maw-media re-serializes the batch on the way to Postgres, so the snake_case in
+§5 is an internal detail of the database function and never appears on the wire.
+The two can change independently — renaming a `jsonb_to_recordset` column does
+not alter the public contract.
+
+A person upsert **replaces the whole row**. Every field must be sent on every
+publish; omitting one clears it rather than leaving it untouched.
 
 ### User-facing — `face:read` / `face:write`
 
 | Endpoint | Purpose |
 |----------|---------|
+| `GET /config/person-statuses` | Lookup values, alongside `GET /config/scales` |
 | `GET /media/{id}/faces` | Faces on a media item |
 | `GET /person` | Browse named people |
 | `GET /person/{id}/media` | Media containing a person |
@@ -526,8 +622,8 @@ one row per published detection either way.
 
 1. **maw-media tables** — `media.person`, `media.face`, `media.face_suggestion`
    and lookups, plus `media.sync_faces` with path resolution.
-2. **Publish path** — outbox columns and triggers here, `POST /face/sync`, a
-   publisher CLI subcommand. Read-only in maw-media, no UI yet.
+2. **Publish path** — outbox columns and triggers here, the four
+   `/persons/sync`, `/faces/sync` and related endpoints, a publisher CLI subcommand. Read-only in maw-media, no UI yet.
 3. **Read APIs and UI** — faces on media detail, person browse, person search.
 4. **Suggestion loop** — suggestion tables, submit/pull/resolve, and the
    `face_label` constraint table that makes corrections stick.
@@ -546,3 +642,9 @@ one row per published detection either way.
 - **Visibility.** Admin-only to start, or all authenticated users?
 - **Person slugs.** Generated here or in maw-media? Names are not unique, so
   the slug needs a disambiguation strategy.
+- **Faces and categories.** Searching for *categories* containing a given person
+  is a likely want, and `media.face → media.media → media.category_media` already
+  supports it without new tables. Open question whether that belongs on
+  `/categories`, on `/persons/{id}/categories`, or folded into the existing
+  category search (`media.search_categories` / `media.category_search`). To be
+  worked through before the read endpoints are built.
