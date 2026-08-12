@@ -4,7 +4,11 @@ How face and person data produced by this project is published to
 [maw-media](https://github.com/mmorano/maw-media), and how user-submitted
 corrections make their way back here.
 
-**Status:** design, not yet implemented.
+**Status:** the publish path (§3, §5, §6 publisher-facing) is implemented in
+maw-media — schema, the `media.sync_*` / `media.delete_*` functions, and the five
+`POST` endpoints, covered by repository and API level tests. Still outstanding:
+the maw-media-ai side (rename, outbox, publisher CLI), the reader endpoints, and
+the whole suggestion loop (§4.5, §4.6).
 
 ---
 
