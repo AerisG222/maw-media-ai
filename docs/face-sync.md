@@ -4,11 +4,62 @@ How face and person data produced by this project is published to
 [maw-media](https://github.com/mmorano/maw-media), and how user-submitted
 corrections make their way back here.
 
-**Status:** the publish path (§3, §5, §6 publisher-facing) is implemented in
-maw-media — schema, the `media.sync_*` / `media.delete_*` functions, and the five
-`POST` endpoints, covered by repository and API level tests. Still outstanding:
-the maw-media-ai side (rename, outbox, publisher CLI), the reader endpoints, and
-the whole suggestion loop (§4.5, §4.6).
+**Status:** the publish path is complete end to end.
+
+- **maw-media** (§3, §5, §6 publisher-facing) — schema, the `media.sync_*` /
+  `media.delete_*` functions, and the five `POST` endpoints, covered by
+  repository and API level tests.
+- **maw-media-ai** — the outbox, tombstones and diagnostics (§4.1–4.3) ship in
+  `migrations/007-publish-outbox.sql` and `schema.sql`; the publisher is
+  `publish-faces.py`. First release publishes named people only (see §9,
+  "Publish policy").
+
+Still outstanding: the reader endpoints and UI (§6 user-facing, phase 3), and
+the whole suggestion loop (§4.4, §4.5, phase 4).
+
+### Environment selection
+
+`publish-faces.py` has no default target: `--prod`, `--staging` or `--dev` is
+required, and the flag selects the api url, the Auth0 audience and the
+credentials file *together* (urls from maw-media's `appsettings.*.json` and
+maw-photos-solid's `environments/.env.*`). Deriving all three from one flag
+means a token cannot be minted for one environment and spent against another.
+
+Credentials live in `~/maw-media-ai/<environment>/config.json`, a JSON object
+with `client_id` and `client_secret`, and never in environment variables — an
+exported secret outlives the command that needed it, and is visible to every
+child process. The file may also set `api_url`, `audience` or `auth_url` to aim
+an environment elsewhere; each is reported at startup as an override.
+
+The internal environments are served by a private CA, which costs two things
+that a browser hides:
+
+- Python verifies against `certifi`'s public roots, not the OS trust store, so a
+  CA added with `update-ca-trust` is invisible to it. The publisher defaults to
+  the system bundle instead, overridable with `ca_bundle`.
+- Python 3.13 enabled `VERIFY_X509_STRICT` by default. A leaf certificate with
+  no **Authority Key Identifier** — which OpenSSL and browsers accept — is
+  rejected. The fix belongs on the certificate
+  (`authorityKeyIdentifier = keyid,issuer`); `tls_strict: false` is the stopgap,
+  and relaxes only those structural checks.
+
+The outbox holds a single `published_revision` per row, and it means "what
+**production** holds". A dev publish that stamped it would leave the next
+production run with an empty queue and no visible symptom, so **only `--prod`
+records progress** — other environments send real payloads and write nothing
+locally. Per-environment outbox columns would be the alternative if a non-prod
+target ever needs durable tracking; it is not worth the schema today, since dev
+databases are rebuilt anyway.
+
+Two things the publisher learned that are worth keeping here:
+
+- `GET /persons/sync/state` (§5, "Drift reconciliation") is specified but not
+  implemented in maw-media, so reconciliation today means re-running
+  `publish-faces.py status` or `reset`.
+- `PersonSync.SourceModified` is a NodaTime `Instant`, whose ExtendedIso pattern
+  requires a literal `Z`. An RFC-3339 `+00:00` offset is **rejected** with
+  "The JSON value could not be converted to ... PersonSync" — verified against
+  the API's own `JsonSerializerOptions`.
 
 ---
 
@@ -636,16 +687,22 @@ one row per published detection either way.
 
 ## 9. Open questions
 
-- **Publish policy.** All detections, or exclude `not_a_person` clusters?
-  Leaning toward excluding those and publishing unnamed clusters, so visitors
-  can help name them.
+- ~~**Publish policy.**~~ **Settled:** named people only for the first release
+  (448 persons, 170,551 faces). Unnamed clusters buy nothing until the
+  suggestion loop exists to let visitors name them, and publishing 2,668
+  nameless entries to a public site in the meantime is noise. The scope lives in
+  the `*_IN_SCOPE` constants in `publish-faces.py`; widening it needs no
+  backfill, since the outbox offers newly-in-scope rows on the next run.
 - **Who reviews?** The Streamlit app is where the operator already has crops,
   embeddings and merge tooling, so review belongs there and maw-media just
   collects. If non-admin suggestions need spam triage before reaching the
   desktop, an admin review state in maw-media is worth adding.
 - **Visibility.** Admin-only to start, or all authenticated users?
-- **Person slugs.** Generated here or in maw-media? Names are not unique, so
-  the slug needs a disambiguation strategy.
+- ~~**Person slugs.**~~ **Settled:** generated here, by a port of
+  `MawMediaPublisher.SlugHelper.MakeSafeSlug`, since this project owns the name.
+  Names are not *guaranteed* unique but happen to be (448 named, no duplicates),
+  and `media.person.slug` is UNIQUE, so a future collision fails the batch
+  loudly. No disambiguation suffix is invented until one is actually needed.
 - **Faces and categories.** Searching for *categories* containing a given person
   is a likely want, and `media.face → media.media → media.category_media` already
   supports it without new tables. Open question whether that belongs on

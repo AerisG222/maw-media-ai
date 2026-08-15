@@ -69,6 +69,10 @@ psycopg2-binary>=2.9.12      # used by the Streamlit app
 # --- Progress bar -------------------------------------------------------------
 tqdm>=4.70.0
 
+# --- Publishing to maw-media ----------------------------------------------------
+# publish-faces.py only; the scanner and the Streamlit app never make network calls.
+requests>=2.32.0
+
 # --- Numerical ----------------------------------------------------------------
 numpy>=2.5.0
 

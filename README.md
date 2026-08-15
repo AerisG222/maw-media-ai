@@ -168,6 +168,176 @@ python scan-faces.py stats
 
 ---
 
+## Publishing to maw-media
+
+`publish-faces.py` pushes the pipeline's conclusions — who a person is, which
+faces are theirs, and where each face sits in its image — to
+[maw-media](https://github.com/mmorano/maw-media), so visitors can search for
+photos of people they know. See `docs/face-sync.md` for the full design.
+
+No embedding ever crosses the wire, and nothing flows back: maw-media holds a
+read-only projection, this project stays the system of record.
+
+### What gets published
+
+Named people and their faces. Unnamed clusters, triaged clusters and unassigned
+faces stay here until the suggestion loop gives visitors a way to name them.
+The policy is the two `*_IN_SCOPE` constants at the top of `publish-faces.py`;
+widening it is a one-line change, and the outbox then offers up the
+newly-in-scope rows on the next run.
+
+### Setup
+
+Apply the outbox migration once (adds revision tracking; takes ~20s against
+255k faces, and `schema.sql` already contains it for fresh databases):
+
+```bash
+psql "$FACE_SCANNER_DSN" -f migrations/007-publish-outbox.sql
+```
+
+Then write one credentials file per environment, at
+`~/maw-media-ai/<env>/config.json`:
+
+```bash
+mkdir -p ~/maw-media-ai/prod
+cat > ~/maw-media-ai/prod/config.json <<'EOF'
+{
+    "client_id": "...",
+    "client_secret": "..."
+}
+EOF
+chmod 600 ~/maw-media-ai/prod/config.json
+```
+
+The credentials belong to the machine-to-machine Auth0 application holding the
+`face-recognition:publish` scope, whose `media.user` row must also have the
+**admin** role (the sync functions call `media.get_is_admin`).
+
+Credentials are read from this file and never from the environment, so no
+`export` can leak a production secret into a shell history, a crash dump or a
+child process. The file is JSON — the standard library reads it, and it is
+plain enough to edit by hand.
+
+A directory per environment is the canonical layout, leaving room for anything
+else an environment needs later. `~/maw-media-ai/<env>.json` and a plain
+`~/maw-media-ai/<env>` file also work, and `--config PATH` overrides the
+location entirely. If none is found, the error lists every path it tried.
+
+Optional keys let a file point an environment elsewhere without touching the
+script: `api_url`, `audience`, `auth_url`, plus the two TLS keys below. Any of
+them is announced at startup as an override. An unrecognised key is an error
+rather than a silent no-op, so a typo cannot leave you wondering why a setting
+did nothing.
+
+The only environment variables the publisher reads are `FACE_SCANNER_DSN` and
+`ASSET_ROOT` (default `/data/maw-media-assets`) — neither is a secret.
+
+### Choosing an environment
+
+There is no default target. Every `publish` names its environment, so nothing
+reaches the live site without the word `prod` in the command:
+
+| Flag | Target | Audience |
+|------|--------|----------|
+| `--prod` | `https://media.mikeandwan.us` | `https://media.mikeandwan.us` |
+| `--staging` | `https://staging-media.mikeandwan.us:8090` | `https://staging-media.mikeandwan.us` |
+| `--dev` | `https://dev-media.mikeandwan.us:8091` | `https://dev-media.mikeandwan.us` |
+
+One flag picks the url, the audience *and* the credentials file together, so
+they cannot disagree — a token minted for production is rejected by dev, which is
+the outcome you want. Each run prints all three before doing anything:
+
+```
+INFO: Target: PROD -> https://media.mikeandwan.us/api/v1
+INFO:         audience https://media.mikeandwan.us
+INFO:         config   /home/you/maw-media-ai/prod
+```
+
+**Only `--prod` records progress.** The outbox has one `published_revision` per
+row and it means "what production holds"; if a dev run stamped it, the next
+production run would find an empty queue and the website would silently stop
+updating. So non-production runs send real data but write nothing locally, which
+also makes them repeatable.
+
+### Private CAs (the internal environments)
+
+A CA installed with `update-ca-trust` is trusted by browsers and `openssl`, but
+**not** by Python: `requests` verifies against `certifi`'s bundle of public
+roots, which never contains it. The publisher therefore defaults to the OS trust
+store (`/etc/pki/tls/certs/ca-bundle.crt` and friends), falling back to certifi
+when no system bundle exists. `"ca_bundle": "/path/to/bundle"` overrides it.
+
+That leaves a second, separate trap. Python 3.13 turned on `VERIFY_X509_STRICT`
+by default, which enforces RFC 5280 structural rules that OpenSSL and browsers
+do not. A certificate missing the **Authority Key Identifier** extension is
+accepted by `openssl s_client` (`Verify return code: 0 (ok)`) and rejected by
+Python:
+
+```
+[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Missing Authority Key Identifier
+```
+
+The fix is to reissue the server certificate with
+
+```
+authorityKeyIdentifier = keyid,issuer
+```
+
+in its OpenSSL extension section. Until then `"tls_strict": false` relaxes only
+those structural checks for that one environment — chain of trust, expiry and
+hostname verification all stay on, and the run warns when it is in effect.
+
+Both failures print the diagnosis and the exact key to add, since the confusing
+part is that the browser succeeds where Python does not.
+
+### Usage
+
+```bash
+python publish-faces.py status                    # what is pending; no network calls
+python publish-faces.py publish --dev --dry-run   # build and validate every payload, send nothing
+python publish-faces.py publish --dev             # real send; outbox untouched
+python publish-faces.py publish --prod --limit 50 # cautious first run (faces only; persons always go in full)
+python publish-faces.py publish --prod
+```
+
+`--dry-run` works without a config file, since it sends nothing — useful for
+checking payloads and path transforms on a machine that has no credentials.
+
+Re-running is always safe. Rows are stamped as published only after the API
+accepts them, so an interrupted run simply resumes, and the API's revision guard
+turns a duplicate into a no-op. The initial publish is ~171 requests and takes a
+couple of minutes.
+
+### How it decides what changed
+
+Not timestamps — two databases on two machines have two clocks, and a
+transaction that commits after a watermark is read becomes invisible forever.
+Instead every person and face carries a `revision` from a shared sequence, and
+a row needs publishing when `published_revision < revision`. Triggers bump the
+revision only when a *published* column changes, so a re-scan that produces
+identical assignments does not enqueue a quarter of a million no-op updates.
+
+Three things can put a row on the queue:
+
+| Situation | What happens |
+|-----------|--------------|
+| New or changed | Published, and `published_revision` stamped on acceptance |
+| Deleted here | A tombstone row drives an explicit deletion — absence from a batch means "unchanged", not "gone" |
+| Left publish scope (e.g. you cleared a person's name) | **Retracted**: deleted from maw-media and marked unpublished here, so it returns automatically if you name them again |
+
+### When a link breaks
+
+Faces are joined to media by published file path, so renaming or recategorising
+a file upstream breaks the link. That is reported rather than silent: the API
+answers `unresolved_path` for that row, the face is left unstamped so it retries,
+and the reason is recorded locally.
+
+```sql
+SELECT file_path, publish_error FROM media WHERE publish_error IS NOT NULL;
+```
+
+---
+
 ## Labelling persons
 
 After clustering, each person has a row in the `person` table with
