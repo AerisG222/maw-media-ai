@@ -7,8 +7,8 @@ corrections make their way back here.
 **Status:** the publish path is complete end to end.
 
 - **maw-media** (§3, §5, §6 publisher-facing) — schema, the `media.sync_*` /
-  `media.delete_*` functions, and the five `POST` endpoints, covered by
-  repository and API level tests.
+  `media.delete_*` functions, the five sync/delete `POST` endpoints and the
+  face image `PUT`, covered by repository and API level tests.
 - **maw-media-ai** — the outbox, tombstones and diagnostics (§4.1–4.3) ship in
   `migrations/007-publish-outbox.sql` and `schema.sql`; the publisher is
   `publish-faces.py`. First release publishes named people only (see §9,
@@ -495,7 +495,14 @@ so divergence is detectable without a full republish.
 Mirrors the existing location precedent (`missing-metadata` / `update-metadata`
 plus machine-to-machine Auth0 identity per `docs/machine-to-machine-auth.sql`).
 
-### Publisher-facing — new `face:publish` scope, new m2m app and `media.user` row
+### Publisher-facing — `face-recognition:publish`
+
+The scope is granted to the **existing** reverse-geocode m2m application rather
+than a new one (the free Auth0 plan caps applications, but not permissions). One
+application means one `client_id`, one `media.external_identity` and therefore
+one `media.user`, so face publishing runs as the same account that reverse
+geocodes — which must hold the `admin` role, since every `media.sync_*` function
+checks it.
 
 | Endpoint | Purpose |
 |----------|---------|
@@ -504,6 +511,7 @@ plus machine-to-machine Auth0 identity per `docs/machine-to-machine-auth.sql`).
 | `POST /persons/deletions` | `Guid[]` |
 | `POST /faces/sync` | `FaceSync[]` |
 | `POST /faces/deletions` | `Guid[]` |
+| `PUT /faces/{id}/image` | raw `image/avif` body |
 | `GET /face/suggestions?status=pending&limit=n` | Pull the review queue |
 | `POST /face/suggestions/resolve` | Report `applied` / `rejected` |
 | `GET /persons/sync/state` | Counts and max revision, for reconciliation |
@@ -523,6 +531,51 @@ shape.
 Deletions are split per resource rather than carrying an entity discriminator:
 each endpoint already knows what it deletes, so the payload is a plain array of
 ids and there is no `unknown_entity` case to report.
+
+### Face images
+
+The preferred face crop is produced **here** and published as a file, rather
+than maw-media cropping it from the original. That keeps every imaging
+dependency in this project, which already has the source image open when it
+picks a preferred face.
+
+```
+PUT /api/v1/faces/{faceId}/image
+Content-Type: image/avif
+<body: the cropped image, at most 2MB>
+```
+
+- **AVIF only.** `MawMediaPublisher` already emits `.poster.avif` for videos, so
+  every image maw-media serves shares one format, and avif is markedly smaller
+  than jpeg at thumbnail sizes. Convert in python before posting; maw-media
+  never decodes the bytes and rejects any other content type with a 400.
+- **Keyed by face id**, stored as `{faceId}.avif` under the `media-faces`
+  volume. A single format keeps the path derivable from the id alone.
+- **Publish after `POST /faces/sync`.** An id that was never published answers
+  404, so a typo cannot leave an orphan file behind.
+- `PUT` replaces, so republishing a changed crop is safe. Changing which face a
+  person prefers leaves the old image behind as an orphan.
+- **Bounded to a 500x500 box** as a ceiling, aspect ratio preserved and never
+  upscaled. In practice this does nothing: `scan-faces.py` already caps cached
+  crops at `FACE_CROP_MAX_DIM` (400 by default). It is kept because that cap is
+  an environment variable, and maw-media cannot check dimensions without the
+  imaging dependency this design excludes. The real work here is the JPEG to
+  AVIF conversion.
+
+**Upload tracking is per face, not per person.** `face_detection.image_published_at`
+(migration 008) records the ones already sent. Driving uploads from
+`person.revision` would have worked, but that bumps whenever `face_count`
+shifts — which is essentially every cluster run — so every named person would
+re-send a byte-identical image. A face's crop never changes once published, so
+tracking it there makes the upload happen exactly once.
+
+`publish-faces.py` runs `publish_face_images` after `publish_faces`, since the
+API answers 404 for a face it has not seen. A 404 leaves the row unstamped and
+retries next run; a missing crop in the cache is counted as `missing_crop` and
+reported rather than failing the run.
+
+`GET /faces/{id}/image` returns it to any authenticated user, and 404s when
+nothing was published.
 
 ### Ordering and batch size
 

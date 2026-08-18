@@ -43,6 +43,7 @@ publish run has no business loading a GPU inference stack.
 """
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -55,7 +56,10 @@ from pathlib import Path
 
 import psycopg
 import requests
+from PIL import Image
 from psycopg.rows import dict_row
+
+from face_cache import face_crop_path
 
 # --- Configuration -----------------------------------------------------------
 DB_DSN = os.getenv("FACE_SCANNER_DSN")
@@ -123,6 +127,16 @@ REQUEST_TIMEOUT = int(os.getenv("PUBLISH_TIMEOUT_SECONDS", "120"))
 STATUS_BATCH = 100
 PERSON_BATCH = 500
 FACE_BATCH = 1000
+
+# A ceiling on what may be published, not the primary sizing step: the scanner
+# already caps cached crops at FACE_CROP_MAX_DIM (400 by default), so this
+# normally does nothing.  It exists because that cap is an environment variable
+# -- raising it for sharper UI thumbnails would otherwise start publishing
+# oversized avatars silently, and maw-media cannot check dimensions without an
+# imaging dependency, which is exactly what this design keeps out.
+FACE_IMAGE_MAX_EDGE = 500
+FACE_IMAGE_QUALITY = int(os.getenv("FACE_IMAGE_QUALITY", "72"))
+FACE_IMAGE_CONTENT_TYPE = "image/avif"
 DELETION_BATCH = 1000
 
 # --- Publish scope -----------------------------------------------------------
@@ -494,6 +508,44 @@ class MawMediaClient:
         return resp.json()
 
 
+    def put_image(self, face_id: str, data: bytes) -> str:
+        """Upload one face crop, returning an outcome in the same vocabulary.
+
+        404 means the face has not been published yet, which is a sequencing
+        problem rather than a failure of this image -- it is left unstamped and
+        retried on the next run.
+        """
+        if self.dry_run:
+            return "would_send"
+
+        url = f"{self.target['api_url'].rstrip('/')}/faces/{face_id}/image"
+        headers = {"Content-Type": FACE_IMAGE_CONTENT_TYPE}
+
+        try:
+            resp = self.session.put(url, data=data, headers=headers, timeout=REQUEST_TIMEOUT)
+
+            if resp.status_code == 401:
+                log.info("Token rejected; re-authenticating.")
+                self.login()
+                resp = self.session.put(url, data=data, headers=headers, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as e:
+            raise PublishError(
+                f"Could not reach the {self.environment} API at {url}: {e}"
+                f"{tls_hint(e, self.target)}"
+            ) from e
+
+        if resp.status_code == 404:
+            return "not_found"
+
+        if resp.status_code == 403:
+            return "forbidden"
+
+        if not resp.ok:
+            raise PublishError(f"PUT {url} -> {resp.status_code}: {resp.text}")
+
+        return "applied"
+
+
 # --- Outcome handling --------------------------------------------------------
 # Both mean maw-media holds this revision or newer, so the row is in sync and
 # must be stamped.  Anything else is left unstamped and retried next run.
@@ -526,6 +578,20 @@ PENDING_PERSONS_SQL = f"""
     JOIN person_v pv ON pv.id = p.id
     WHERE {PERSON_IN_SCOPE}
       AND (p.published_revision IS NULL OR p.published_revision < p.revision)
+    ORDER BY p.revision
+"""
+
+# preferred faces whose crop has not been uploaded yet.  driven by the face
+# rather than by person.revision so an unrelated person change (face_count moves
+# on every cluster run) does not re-send a byte-identical image.
+PENDING_FACE_IMAGES_SQL = f"""
+    SELECT fd.id, m.file_path
+    FROM person p
+    JOIN face_detection fd ON fd.id = p.preferred_face_id
+    JOIN media m           ON m.id = fd.media_id
+    WHERE {PERSON_IN_SCOPE}
+      AND fd.image_published_at IS NULL
+      AND fd.published_revision IS NOT NULL
     ORDER BY p.revision
 """
 
@@ -651,6 +717,8 @@ def cmd_status() -> None:
             persons = cur.fetchall()
             cur.execute(PENDING_FACES_SQL)
             faces = cur.fetchall()
+            cur.execute(PENDING_FACE_IMAGES_SQL)
+            face_images = cur.fetchall()
             cur.execute(RETRACT_PERSONS_SQL)
             retract_p = cur.fetchall()
             cur.execute(RETRACT_FACES_SQL)
@@ -671,6 +739,7 @@ def cmd_status() -> None:
     print("\nPending publish:")
     print(f"  persons        {len(persons):>8,}  ({-(-len(persons) // PERSON_BATCH)} requests)")
     print(f"  faces          {len(faces):>8,}  ({-(-len(faces) // FACE_BATCH)} requests)")
+    print(f"  face images    {len(face_images):>8,}   (one request each)")
     print("\nPending removal:")
     print(f"  persons deleted{len(tomb_p):>8,}")
     print(f"  persons retract{len(retract_p):>8,}   (unnamed since publishing)")
@@ -796,6 +865,94 @@ def publish_faces(conn, client: MawMediaClient, limit: int | None) -> dict:
         log.info("Faces: %d/%d rows processed", done, len(rows))
 
     return totals
+
+
+def build_face_image(source_path: str, face_id: str) -> bytes | None:
+    """Read the cached crop and return it as avif, bounded to a 500px box.
+
+    The conversion happens here rather than in maw-media so that no imaging
+    dependency is needed there; the crop is already on disk from the scan.
+    """
+    crop = face_crop_path(source_path, face_id)
+
+    if not crop.exists():
+        return None
+
+    with Image.open(crop) as img:
+        # avif has no alpha requirement here and the crops are opaque; convert so
+        # a palette or grayscale source cannot surprise the encoder
+        img = img.convert("RGB")
+
+        # backstop only -- see FACE_IMAGE_MAX_EDGE.  in place, preserves aspect
+        # ratio, and a no-op when the crop already fits; it never upscales
+        img.thumbnail((FACE_IMAGE_MAX_EDGE, FACE_IMAGE_MAX_EDGE), Image.LANCZOS)
+
+        buffer = io.BytesIO()
+        img.save(buffer, format="AVIF", quality=FACE_IMAGE_QUALITY)
+
+    return buffer.getvalue()
+
+
+def publish_face_images(conn, client: MawMediaClient) -> dict:
+    """Upload the crop for each preferred face that has not been sent yet.
+
+    Runs after publish_faces: the api answers 404 for a face it has never seen,
+    which is how an orphaned image is prevented.
+    """
+    with conn.cursor() as cur:
+        cur.execute(PENDING_FACE_IMAGES_SQL)
+        rows = cur.fetchall()
+
+    if not rows:
+        log.info("Face images: nothing pending")
+        return {}
+
+    totals: dict[str, int] = {}
+    uploaded: list[str] = []
+
+    for row in rows:
+        face_id = str(row["id"])
+        data = build_face_image(row["file_path"], face_id)
+
+        if data is None:
+            # the scan writes crops, so a missing one means the cache was cleared
+            # or the face predates it; re-running the scan repopulates it
+            totals["missing_crop"] = totals.get("missing_crop", 0) + 1
+            log.warning("No cached crop for face %s (%s)", face_id, row["file_path"])
+            continue
+
+        outcome = client.put_image(face_id, data)
+        totals[outcome] = totals.get(outcome, 0) + 1
+
+        if outcome == "forbidden":
+            raise PublishError(
+                "The API rejected a face image as forbidden -- the publisher "
+                "account is missing the admin role or the publish scope."
+            )
+
+        if outcome == "applied":
+            uploaded.append(face_id)
+
+    if client.stamps and uploaded:
+        stamp_face_images(conn, uploaded)
+
+    log.info("Face images: %d/%d uploaded", len(uploaded), len(rows))
+
+    return totals
+
+
+def stamp_face_images(conn, face_ids: list[str]) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE face_detection
+               SET image_published_at = now()
+             WHERE id = ANY(%s)
+            """,
+            (face_ids,),
+        )
+
+    conn.commit()
 
 
 def publish_removals(conn, client: MawMediaClient) -> dict:
@@ -999,12 +1156,14 @@ def cmd_publish(
         publish_statuses(conn, client)
         p_totals = publish_persons(conn, client)
         f_totals = publish_faces(conn, client, limit)
+        i_totals = publish_face_images(conn, client)
         r_totals = publish_removals(conn, client)
 
     log.info("Done in %.1fs", time.time() - started)
     for label, totals in (
         ("persons", p_totals),
         ("faces", f_totals),
+        ("images", i_totals),
         ("removals", r_totals),
     ):
         if totals:
@@ -1028,7 +1187,13 @@ def cmd_reset(persons: bool, faces: bool) -> None:
                 cur.execute("UPDATE person SET published_revision = NULL")
                 log.info("Persons reset: %d", cur.rowcount)
             if faces:
-                cur.execute("UPDATE face_detection SET published_revision = NULL")
+                cur.execute(
+                    """
+                    UPDATE face_detection
+                       SET published_revision = NULL,
+                           image_published_at = NULL
+                    """
+                )
                 log.info("Faces reset: %d", cur.rowcount)
             cur.execute("UPDATE deleted_entity SET published_revision = NULL")
         conn.commit()

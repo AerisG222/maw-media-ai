@@ -97,6 +97,12 @@ ALTER TABLE person ADD CONSTRAINT person_status_code_fkey
     FOREIGN KEY (status_code) REFERENCES person_status(code);
 
 -- A named person is triaged by definition, so the two are mutually exclusive.
+-- the preferred face crop published to maw-media is keyed by face id and never
+-- changes once uploaded, so this records the ones already sent.  see
+-- migrations/008-face-image-published.sql for why it is not driven by
+-- person.revision.
+ALTER TABLE face_detection ADD COLUMN IF NOT EXISTS image_published_at TIMESTAMPTZ;
+
 ALTER TABLE person DROP CONSTRAINT IF EXISTS person_name_status_excl;
 ALTER TABLE person ADD CONSTRAINT person_name_status_excl
     CHECK (name IS NULL OR status_code IS NULL);
