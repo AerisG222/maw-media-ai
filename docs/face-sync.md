@@ -51,6 +51,14 @@ locally. Per-environment outbox columns would be the alternative if a non-prod
 target ever needs durable tracking; it is not worth the schema today, since dev
 databases are rebuilt anyway.
 
+That rule has one sharp edge worth remembering: **`published_revision` and
+`image_published_at` are always NULL outside production**, so any query of the
+form "only do X for rows already published" silently matches nothing in dev. The
+face-image queue hit exactly this and appeared to be broken. The fix is not to
+drop the ordering requirement but to satisfy it from what the current run
+learned — the API's own per-item outcomes say which rows it just accepted, and
+that is true in every environment.
+
 Two things the publisher learned that are worth keeping here:
 
 - `GET /persons/sync/state` (§5, "Drift reconciliation") is specified but not

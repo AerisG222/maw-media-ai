@@ -584,14 +584,20 @@ PENDING_PERSONS_SQL = f"""
 # preferred faces whose crop has not been uploaded yet.  driven by the face
 # rather than by person.revision so an unrelated person change (face_count moves
 # on every cluster run) does not re-send a byte-identical image.
+# An image can only attach to a face maw-media already holds, so the candidate
+# set is filtered by "is that face published?" -- but NOT in SQL.  published_revision
+# is written only by production runs (see MawMediaClient.stamps), so testing it here
+# would make this query return nothing at all in dev, forever.  The face may equally
+# have been published moments ago by publish_faces in this same run, which is the
+# only way dev ever gets there; that decision needs both facts and so lives in
+# publish_face_images.
 PENDING_FACE_IMAGES_SQL = f"""
-    SELECT fd.id, m.file_path
+    SELECT fd.id, m.file_path, fd.published_revision
     FROM person p
     JOIN face_detection fd ON fd.id = p.preferred_face_id
     JOIN media m           ON m.id = fd.media_id
     WHERE {PERSON_IN_SCOPE}
       AND fd.image_published_at IS NULL
-      AND fd.published_revision IS NOT NULL
     ORDER BY p.revision
 """
 
@@ -817,7 +823,9 @@ def publish_persons(conn, client: MawMediaClient) -> dict:
     return totals
 
 
-def publish_faces(conn, client: MawMediaClient, limit: int | None) -> dict:
+def publish_faces(
+    conn, client: MawMediaClient, limit: int | None, accepted: set[str] | None = None
+) -> dict:
     with conn.cursor() as cur:
         cur.execute(PENDING_FACES_SQL)
         rows = cur.fetchall()
@@ -850,6 +858,13 @@ def publish_faces(conn, client: MawMediaClient, limit: int | None) -> dict:
 
         for outcome, n in summarize(results).items():
             totals[outcome] = totals.get(outcome, 0) + n
+
+        # Recorded before the stamping guard: a dev run never stamps, but the
+        # rows really were accepted, and their images depend on knowing that.
+        if accepted is not None:
+            accepted.update(
+                r["entityId"] for r in results if r.get("outcome") in SETTLED
+            )
 
         if not client.stamps:
             continue
@@ -893,15 +908,31 @@ def build_face_image(source_path: str, face_id: str) -> bytes | None:
     return buffer.getvalue()
 
 
-def publish_face_images(conn, client: MawMediaClient) -> dict:
+def publish_face_images(
+    conn, client: MawMediaClient, accepted: set[str] | None = None
+) -> dict:
     """Upload the crop for each preferred face that has not been sent yet.
 
     Runs after publish_faces: the api answers 404 for a face it has never seen,
-    which is how an orphaned image is prevented.
+    which is how an orphaned image is prevented.  Skipping those faces here as
+    well keeps a broken path or an out-of-order person from costing a request
+    per run, forever.
+
+    A face counts as known to maw-media if it is stamped (a previous production
+    run) OR the api accepted it moments ago in this run.  The second half is not
+    a nicety: dev never stamps, so without it the candidate set is always empty
+    and no face image can ever reach a non-production environment.
     """
     with conn.cursor() as cur:
         cur.execute(PENDING_FACE_IMAGES_SQL)
         rows = cur.fetchall()
+
+    known = accepted or set()
+    rows = [
+        r
+        for r in rows
+        if r["published_revision"] is not None or str(r["id"]) in known
+    ]
 
     if not rows:
         log.info("Face images: nothing pending")
@@ -1155,8 +1186,11 @@ def cmd_publish(
         # persons before faces (person_id is a foreign key), removals last.
         publish_statuses(conn, client)
         p_totals = publish_persons(conn, client)
-        f_totals = publish_faces(conn, client, limit)
-        i_totals = publish_face_images(conn, client)
+        # Face ids the api accepted this run; publish_face_images needs them
+        # because a dev run leaves no durable record that it published anything.
+        accepted: set[str] = set()
+        f_totals = publish_faces(conn, client, limit, accepted)
+        i_totals = publish_face_images(conn, client, accepted)
         r_totals = publish_removals(conn, client)
 
     log.info("Done in %.1fs", time.time() - started)
