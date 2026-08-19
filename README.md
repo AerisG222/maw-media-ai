@@ -409,6 +409,13 @@ uncategorised faces (optionally sorted by similarity to a target person),
 merging similar clusters, reviewing `suggest` results, and clearing unwanted
 clusters.
 
+A cluster card is badged **AUTO** when nobody picked its face by hand, so the
+strongest detection is standing in — which is also the face the publisher sends
+to the website. The **No face chosen** filter narrows the grid to those, and
+composes with the Show filter, so *Named* + *No face chosen* is the list worth
+working through. Click the star on any face to make the choice explicit and the
+badge goes away.
+
 Inside a cluster, **Select faces** turns on a checkbox per face (plus *Select
 all on page*) and offers two bulk actions for that subset: **Move** them to
 another named person, or **Remove** them so they return to Uncategorized. Use

@@ -9,7 +9,6 @@ from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
-import numpy as np
 import psycopg2
 import psycopg2.pool
 import streamlit as st
@@ -288,15 +287,30 @@ def _triage_clause(triage: str) -> str:
     }.get(triage, " AND status_code = %(tcode)s")
 
 
+def _preview_clause(needs_preview: bool, alias: str = "") -> str:
+    """SQL fragment for "no face was chosen by hand".
+
+    Takes the alias explicitly rather than post-processing the string the way
+    _triage_clause is patched at each call site -- one less thing to get wrong
+    when a query gains a join.
+    """
+    if not needs_preview:
+        return ""
+
+    return f" AND {alias}preferred_face_id IS NULL"
+
+
 def fetch_persons_count(
     search: str | None = None,
     triage: str = "all",
+    needs_preview: bool = False,
 ) -> int:
     like = f"%{search}%" if search else None
     result = execute_single(
         "SELECT COUNT(1) FROM person WHERE (%(s)s IS NULL OR name ILIKE %(l)s "
         "OR id::text ILIKE %(l)s)"
-        + _triage_clause(triage),
+        + _triage_clause(triage)
+        + _preview_clause(needs_preview),
         {"s": search, "l": like, "tcode": triage},
     )
     return result[0] if result else 0
@@ -307,17 +321,24 @@ def fetch_persons_page(
     limit: int = PERSONS_PAGE_SIZE,
     offset: int = 0,
     triage: str = "all",
+    needs_preview: bool = False,
 ) -> list:
     """Return a page of persons with one sample face for preview.
 
-    Each row: (id, name, face_count, sample_path, sample_score, sample_bbox, sample_face_id)
+    Each row: (id, name, face_count, sample_path, sample_score, sample_bbox,
+    sample_face_id, preferred_face_id)
+
+    preferred_face_id is the operator's own choice and is NULL for most clusters;
+    the sample above then falls back to the strongest detection.  The card marks
+    that case, because the publisher sends whichever face this resolves to.
     """
     like = f"%{search}%" if search else None
     return execute_query(
         """
         SELECT p.id, p.name, p.face_count,
                ph.file_path AS sample_path, fd.detection_score AS sample_score,
-               fd.bounding_box AS sample_bbox, fd.id AS sample_face_id
+               fd.bounding_box AS sample_bbox, fd.id AS sample_face_id,
+               p.preferred_face_id
         FROM person_v p
         LEFT JOIN LATERAL (
             SELECT fd.id, fd.media_id, fd.detection_score, fd.bounding_box
@@ -330,111 +351,13 @@ def fetch_persons_page(
         LEFT JOIN media ph ON ph.id = fd.media_id
         WHERE (%(s)s IS NULL OR p.name ILIKE %(l)s OR p.id::text ILIKE %(l)s)
           """ + _triage_clause(triage).replace(" AND name", " AND p.name")
-                                      .replace(" AND status_code", " AND p.status_code") + """
+                                      .replace(" AND status_code", " AND p.status_code")
+              + _preview_clause(needs_preview, "p.") + """
         ORDER BY p.face_count DESC NULLS LAST, p.id
         LIMIT %(lim)s OFFSET %(off)s
         """,
         {"s": search, "l": like, "tcode": triage,
          "lim": limit, "off": offset},
-    )
-
-
-def fetch_all_persons_embeddings(
-    search: str | None = None,
-    triage: str = "all",
-) -> list[tuple]:
-    """Fetch all matching persons with centroids for similarity-order computation.
-
-    Returns list of (id, face_count, embedding_floats | None), sorted by face_count desc.
-    """
-    like = f"%{search}%" if search else None
-    rows = execute_query(
-        """
-        SELECT p.id, p.face_count, p.representative_embedding::text
-        FROM person_v p
-        WHERE (%(s)s IS NULL OR p.name ILIKE %(l)s OR p.id::text ILIKE %(l)s)
-          """ + _triage_clause(triage).replace(" AND name", " AND p.name")
-                                      .replace(" AND status_code", " AND p.status_code") + """
-        ORDER BY p.face_count DESC NULLS LAST, p.id
-        """,
-        {"s": search, "l": like, "tcode": triage},
-    )
-    result = []
-    for pid, face_count, emb_text in rows:
-        emb = json.loads(emb_text) if emb_text else None
-        result.append((str(pid), face_count, emb))
-    return result
-
-
-def _compute_similarity_order(persons_data: list[tuple]) -> list[str]:
-    """Greedy nearest-neighbor traversal ordering persons by centroid cosine similarity.
-
-    Starts from the largest cluster and chains each step to the most similar
-    unvisited cluster.  Persons without embeddings are appended at the end.
-
-    persons_data: list of (id, face_count, embedding | None)
-    Returns: ordered list of person ID strings.
-    """
-    with_emb = [(p[0], p[2]) for p in persons_data if p[2] is not None]
-    without_emb = [p[0] for p in persons_data if p[2] is None]
-
-    if not with_emb:
-        return without_emb
-
-    ids = [p[0] for p in with_emb]
-    mat = np.array([p[1] for p in with_emb], dtype=np.float32)
-
-    # L2-normalize so dot product equals cosine similarity
-    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    mat /= norms
-
-    sim = mat @ mat.T  # (n, n) cosine similarity matrix
-
-    n = len(ids)
-    visited = np.zeros(n, dtype=bool)
-    order: list[int] = []
-    current = 0  # largest cluster is index 0 (sorted by face_count desc)
-    visited[current] = True
-    order.append(current)
-
-    for _ in range(n - 1):
-        row = sim[current].copy()
-        row[visited] = -np.inf
-        nearest = int(np.argmax(row))
-        visited[nearest] = True
-        order.append(nearest)
-        current = nearest
-
-    return [ids[i] for i in order] + without_emb
-
-
-def fetch_persons_by_ids(page_ids: list[str]) -> list:
-    """Fetch a page of persons in the given ID order (used for similarity sort).
-
-    Returns same tuple format as fetch_persons_page.
-    """
-    if not page_ids:
-        return []
-    return execute_query(
-        """
-        SELECT p.id, p.name, p.face_count,
-               ph.file_path AS sample_path, fd.detection_score AS sample_score,
-               fd.bounding_box AS sample_bbox, fd.id AS sample_face_id
-        FROM person_v p
-        LEFT JOIN LATERAL (
-            SELECT fd.id, fd.media_id, fd.detection_score, fd.bounding_box
-            FROM face_detection fd
-            WHERE fd.person_id = p.id
-            ORDER BY (fd.id = p.preferred_face_id) DESC NULLS LAST,
-                     fd.detection_score DESC NULLS LAST, fd.id
-            LIMIT 1
-        ) fd ON true
-        LEFT JOIN media ph ON ph.id = fd.media_id
-        WHERE p.id = ANY(%s::uuid[])
-        ORDER BY array_position(%s::uuid[], p.id)
-        """,
-        (page_ids, page_ids),
     )
 
 
@@ -893,14 +816,31 @@ def render_clickable_person_card(
     width: int = 160,
     height: int = 160,
     filename: str = "Image",
+    auto_preview: bool = False,
 ) -> None:
-    """Render a cluster/person card's image and metadata (no action button)."""
+    """Render a cluster/person card's image and metadata (no action button).
+
+    auto_preview marks a cluster whose face nobody chose, so the strongest
+    detection is standing in.  Worth seeing at a glance now that this is the
+    face published to the website.
+    """
     if data_url:
         style = f"width:{width}px;height:{height}px;object-fit:contain;display:block;margin:auto;user-select:none;border-radius:8px;"
         img_html = (
             f'<img src="{data_url}" alt="{html.escape(filename)}" width="{width}" height="{height}" '
             f'style="{style}" draggable="false" />'
         )
+        if auto_preview:
+            # Only over a real thumbnail: a cluster with no faces has no chosen
+            # face either, and badging an empty card would say nothing.
+            img_html = (
+                f'<div style="position:relative;width:{width}px;margin:auto;">{img_html}'
+                '<div title="No face chosen - showing the strongest detection" '
+                'style="position:absolute;top:6px;right:6px;background:rgba(0,0,0,0.6);'
+                'color:#fff;font-size:0.6rem;line-height:1;letter-spacing:0.04em;'
+                'padding:3px 5px;border-radius:4px;pointer-events:none;">AUTO</div>'
+                "</div>"
+            )
     else:
         img_html = (
             f'<div style="width:{width}px;height:{height}px;background:var(--background-color);'
@@ -1042,7 +982,7 @@ def main():
 
 
 def render_persons_step():
-    control_col1, control_col3, control_col_sim, control_col4 = st.columns(
+    control_col1, control_col3, control_col_filter, control_col4 = st.columns(
         [3, 1, 1, 3]
     )
 
@@ -1074,11 +1014,15 @@ def render_persons_step():
             persist_state="session",
         )
 
-    with control_col_sim:
+    with control_col_filter:
+        # Composes with the triage filter rather than being another value in it:
+        # "Named" + this is the combination that matters, since those are the
+        # clusters whose face gets published.
         st.checkbox(
-            "Sort by similarity",
-            key="choose_sim_sort",
+            "No face chosen",
+            key="choose_needs_preview",
             persist_state="session",
+            help="Only clusters where no face was picked by hand (marked AUTO)",
         )
 
     with control_col4:
@@ -1112,36 +1056,13 @@ def render_persons_step():
                 st.error(f"Cleanup failed: {e}")
 
     triage = st.session_state.get("choose_triage", "all")
-    sim_sort = st.session_state.get("choose_sim_sort", False)
+    needs_preview = st.session_state.get("choose_needs_preview", False)
 
-    # Cache key uniquely identifies the current filter combination.
-    # When it changes, the similarity order must be recomputed and the page reset.
-    sim_cache_key = f"{search or ''}:{triage}"
-
-    if sim_sort:
-        prev_key = st.session_state.get("sim_order_key")
-        if prev_key != sim_cache_key or "sim_order" not in st.session_state:
-            with st.spinner("Computing similarity order…"):
-                persons_data = fetch_all_persons_embeddings(
-                    search if search else None, triage=triage
-                )
-                st.session_state["sim_order"] = _compute_similarity_order(persons_data)
-                # Reset to page 1 only when the user actually changed the filter,
-                # not on a fresh restore (prev_key is None) where the URL page stands.
-                if prev_key is not None and prev_key != sim_cache_key:
-                    st.session_state["choose_page"] = 1
-                st.session_state["sim_order_key"] = sim_cache_key
-
-        ordered_ids = st.session_state["sim_order"]
-        total = len(ordered_ids)
-    else:
-        # Clear stale cache when sim sort is turned off
-        st.session_state.pop("sim_order", None)
-        st.session_state.pop("sim_order_key", None)
-        total = fetch_persons_count(
-            search if search else None,
-            triage=triage,
-        )
+    total = fetch_persons_count(
+        search if search else None,
+        triage=triage,
+        needs_preview=needs_preview,
+    )
 
     page_count = max(1, math.ceil(total / PERSONS_PAGE_SIZE))
 
@@ -1177,16 +1098,13 @@ def render_persons_step():
 
     # Fetch page
     offset = (st.session_state["choose_page"] - 1) * PERSONS_PAGE_SIZE
-    if sim_sort:
-        page_ids = ordered_ids[offset : offset + PERSONS_PAGE_SIZE]
-        persons = fetch_persons_by_ids(page_ids)
-    else:
-        persons = fetch_persons_page(
-            search if search else None,
-            limit=PERSONS_PAGE_SIZE,
-            offset=offset,
-            triage=triage,
-        )
+    persons = fetch_persons_page(
+        search if search else None,
+        needs_preview=needs_preview,
+        limit=PERSONS_PAGE_SIZE,
+        offset=offset,
+        triage=triage,
+    )
 
     for row_start in range(0, len(persons), GRID_COLS):
         row = persons[row_start : row_start + GRID_COLS]
@@ -1201,6 +1119,7 @@ def render_persons_step():
                 sample_score,
                 sample_bbox,
                 sample_face_id,
+                preferred_face_id,
             ) = person_row
 
             with cols[col_idx]:
@@ -1220,6 +1139,7 @@ def render_persons_step():
                     filename=os.path.basename(sample_path)
                     if sample_path
                     else "Unknown",
+                    auto_preview=preferred_face_id is None,
                 )
 
                 # Named clusters get a single full-width name button. Unnamed
@@ -1247,10 +1167,6 @@ def render_persons_step():
                                 try:
                                     clear_cluster(str(person_id))
                                     st.session_state.pop(confirm_key, None)
-                                    # A cluster was removed — invalidate the
-                                    # cached similarity order so it recomputes.
-                                    st.session_state.pop("sim_order", None)
-                                    st.session_state.pop("sim_order_key", None)
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Failed to clear: {e}")
