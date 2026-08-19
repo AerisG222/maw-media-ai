@@ -32,10 +32,9 @@ import psycopg
 from psycopg.rows import dict_row
 from sklearn.linear_model import LogisticRegression
 
-DB_DSN = os.getenv(
-    "FACE_SCANNER_DSN",
-    "postgresql://face_scanner:face_scanner_secret@localhost:5433/face_scanner",
-)
+# No default: see the note in scan-faces.py.  psycopg would otherwise fall back
+# to libpq's defaults and read a different database than intended.
+DB_DSN = os.getenv("FACE_SCANNER_DSN")
 
 TEST_FRACTION = 0.20
 RANDOM_SEED = 42
@@ -47,6 +46,12 @@ def log(msg: str) -> None:
 
 def load_labeled(dsn: str) -> tuple[np.ndarray, np.ndarray, dict[str, str]]:
     """Return (X, y, id->name) for every face belonging to a NAMED person."""
+    if not dsn:
+        raise SystemExit(
+            "FACE_SCANNER_DSN is not set.  Export the connection string first:\n"
+            '    export FACE_SCANNER_DSN="postgresql://user:pass@host:5433/face_scanner"'
+        )
+
     log("Loading labelled embeddings…")
     t0 = time.time()
     with psycopg.connect(dsn, row_factory=dict_row) as conn:

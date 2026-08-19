@@ -549,7 +549,7 @@ def fetch_all_persons_for_merge(exclude_id: str) -> list:
             FROM face_detection fd
             WHERE fd.person_id = p.id
             ORDER BY (fd.id = p.preferred_face_id) DESC NULLS LAST,
-                     fd.detection_score DESC NULLS LAST
+                     fd.detection_score DESC NULLS LAST, fd.id
             LIMIT 1
         ) fd ON true
         LEFT JOIN media ph ON ph.id = fd.media_id

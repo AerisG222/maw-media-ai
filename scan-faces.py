@@ -47,10 +47,11 @@ from face_cache import face_crop_path
 # Configuration — override via environment variables or edit defaults below
 # ---------------------------------------------------------------------------
 
-DB_DSN = os.getenv(
-    "FACE_SCANNER_DSN",
-    "postgresql://face_scanner:face_scanner_secret@localhost:5433/face_scanner",
-)
+# No default.  A fallback here would put a password in the source, and psycopg
+# reads a missing dsn as "use libpq's own defaults" (PGHOST, PGDATABASE, the local
+# unix socket), so an unset variable would quietly scan into whatever database
+# happens to be reachable.  get_connection() enforces this.
+DB_DSN = os.getenv("FACE_SCANNER_DSN")
 
 # InsightFace model name. buffalo_l is the best quality; buffalo_s is faster.
 INSIGHTFACE_MODEL = os.getenv("INSIGHTFACE_MODEL", "buffalo_l")
@@ -166,7 +167,14 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def get_connection(dsn: str) -> psycopg.Connection:
+def get_connection(dsn: str | None) -> psycopg.Connection:
+    if not dsn:
+        raise SystemExit(
+            "FACE_SCANNER_DSN is not set.  Export the connection string first:\n"
+            '    export FACE_SCANNER_DSN="postgresql://user:pass@host:5433/face_scanner"\n'
+            "setup-db.sh prints the exact line for your container."
+        )
+
     return psycopg.connect(dsn, row_factory=dict_row)
 
 

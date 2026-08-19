@@ -62,6 +62,12 @@ from psycopg.rows import dict_row
 from face_cache import face_crop_path
 
 # --- Configuration -----------------------------------------------------------
+# No default.  A hard-coded fallback would embed a password in the source, and
+# psycopg treats a missing dsn as "use libpq's own defaults" -- PGHOST, PGDATABASE,
+# or the local unix socket -- so an unset variable would quietly connect to
+# whatever database happens to be there rather than failing.  Publishing reads
+# person and face rows and writes published_revision back, so the wrong database
+# is not a harmless mistake.  connect() below enforces this.
 DB_DSN = os.getenv("FACE_SCANNER_DSN")
 
 # --- Environments ------------------------------------------------------------
@@ -159,6 +165,17 @@ log = logging.getLogger("publish-faces")
 
 class PublishError(Exception):
     pass
+
+
+def connect(**kwargs):
+    """Open a connection, refusing to fall back to libpq's defaults."""
+    if not DB_DSN:
+        raise PublishError(
+            "FACE_SCANNER_DSN is not set.  Export the connection string first:\n"
+            '    export FACE_SCANNER_DSN="postgresql://user:pass@localhost:5433/face_scanner"'
+        )
+
+    return psycopg.connect(DB_DSN, **kwargs)
 
 
 CONFIG_TEMPLATE = """{
@@ -571,11 +588,32 @@ def check_forbidden(results: list[dict]) -> None:
 
 
 # --- Queries -----------------------------------------------------------------
+# Which face represents a cluster.  Copied deliberately from view-clusters-app.py's
+# person grid so the website shows the same face the operator sees while labelling:
+# the starred face when there is one, otherwise the strongest detection, with id as
+# a deterministic tiebreak so two equal scores cannot pick differently run to run.
+#
+# preferred_face_id is left alone locally -- the star is an operator decision and
+# writing a guess into it would be indistinguishable from one.  The fallback is
+# resolved at publish time instead, and maw-media is told the result so its
+# preferred_face_id always points at a face whose image was actually sent.
+PREVIEW_FACE_SQL = """
+    SELECT fd.id
+    FROM face_detection fd
+    WHERE fd.person_id = p.id
+    ORDER BY (fd.id = p.preferred_face_id) DESC NULLS LAST,
+             fd.detection_score DESC NULLS LAST, fd.id
+    LIMIT 1
+"""
+
+# LEFT JOIN LATERAL, not JOIN: a named person can have no faces at all (label a
+# cluster, then move every face out of it), and it still has to publish.
 PENDING_PERSONS_SQL = f"""
-    SELECT p.id, p.name, p.status_code, p.preferred_face_id,
+    SELECT p.id, p.name, p.status_code, preview.id AS preferred_face_id,
            pv.face_count, p.revision, p.updated_at
     FROM person p
     JOIN person_v pv ON pv.id = p.id
+    LEFT JOIN LATERAL ({PREVIEW_FACE_SQL}) preview(id) ON TRUE
     WHERE {PERSON_IN_SCOPE}
       AND (p.published_revision IS NULL OR p.published_revision < p.revision)
     ORDER BY p.revision
@@ -594,7 +632,8 @@ PENDING_PERSONS_SQL = f"""
 PENDING_FACE_IMAGES_SQL = f"""
     SELECT fd.id, m.file_path, fd.published_revision
     FROM person p
-    JOIN face_detection fd ON fd.id = p.preferred_face_id
+    JOIN LATERAL ({PREVIEW_FACE_SQL}) preview(id) ON TRUE
+    JOIN face_detection fd ON fd.id = preview.id
     JOIN media m           ON m.id = fd.media_id
     WHERE {PERSON_IN_SCOPE}
       AND fd.image_published_at IS NULL
@@ -708,7 +747,7 @@ def cmd_status() -> None:
     Takes no environment: the outbox records one thing, what production holds,
     so this is always production's queue.
     """
-    with psycopg.connect(DB_DSN, row_factory=dict_row) as conn:
+    with connect(row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             cur.execute(f"SELECT count(*) AS n FROM person p WHERE {PERSON_IN_SCOPE}")
             in_scope_persons = cur.fetchone()["n"]
@@ -1180,7 +1219,7 @@ def cmd_publish(
     if not dry_run:
         client.login()
 
-    with psycopg.connect(DB_DSN, row_factory=dict_row) as conn:
+    with connect(row_factory=dict_row) as conn:
         # Order matters, and the caller owns it: each endpoint is its own
         # transaction.  Statuses before persons (status_code is a foreign key),
         # persons before faces (person_id is a foreign key), removals last.
@@ -1215,7 +1254,7 @@ def cmd_reset(persons: bool, faces: bool) -> None:
     guard, so a republish of unchanged data lands as skipped_stale -- harmless,
     but it does mean this cannot be used to *repair* maw-media, only to resend.
     """
-    with psycopg.connect(DB_DSN) as conn:
+    with connect() as conn:
         with conn.cursor() as cur:
             if persons:
                 cur.execute("UPDATE person SET published_revision = NULL")

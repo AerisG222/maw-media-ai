@@ -88,7 +88,10 @@ PG_PASSWORD=mysecret PG_PORT=5434 ./setup-db.sh
 export FACE_SCANNER_DSN="postgresql://face_scanner:face_scanner_secret@localhost:5433/face_scanner"
 ```
 
-Or edit the `DB_DSN` default at the top of `scan-faces.py`.
+This is required — every script refuses to run without it. There is no
+in-source default, so nothing can connect to an unintended database just
+because a variable was forgotten. `./setup-db.sh` prints the exact line for
+your container.
 
 ---
 
@@ -324,6 +327,21 @@ Three things can put a row on the queue:
 | New or changed | Published, and `published_revision` stamped on acceptance |
 | Deleted here | A tombstone row drives an explicit deletion — absence from a batch means "unchanged", not "gone" |
 | Left publish scope (e.g. you cleared a person's name) | **Retracted**: deleted from maw-media and marked unpublished here, so it returns automatically if you name them again |
+
+### Which face represents a person
+
+Every named person publishes one face image — the same face the Streamlit app
+shows on its cluster card: the face you starred, or the strongest detection when
+you have not starred one (ties broken by id, so the choice is stable).
+
+The star is left alone locally; writing a guess into `preferred_face_id` would be
+indistinguishable from an operator decision. The fallback is resolved at publish
+time and maw-media is told the result, so `media.person.preferred_face_id` always
+points at a face whose image was actually uploaded.
+
+This is why the queue shows 448 face images rather than the 64 you have starred.
+Star a different face and the next publish moves the pointer and uploads that
+crop.
 
 ### When a link breaks
 
