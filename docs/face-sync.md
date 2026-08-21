@@ -582,8 +582,17 @@ API answers 404 for a face it has not seen. A 404 leaves the row unstamped and
 retries next run; a missing crop in the cache is counted as `missing_crop` and
 reported rather than failing the run.
 
-`GET /faces/{id}/image` returns it to any authenticated user, and 404s when
-nothing was published.
+Reading the crop back is *not* an API call. `GET /assets/faces/{faceId}.avif`
+serves it from maw-media's static file pipeline, alongside media assets, and
+404s when nothing was published. Two reasons it lives there rather than under
+`/api`: the person picker renders hundreds of these at once, and static file
+middleware answers a conditional GET with `304` where an API route resent every
+body; and an image has no business carrying an API version in its URL.
+
+It still requires the `face-recognition:read` scope, and it still answers `404`
+rather than `403` for a face the caller may not see — a `403` would confirm the
+face exists. Publishing is unchanged and remains `PUT /api/v1/faces/{id}/image`
+under `face-recognition:publish`.
 
 ### Ordering and batch size
 
