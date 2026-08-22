@@ -665,15 +665,35 @@ not alter the public contract.
 A person upsert **replaces the whole row**. Every field must be sent on every
 publish; omitting one clears it rather than leaving it untouched.
 
-### User-facing — `face:read` / `face:write`
+### User-facing — `face-recognition:read`
+
+Built, except the suggestion route. All of these live under `/api/v1` and are
+gated on `face-recognition:read`, separate from `media:read`, so the whole face
+feature can be withdrawn from a client without touching media access.
 
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /config/person-statuses` | Lookup values, alongside `GET /config/scales` |
-| `GET /media/{id}/faces` | Faces on a media item |
-| `GET /person` | Browse named people |
-| `GET /person/{id}/media` | Media containing a person |
-| `POST /face/{id}/suggestion` | File a suggestion or correction |
+| `GET /media/{id}/faces` | Faces and bounding boxes on a media item |
+| `GET /persons` | Browse named people; `?f=true` for favourites, favourites sort first |
+| `PUT /persons/{id}/favorite` | Favourite a person |
+| `GET /persons/{id}/media` | Media containing a person; `?o=`, `?f=true`, `?seed=` |
+| `GET /clans` … `DELETE /clans/{id}` | Saved selections of people, private per user |
+| `GET /clans/{id}/media` | Media containing *any* member of a clan |
+| `GET /assets/faces/{faceId}.avif` | The published crop, served as a static file |
+| `POST /face/{id}/suggestion` | *(not built)* File a suggestion or correction |
+
+`GET /media/{id}/faces` returns `[{ id, personId, boxX, boxY, boxWidth,
+boxHeight }]`. The box is normalised 0..1 against the full frame, so it applies
+to whichever scale the client is showing, and may fall slightly outside that
+range for a face the frame cuts off — clamp when drawing.
+
+`personId` is null both for an unassigned face and for one whose person is
+unnamed or triaged. The box is still worth drawing in either case, but returning
+the cluster id would let a caller learn about a person `GET /persons`
+deliberately hides. A media item the caller cannot see returns an empty array
+rather than a 404, since "nothing to draw" is the same answer either way and the
+media route itself already distinguishes them.
 
 ### Security
 
