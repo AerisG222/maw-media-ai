@@ -7,7 +7,7 @@ import os
 from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
-from uuid import uuid4
+from uuid import uuid4, uuid7
 
 import psycopg2
 import psycopg2.pool
@@ -199,6 +199,56 @@ def move_faces_to_person(
             cur.execute(_REFRESH_CENTROID_SQL, (source_id, source_id))
             conn.commit()
     return moved
+
+
+def find_person_by_name(name: str):
+    """Case-insensitive name lookup, used to refuse a duplicate before it exists.
+
+    maw-media derives media.person.slug from the name and that column is UNIQUE,
+    so "Bob Smith" and "bob smith" collide there.  Catching it here beats a
+    failed batch at publish time, when the cause is far from the cause.
+    """
+    return execute_single(
+        "SELECT id, name FROM person WHERE lower(name) = lower(%s) LIMIT 1",
+        (name,),
+    )
+
+
+def create_person_from_face(face_id: str, name: str) -> str:
+    """Make a new named cluster whose only member is this face.
+
+    The face's own embedding becomes the centroid, so `suggest` and
+    `merge-clusters` can match against the new person on their very next run
+    rather than after a re-cluster.
+
+    It is also recorded as preferred_face_id: unlike the score fallback that
+    leaves a cluster badged AUTO, this face really was chosen by hand -- it is
+    the whole reason the person exists.
+    """
+    person_id = str(uuid7())
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO person (id, name, representative_embedding, preferred_face_id)
+                SELECT %s, %s, fd.embedding, fd.id
+                FROM face_detection fd
+                WHERE fd.id = %s
+                """,
+                (person_id, name, face_id),
+            )
+
+            if cur.rowcount != 1:
+                raise ValueError(f"No face {face_id}")
+
+            cur.execute(
+                "UPDATE face_detection SET person_id = %s WHERE id = %s",
+                (person_id, face_id),
+            )
+            conn.commit()
+
+    return person_id
 
 
 def set_preferred_face(person_id: str, face_id: str | None):
@@ -1216,6 +1266,43 @@ def navigate_to_unknown():
     st.rerun()
 
 
+@st.dialog("New person from this face")
+def _create_person_dialog(face_id: str, file_path: str, bbox: dict | None):
+    """Name a brand new cluster containing just this face."""
+    data_url = face_thumb_url(file_path, face_id, bbox)
+    if data_url:
+        st.markdown(
+            f'<img src="{data_url}" style="width:{IMAGE_HEIGHT}px;height:{IMAGE_HEIGHT}px;'
+            'object-fit:contain;border-radius:8px;display:block;margin:auto;" />',
+            unsafe_allow_html=True,
+        )
+    st.caption(file_path)
+
+    name = st.text_input("Name", key=f"new_person_name_{face_id}").strip()
+
+    if st.button(
+        "Create person",
+        type="primary",
+        disabled=not name,
+        key=f"new_person_create_{face_id}",
+    ):
+        existing = find_person_by_name(name)
+        if existing:
+            st.error(
+                f"'{existing[1]}' already exists. Choose them as the target "
+                "person and use Assign instead, so the two do not become "
+                "separate clusters with the same name."
+            )
+            return
+
+        try:
+            create_person_from_face(face_id, name)
+            st.session_state[UNKNOWN_SEL_KEY].discard(face_id)
+            st.rerun()
+        except Exception as e:
+            st.error(f"Could not create the person: {e}")
+
+
 @st.dialog("Original photo", width="large")
 def _show_original_photo(file_path: str):
     """Modal showing the full original image so a face can be seen in context."""
@@ -1752,17 +1839,31 @@ def render_unknown_step():
                     unsafe_allow_html=True,
                 )
 
+                # zoom and "new person" are always offered; Assign only makes
+                # sense once a target person has been chosen above.
+                widths = [1, 1, 2] if target_person is not None else [1, 1]
+                btn_cols = st.columns(widths)
+
+                with btn_cols[0]:
+                    if st.button(
+                        "", icon=":material/zoom_in:",
+                        key=f"unknown_view_orig_{face_id_str}",
+                        help="Open the original photo to see this face in context",
+                        width="stretch",
+                    ):
+                        _show_original_photo(file_path)
+
+                with btn_cols[1]:
+                    if st.button(
+                        "", icon=":material/person_add:",
+                        key=f"new_person_{face_id_str}",
+                        help="Start a new named person from this face",
+                        width="stretch",
+                    ):
+                        _create_person_dialog(face_id_str, file_path, bounding_box)
+
                 if target_person is not None:
-                    view_col, assign_col = st.columns(2)
-                    with view_col:
-                        if st.button(
-                            "", icon=":material/zoom_in:",
-                            key=f"unknown_view_orig_{face_id_str}",
-                            help="Open the original photo to see this face in context",
-                            width="stretch",
-                        ):
-                            _show_original_photo(file_path)
-                    with assign_col:
+                    with btn_cols[2]:
                         if st.button(
                             "Assign",
                             key=f"quick_assign_{face_id_str}",
@@ -1776,14 +1877,6 @@ def render_unknown_step():
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Assignment failed: {e}")
-                else:
-                    if st.button(
-                        "", icon=":material/zoom_in:",
-                        key=f"unknown_view_orig_{face_id_str}",
-                        help="Open the original photo to see this face in context",
-                        width="stretch",
-                    ):
-                        _show_original_photo(file_path)
 
                 if show_checkbox:
                     render_selection_checkbox(

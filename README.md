@@ -409,6 +409,13 @@ uncategorised faces (optionally sorted by similarity to a target person),
 merging similar clusters, reviewing `suggest` results, and clearing unwanted
 clusters.
 
+On the **Uncategorized faces** page, each face has a person-add button that
+starts a brand new named cluster from that one face. The face becomes the
+cluster's only member and its preferred face, and its embedding becomes the
+centroid — so `suggest` and `merge-clusters` can match against the new person on
+their next run rather than waiting for a re-cluster. A name that already exists
+(ignoring case) is refused, because maw-media derives a UNIQUE slug from it.
+
 A cluster card is badged **AUTO** when nobody picked its face by hand, so the
 strongest detection is standing in — which is also the face the publisher sends
 to the website. The **No face chosen** filter narrows the grid to those, and
