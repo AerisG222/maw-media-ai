@@ -198,6 +198,54 @@ no wheel for the newest Python for a while after release, so pass
 
 ---
 
+### Score scenes
+
+Classifies every media file: how outdoor it looks, and which scene categories
+describe it. The score ranks candidates for a location's cover image; the
+categories feed maw-media's search at its lowest weight.
+
+```bash
+psql "$FACE_SCANNER_DSN" -f migrations/009-scene-scores.sql       # once
+psql "$FACE_SCANNER_DSN" -f migrations/010-independent-scans.sql  # once
+./export-scene-model.sh                                       # once per machine
+python scan-scenes.py --media-dir /path/to/media
+```
+
+The work list is the **library on disk** (every image inside a `full/`
+directory, matching what the face scan walks), reconciled against the `media`
+table. Rows are then claimed by `scene_scored_at IS NULL`, so a run resumes where
+the last one stopped and re-running after new media arrives only does the new
+work.
+
+A photo it finds that nothing has recorded yet is registered so it can be
+scored, leaving `faces_scanned_at` NULL so the face scan still picks it up.
+
+**The two scanners are independent and can run in either order.** Each walks the
+directory it is given and claims work by its own column — `faces_scanned_at` for
+faces, `scene_scored_at` for scenes — so whichever meets a new file first
+registers it and the other still does its own work on it. Verified both ways
+round on the same files: identical end state, no duplicate rows.
+
+That independence needs migration 010. Before it, `scan-faces.py` treated "has a
+media row" as "already scanned", so a row created by anything else would have
+been skipped by the face scan forever.
+
+```bash
+python scan-scenes.py --sample 40    # score and print, writing nothing
+python scan-scenes.py --limit 2000   # a bounded first pass
+python scan-scenes.py --stats        # what has been scored so far
+python scan-scenes.py --rescan-all   # redo everything
+```
+
+Measured at **467 media/sec** on the GPU with the default 8 decode threads, so
+the whole library is a few minutes. That depends on reading a small rendition:
+a 224x224 classifier has no use for the 5400x3600 `full` file the face scanner
+needs, and decoding `full` measured 3/sec against 147 for `nhd`. The scan falls
+back `nhd` → `qvg` → `full-hd` → `full` so a missing variant degrades rather
+than skips.
+
+---
+
 ## Publishing to maw-media
 
 `publish-faces.py` pushes the pipeline's conclusions — who a person is, which

@@ -436,3 +436,66 @@ CREATE TRIGGER face_tombstone_trg
     AFTER DELETE ON face_detection
     REFERENCING OLD TABLE AS old_faces
     FOR EACH STATEMENT EXECUTE FUNCTION record_face_deletion();
+
+
+-- ---------------------------------------------------------------------------
+-- Scene scores (docs/place-covers.md in maw-media)
+--
+-- One Places365 pass yields how outdoor a photo looks, for ranking a location's
+-- cover image, plus the scene categories themselves for search.  Identical DDL
+-- to migrations/009-scene-scores.sql, which brings an existing database
+-- forward; this copy is for fresh ones.
+-- ---------------------------------------------------------------------------
+ALTER TABLE media ADD COLUMN IF NOT EXISTS outdoor_score REAL;
+ALTER TABLE media ADD COLUMN IF NOT EXISTS scene_scored_at TIMESTAMPTZ;
+
+-- ---------------------------------------------------------------------------
+-- Top-K scene categories per media
+--
+-- A child table rather than JSONB on media: both consumers want it relational.
+-- The search vector aggregates labels per category (a join), and the
+-- probability floor that keeps softmax noise out of the index is then a WHERE
+-- rather than a json path expression.
+--
+-- Storing K labels rather than just the winner is deliberate -- see the "store
+-- more than is currently used" note in the design.  The floor and the cover
+-- heuristics are exactly the decisions that will move after the first review,
+-- and keeping the output means moving them costs a query rather than a re-scan.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS media_scene_label (
+    media_id    UUID NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+    rank        SMALLINT NOT NULL,      -- 1 = most probable
+    code        TEXT NOT NULL,          -- places365 category, e.g. 'botanical_garden'
+    probability REAL NOT NULL,
+
+    PRIMARY KEY (media_id, rank)
+);
+
+-- "which media look like a museum" -- the admin cover picker filters on this
+-- when the outdoor ranking has nothing good to offer for a place.
+CREATE INDEX IF NOT EXISTS media_scene_label_code_idx
+    ON media_scene_label(code);
+
+-- The work queue: rows still needing a pass.  Partial, so it stays small as the
+-- library fills in and is empty once everything is scored.
+CREATE INDEX IF NOT EXISTS media_unscored_idx
+    ON media(id) WHERE scene_scored_at IS NULL;
+
+-- Cover ranking reads highest-first over a subset of media, so the index is
+-- worth having even though the table is small enough to seq-scan today.
+CREATE INDEX IF NOT EXISTS media_outdoor_score_idx
+    ON media(outdoor_score DESC) WHERE outdoor_score IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Independent scanners (migrations/010-independent-scans.sql)
+--
+-- scan-faces.py and scan-scenes.py both walk the media directory, so either can
+-- be the first to meet a new file and register it.  Each claims its own work by
+-- its own column -- faces_scanned_at here, scene_scored_at above -- rather than
+-- by the existence of a media row, which would let one scanner hide files from
+-- the other permanently.
+-- ---------------------------------------------------------------------------
+ALTER TABLE media ADD COLUMN IF NOT EXISTS faces_scanned_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS media_faces_unscanned_idx
+    ON media(id) WHERE faces_scanned_at IS NULL;

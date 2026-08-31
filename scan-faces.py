@@ -191,9 +191,15 @@ def check_schema(conn: psycopg.Connection) -> bool:
 
 
 def get_already_scanned_paths(conn: psycopg.Connection) -> set[str]:
-    """Return file paths that already have a media row (success or error)."""
+    """Return file paths the FACE scan has already processed (success or error).
+
+    Keyed on faces_scanned_at, not on the existence of a media row.  scan-scenes.py
+    also walks the library and registers what it finds, so "has a row" would mean
+    "somebody has seen this file", and treating that as "faces already detected"
+    would skip those photos forever.
+    """
     with conn.cursor() as cur:
-        cur.execute("SELECT file_path FROM media")
+        cur.execute("SELECT file_path FROM media WHERE faces_scanned_at IS NOT NULL")
         return {row["file_path"] for row in cur.fetchall()}
 
 
@@ -209,10 +215,14 @@ def upsert_media(
         cur.execute("SELECT id FROM media WHERE file_path = %s", (file_path,))
         row = cur.fetchone()
         if row:
-            # Update scan_error if needed
+            # faces_scanned_at is stamped here rather than only on insert: the row
+            # may have been registered by scan-scenes.py, in which case this is
+            # the first time faces have actually been looked for.
             cur.execute(
                 """
-                UPDATE media SET scanned_at = now(), scan_error = %s WHERE id = %s
+                UPDATE media
+                SET scanned_at = now(), faces_scanned_at = now(), scan_error = %s
+                WHERE id = %s
                 """,
                 (error, row["id"]),
             )
@@ -221,8 +231,8 @@ def upsert_media(
         media_id = str(uuid.uuid7())
         cur.execute(
             """
-            INSERT INTO media (id, file_path, file_name, scan_error)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO media (id, file_path, file_name, scan_error, faces_scanned_at)
+            VALUES (%s, %s, %s, %s, now())
             RETURNING id
             """,
             (media_id, file_path, Path(file_path).name, error),
