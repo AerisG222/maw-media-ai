@@ -171,6 +171,33 @@ python scan-faces.py stats
 
 ---
 
+## Scene scoring (place covers)
+
+`export-scene-model.sh` produces the Places365 scene classifier used to find
+outdoor photos suitable as location covers. Run it once per machine:
+
+```bash
+./export-scene-model.sh
+```
+
+It downloads the published PyTorch weights, converts them to ONNX in a
+**throwaway venv**, verifies the installed file against the original model, and
+deletes the venv. `torch` is needed for the conversion only and never enters
+`requirements.txt` — scoring runs on the `onnxruntime-gpu` already used for face
+detection.
+
+Artifacts land in `~/.cache/maw-media-ai/models/` (override with
+`SCENE_MODEL_DIR`): the `.onnx`, plus the category names and the indoor/outdoor
+map. The outdoor score is the softmax mass over the 204 outdoor categories, so
+it comes from the model's own taxonomy rather than a hand-picked threshold.
+
+The script prints the SHA256 of every download and the resolved torch version,
+and echoes the exact command to reproduce the same model elsewhere. `torch` has
+no wheel for the newest Python for a while after release, so pass
+`PYTHON=python3.11` if the install fails.
+
+---
+
 ## Publishing to maw-media
 
 `publish-faces.py` pushes the pipeline's conclusions — who a person is, which
