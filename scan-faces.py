@@ -29,6 +29,7 @@ import os
 import sys
 import sysconfig
 import time
+import warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -160,6 +161,33 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Third-party warnings
+# ---------------------------------------------------------------------------
+
+# insightface 1.0.1 aligns every detected face through
+# utils/face_align.py::estimate_norm, which builds the similarity transform as
+#     tform = trans.SimilarityTransform(); tform.estimate(lmk, dst)
+# scikit-image 0.26 (pulled in transitively by insightface -- we never import it
+# ourselves) deprecated that instance method in favour of the
+# SimilarityTransform.from_estimate class constructor, so the call emits a
+# FutureWarning naming insightface's file, not ours.  There is nothing to fix on
+# this side: the maths is unchanged (`estimate` still delegates to the same
+# `_estimate`, only the calling convention moved), and the fix has to land
+# upstream in insightface.
+#
+# Scoped to this one message so genuine FutureWarnings elsewhere still surface.
+# scikit-image schedules removal for 2.2; when that lands, this filter stops
+# matching anything and insightface fails loudly with an AttributeError rather
+# than silently -- which is the outcome we want.  Drop this once insightface
+# ships a release that calls from_estimate.
+warnings.filterwarnings(
+    "ignore",
+    message=r"`estimate` is deprecated since version 0\.26",
+    category=FutureWarning,
+)
 
 
 # ---------------------------------------------------------------------------
