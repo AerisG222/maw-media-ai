@@ -201,16 +201,22 @@ def move_faces_to_person(
     return moved
 
 
-def find_person_by_name(name: str):
+def find_person_by_name(name: str, exclude_id: str | None = None):
     """Case-insensitive name lookup, used to refuse a duplicate before it exists.
 
     maw-media derives media.person.slug from the name and that column is UNIQUE,
     so "Bob Smith" and "bob smith" collide there.  Catching it here beats a
     failed batch at publish time, when the cause is far from the cause.
+
+    exclude_id lets a rename ignore the person being renamed: re-saving a name
+    unchanged, or fixing only its capitalisation, is not a duplicate of itself.
     """
     return execute_single(
-        "SELECT id, name FROM person WHERE lower(name) = lower(%s) LIMIT 1",
-        (name,),
+        "SELECT id, name FROM person "
+        "WHERE lower(name) = lower(%s) "
+        "  AND (%s::uuid IS NULL OR id <> %s::uuid) "
+        "LIMIT 1",
+        (name, exclude_id, exclude_id),
     )
 
 
@@ -1386,14 +1392,31 @@ def render_faces_step(person_id: str):
         )
     with save_button_col:
         if st.button("Save name", key=f"save_name_{person_id}"):
-            try:
-                execute_update(
-                    "UPDATE person SET name = %s WHERE id = %s",
-                    (new_name if new_name else None, person_id),
+            # The same guard _create_person_dialog applies, because this is the
+            # other way a name reaches the database -- and the way a duplicate
+            # actually got made.  media.person.slug in maw-media is derived from
+            # this name and is UNIQUE, so a second "Riccardo LaRosa" is not a
+            # local curiosity: media.sync_persons upserts ON CONFLICT (id), so a
+            # slug already held by a different id raises a unique violation that
+            # fails the entire person batch, taking every unrelated person in it
+            # along.  Clearing the name (NULL) can never collide.
+            clash = find_person_by_name(new_name, person_id) if new_name else None
+
+            if clash:
+                st.error(
+                    f"'{clash[1]}' already exists.  Merge this cluster into them "
+                    "instead (below) rather than giving two clusters one name --"
+                    " maw-media cannot store both, and the publish would fail."
                 )
-                st.rerun()
-            except Exception as e:
-                st.error(f"Failed to save name: {e}")
+            else:
+                try:
+                    execute_update(
+                        "UPDATE person SET name = %s WHERE id = %s",
+                        (new_name if new_name else None, person_id),
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to save name: {e}")
 
     # --- triage -------------------------------------------------------------
     # Naming and triage are mutually exclusive (enforced by a CHECK), so only
