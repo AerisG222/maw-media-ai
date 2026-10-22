@@ -25,7 +25,7 @@ insightface==1.0.1
 # replacing the headless cv2 build with the GUI one.  After installing, run:
 #     pip uninstall -y onnxruntime opencv-python
 #     pip install --force-reinstall --no-deps \
-#         onnxruntime-gpu==1.25.1 opencv-python-headless==5.0.0.93
+#         onnxruntime-gpu==1.26.0 opencv-python-headless==5.0.0.93
 # (the force-reinstall is needed because uninstalling removes shared files)
 # Or install from requirements.lock, which has the resolved, working set.
 #
@@ -33,21 +33,27 @@ insightface==1.0.1
 #     export LD_LIBRARY_PATH=".venv/lib/python3.14/site-packages/nvidia/cudnn/lib:$LD_LIBRARY_PATH"
 #
 # These two are the last packages not on their latest release, and the ceiling is
-# an upstream packaging fact rather than caution on our part.  Checked 2026-07-28:
+# the CUDA generation rather than caution on our part.  Checked 2026-10-22:
 #
-#   * onnxruntime-gpu 1.28.0 publishes NO Linux wheel for Python 3.14.  Its only
-#     manylinux build is cp311; every other wheel that release is win_amd64.  So
-#     on this platform there is simply nothing newer to install.
-#   * 1.28 also moved to the CUDA 13 stack (nvidia-cuda-runtime~=13.0,
-#     nvidia-cudnn-cu13~=9.0).  We are on cu12, so adopting it is a
-#     cross-generation migration of the whole CUDA stack, not a version bump.
+#   * 1.26 is the last onnxruntime-gpu built for CUDA 12 (nvidia-cuda-runtime-cu12
+#     ~=12.0, nvidia-cudnn-cu12~=9.0).  Every release from 1.27 on requires the
+#     CUDA 13 stack (nvidia-cuda-runtime~=13.0, nvidia-cudnn-cu13~=9.0).  We are
+#     on cu12, so going past 1.26 is a cross-generation migration of the whole
+#     CUDA stack, not a version bump.
+#   * Python 3.14 is NOT a constraint.  Every release from 1.26.0 on ships a
+#     cp314 manylinux x86_64 wheel.  An earlier version of this note (2026-07-28)
+#     blamed a missing cp314 wheel and capped at <1.26, but 1.26.0 and 1.27.0
+#     had cp314 wheels from release, and 1.28.0's was uploaded the next day.
+#   * 1.25.1 -> 1.26.0 was verified on the GPU before upgrading: detection boxes
+#     and embeddings for 120 stored faces were bit-identical across the two
+#     versions, and each was bit-identical run-to-run.
 #   * nvidia-cudnn-cu12 is capped for the same reason: it only matters as part of
 #     that stack, and moving it alone risks a silent fall back to CPU.
 #
-# Revisit when a manylinux + cp314 wheel exists for a newer onnxruntime-gpu, or
-# when moving to CUDA 13 deliberately.  Either way, re-verify that
-# `scan-faces.py` still logs "loaded on GPU" afterwards.
-onnxruntime-gpu>=1.17.0,<1.26
+# Revisit when moving to CUDA 13 deliberately.  Re-verify that `scan-faces.py`
+# still logs "loaded on GPU" afterwards, and compare embeddings against the
+# previous version the same way.
+onnxruntime-gpu>=1.17.0,<1.27
 nvidia-cudnn-cu12<9.24
 
 # --- Clustering ---------------------------------------------------------------
