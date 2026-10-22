@@ -60,7 +60,11 @@ scikit-learn>=1.9.0          # also used by `suggest`'s logistic-regression path
 # to 4.13 across 25 photos, and the full GPU pipeline matched 100/100 faces.  The
 # APIs used here and inside insightface are long-stable core functions.
 opencv-python-headless>=5.0.0
-Pillow>=12.3.0
+# Floor is a security minimum, not a feature need: every 12.x has open advisories
+# (4 critical, incl. a heap overflow in ImagingJpegDecode) and none were
+# backported.  13.0 removed nothing used here -- Pillow only opens, thumbnails
+# and AVIF-encodes face crops, and is not on the embedding path.
+Pillow>=13.0.0
 
 # --- Database -----------------------------------------------------------------
 psycopg[binary]>=3.3.4       # psycopg3 — used by the scanner
